@@ -179,7 +179,7 @@ a function, `Frames.resolve2(frame_a.R, ...)`; none for a parameter or a discret
 under pre(), edge(), change() and delay() (known at the current time); only the actual
 argument of homotopy().
 """
-function continuousReads!(out::Vector{Symbol}, e::IR.Expression, resolve::F)::Vector{Symbol} where {F}
+function continuousReads!(out::Vector{Symbol}, @nospecialize(e::IR.Expression), resolve::F)::Vector{Symbol} where {F}
   if e isa IR.CREF
     for n in resolve(e.cref.name)
       n in out || push!(out, n)
@@ -230,7 +230,7 @@ function expandDerivatives!(equations::Vector{IR.Equation}, continuous::Set{Symb
     return IR.CREF(IR.derivativeCref(variables[name].cref), IR.T_REAL())
   end
   local seeds = Seeds(variable, 1.0, functions)
-  local expand = (e::IR.Expression) -> (e isa IR.CALL && e.attributes.builtin && e.name === :der) ?
+  local expand = (@nospecialize(e::IR.Expression)) -> (e isa IR.CALL && e.attributes.builtin && e.name === :der) ?
     differentiate(only(e.arguments), seeds) : e
   for eq in equations
     IR.mapEquation!(expand, eq)
@@ -414,18 +414,18 @@ derivative functions nested in each other's arguments, and its choice of states 
 inlined).
 """
 function inlineCalls(e::IR.Expression, functions::Dict{Symbol, IR.ModelicaFunction};
-                     active::Vector{Symbol} = Symbol[])::IR.Expression
-  return IR.mapExp(e) do x
+                     active::Vector{Symbol} = Symbol[], noEvents::Bool = false)::IR.Expression
+  return IR.mapExp(e) do @nospecialize(x::IR.Expression)
     if x isa IR.CALL && !x.attributes.builtin
       local f = get(functions, x.name, nothing)
       (f === nothing || x.name in active || any(iteratorIndexedRecord, x.arguments)) && return x
       local body = inlineBody(f, x)
       body === nothing && return x
       push!(active, x.name)
-      local inlined = inlineCalls(body, functions; active)
+      local inlined = inlineCalls(body, functions; active, noEvents)
       pop!(active)
       (any(d -> d.order == 1, f.derivatives) && IR.anyExp(y -> opaqueCall(y, functions), inlined)) && return x
-      return inlined
+      return noEvents ? withoutEvents(inlined, x.ty) : inlined
     elseif x isa IR.SUBSCRIPTED
       return subscriptedReference(foldTree(selectElement(x.exp, x.subscripts, x.ty)))
     elseif x isa IR.RECORD_ELEMENT
@@ -434,6 +434,22 @@ function inlineCalls(e::IR.Expression, functions::Dict{Symbol, IR.ModelicaFuncti
     end
     return foldScalar(x)
   end
+end
+
+"""
+    withoutEvents(e, ty) -> Expression
+
+The inlined body `e` of a call of the scalar type `ty` as `noEvent(e)` where it holds a relation: the relations of a
+function's body generate no events (MLS 3.7.5, 12.2), and inlined as they are they became the equation's, with events
+(MSL Fluid's `regSquare2(m_flow, m_flow_small, k1, k2)`, `if x >= x_small then k1 * x^2 else ...` in the equation of
+a tank's port pressure: its branch held during the solve of the loop it is in, the loop's residual kinked at zero
+flow; AST_BatchPlant TwoTanks failed where the levels meet). A record or array value stays as it is (its fields and
+elements are picked from the literal).
+"""
+function withoutEvents(e::IR.Expression, ty::IR.ModelicaType)::IR.Expression
+  ty isa Union{IR.T_REAL, IR.T_INTEGER, IR.T_BOOLEAN} || return e
+  (IR.isBuiltinCall(e, :noEvent) || !IR.anyExp((@nospecialize(x::IR.Expression)) -> x isa IR.RELATION, e)) && return e
+  return builtinCall(:noEvent, IR.Expression[e], ty)
 end
 
 """
@@ -492,19 +508,31 @@ end
 """
     inlineEquation(eq, functions) -> Equation
 
-A scalar or if-equation with its calls inlined (`inlineCalls`): the form the structure reads
-and index reduction differentiates, so both see the same dependencies. Other kinds as they are.
+A scalar, array or if-equation with its calls inlined (`inlineCalls`): the form the structure reads
+and index reduction differentiates, so both see the same dependencies. Other kinds as they are. `noEvents`: the
+relations of an inlined body under noEvent (`withoutEvents`: the equations the array code computes).
 """
-inlineEquation(eq::IR.SCALAR_EQUATION, functions::Dict{Symbol, IR.ModelicaFunction})::IR.Equation =
-  IR.SCALAR_EQUATION(inlineCalls(eq.lhs, functions), inlineCalls(eq.rhs, functions), eq.ty, eq.source, eq.attributes)
-
-function inlineEquation(eq::IR.IF_EQUATION, functions::Dict{Symbol, IR.ModelicaFunction})::IR.Equation
-  local branches = IR.EquationBranch[IR.EquationBranch(b.condition, IR.Equation[inlineEquation(e, functions) for e in b.equations])
-                                      for b in eq.branches]
-  return IR.IF_EQUATION(branches, IR.Equation[inlineEquation(e, functions) for e in eq.elseEquations], eq.source, eq.attributes)
+function inlineEquation(eq::IR.SCALAR_EQUATION, functions::Dict{Symbol, IR.ModelicaFunction};
+                        noEvents::Bool = false)::IR.Equation
+  local lhs::IR.Expression = inlineCalls(eq.lhs, functions; noEvents)
+  return IR.SCALAR_EQUATION(lhs, inlineCalls(eq.rhs, functions; noEvents), eq.ty, eq.source, eq.attributes)
 end
 
-inlineEquation(eq::IR.Equation, ::Dict{Symbol, IR.ModelicaFunction})::IR.Equation = eq
+function inlineEquation(eq::IR.ARRAY_EQUATION, functions::Dict{Symbol, IR.ModelicaFunction};
+                        noEvents::Bool = false)::IR.Equation
+  local lhs::IR.Expression = inlineCalls(eq.lhs, functions; noEvents)
+  return IR.ARRAY_EQUATION(lhs, inlineCalls(eq.rhs, functions; noEvents), eq.ty, eq.source, eq.attributes)
+end
+
+function inlineEquation(eq::IR.IF_EQUATION, functions::Dict{Symbol, IR.ModelicaFunction};
+                        noEvents::Bool = false)::IR.Equation
+  local inlined = (e::IR.Equation) -> inlineEquation(e, functions; noEvents)
+  local branches = IR.EquationBranch[IR.EquationBranch(b.condition, IR.Equation[inlined(e) for e in b.equations])
+                                      for b in eq.branches]
+  return IR.IF_EQUATION(branches, IR.Equation[inlined(e) for e in eq.elseEquations], eq.source, eq.attributes)
+end
+
+inlineEquation(eq::IR.Equation, ::Dict{Symbol, IR.ModelicaFunction}; noEvents::Bool = false)::IR.Equation = eq
 
 """
     positionEquations(eq, k) -> Vector{Equation}

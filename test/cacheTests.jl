@@ -33,6 +33,20 @@ import OMFrontend
     end
     C.remove!("d")
     @test isempty(C.MODELS) && isempty(C.SIZES)
+    #= measured only when a size is needed: the live heap over the limit (here never: 1000 GiB), then once =#
+    local measured = Ref(0)
+    local code = () -> (measured[] += 1; zeros(UInt8, 100))
+    withenv("OMBACKEND_CACHE_LIMIT_GIB" => "1000") do
+      @test isempty(C.store!("e", code; forget))
+      @test measured[] == 0 && haskey(C.PENDING, "e")
+    end
+    withenv("OMBACKEND_CACHE_LIMIT_GIB" => string(1024 / 2^30)) do
+      @test isempty(C.store!("f", 4; forget))
+      @test measured[] == 1 && C.MODELS == ["e", "f"] && C.SIZES["e"] >= 100 && isempty(C.PENDING)
+      @test C.totalBytes() == C.SIZES["e"] + 4 && measured[] == 1
+    end
+    C.clear!()
+    @test isempty(C.PENDING)
     #= a module is not counted (a build's closures reach the generated model module) =#
     @test C.sizeOf((1, OMBackend)) < 1000
     #= nor the compiled code a GlobalRef's binding leads to (a RuntimeGeneratedFunction's body: 1.7 GiB in 150 s) =#

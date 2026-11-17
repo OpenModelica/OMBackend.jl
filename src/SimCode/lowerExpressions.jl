@@ -193,6 +193,9 @@ function simExp(names::Names, e::IR.SIZE)::Exp
 end
 
 function simExp(names::Names, e::IR.CALL)::Exp
+  #= a clocked sample()'s read (`IR.SAMPLED_READ`): the variable, where the array code's form did not make it pre() =#
+  (e.attributes.builtin && e.name === IR.SAMPLED_READ && length(e.arguments) == 1) &&
+    return simExp(names, e.arguments[1])
   if e.attributes.builtin && length(e.arguments) == 1 && e.arguments[1] isa IR.CREF &&
      !haskey(names.stateOf, e.arguments[1].cref.name)
     e.name === :der && return DER(simCref(names, e.arguments[1].cref))

@@ -35,7 +35,7 @@
 
 #= The domain level's classes and their expression form, its passes (rerolling, folding, alias elimination, semiLinear
    chains) and the causal level (elements, matching, scheduling with loops, tearing, solving for an unknown): moved
-   from CodeGeneration's ArrayODEGeneration.jl (2026-11-01), unchanged. =#
+   from CodeGeneration's ArrayODEGen.jl (2026-11-01), unchanged. =#
 
 struct NotSupported <: Exception
   msg::String
@@ -169,7 +169,8 @@ EqClass(lhs::IR, rhs::IR, nslots::Int, domain::Matrix{Int}, nrel::Int, text::Str
 #= A when-equation over a domain: its condition and body (discrete assignments, reinits). =#
 struct WhenClass
   cond::IR                               #= Op(:elsewhen, conditions) for when ... elsewhen =#
-  body::Vector{Tuple{Symbol, Ref, IR}}   #= (:assign, :reinit or :call (a statement), target, value) =#
+  #= (:assign, :reinit, :switch (a state set's reinit) or :call (a statement), target, value) =#
+  body::Vector{Tuple{Symbol, Ref, IR}}
   starts::Vector{Int}                    #= where each branch's body begins =#
   nslots::Int
   domain::Matrix{Int}
@@ -183,6 +184,12 @@ end
 abstract type Stmt end
 
 struct SAssign <: Stmt
+  target::Ref
+  value::IR
+end
+
+"`pre(target) = value` at the initialization (an initial equation on pre() of a discrete variable)."
+struct SPreStart <: Stmt
   target::Ref
   value::IR
 end
@@ -241,6 +248,21 @@ struct AssertClass
   msg::IR
 end
 
+"""
+    DelaySite(base, nslots, domain, value, time)
+
+A delay() call of a domain system's equations (`_numberDelays!`): `delay(value, time)` in a class of the domain
+`domain` (`nslots` slots), each column an instance with a history of its own, `base + column` of the run's delay
+state.
+"""
+struct DelaySite
+  base::Int
+  nslots::Int
+  domain::Matrix{Int}
+  value::IR
+  time::IR
+end
+
 mutable struct Gen
   vars::Dict{String, VarInfo}
   nStates::Int
@@ -269,7 +291,15 @@ mutable struct Gen
   derOf::Dict{String, String}   #= the states' derivative links (SimCode's STATE_DERIVATIVE entries): \$STATEDER.x -> x =#
   startComputed::Set{String}    #= parameters the translation has no value of (an impure call): computed at each start =#
   strings::Vector{Tuple{String, String}}  #= String parameters the code reads (name, translated value): the run state's slots =#
+  #= the external objects the code reads (name, constructor call, destructor): one object per build (`_objectRead`) =#
+  objects::Vector{Tuple{String, IR, String}}
+  usesLeft::Bool   #= the code reads an algebraic variable's left limit at an event (pre() of it) =#
+  delays::Vector{DelaySite}   #= the delay() calls of the equations and when-equations, numbered (`_numberDelays!`) =#
+  usesHomotopy::Bool   #= the code calls homotopy(): the initialization's continuation in its λ (`homotopyStart!`) =#
 end
+
+"A relation of a template by its expression and scope (the iterators' slots, the element-wise dimensions)."
+const RelationKey = Tuple{SC.Exp, Dict{String, Int}, Vector{Int}}
 
 struct Ctx
   iters::Dict{String, Int}  #= frontend iterator name -> slot =#
@@ -277,13 +307,21 @@ struct Ctx
   nrel::Base.RefValue{Int}  #= relations numbered so far in this template =#
   noEvent::Bool
   nsam::Base.RefValue{Int}  #= sample() calls numbered so far in this template =#
+  #= the relations numbered in this template: an equal relation in the same scope is the same relation, one slot
+     (`toIR`) =#
+  relations::Dict{RelationKey, IR}
+  #= an initial algorithm's: its relations of continuous values literal, a tie to rounding the exact tie
+     (`Op(:startRelation)`) =#
+  atStart::Bool
 end
 
-Ctx(iters, elem) = Ctx(iters, elem, Base.RefValue(0), false, Base.RefValue(0))
+Ctx(iters, elem) = Ctx(iters, elem, Base.RefValue(0), false, Base.RefValue(0), Dict{RelationKey, IR}(), false)
 
-Ctx(iters, elem, nrel, noEvent) = Ctx(iters, elem, nrel, noEvent, Base.RefValue(0))
+Ctx(iters, elem, nrel, noEvent) =
+  Ctx(iters, elem, nrel, noEvent, Base.RefValue(0), Dict{RelationKey, IR}(), false)
 
-_with(ctx::Ctx; elem = ctx.elem, noEvent = ctx.noEvent) = Ctx(ctx.iters, elem, ctx.nrel, noEvent, ctx.nsam)
+_with(ctx::Ctx; elem = ctx.elem, noEvent = ctx.noEvent, atStart = ctx.atStart) =
+  Ctx(ctx.iters, elem, ctx.nrel, noEvent, ctx.nsam, ctx.relations, atStart)
 
 function _paramValue!(g::Gen, name::String)
   haskey(g.params, name) && return g.params[name]
@@ -307,7 +345,10 @@ const MATH_BUILTINS = Dict("sin" => :sin, "cos" => :cos, "tan" => :tan, "asin" =
                            "acos" => :acos, "atan" => :atan, "atan2" => :atan, "exp" => :exp,
                            "log" => :log, "log10" => :log10, "sqrt" => :sqrt, "abs" => :abs,
                            "sinh" => :sinh, "cosh" => :cosh, "tanh" => :tanh,
-                           "min" => :min, "max" => :max, "sign" => :sign)
+                           "min" => :min, "max" => :max, "sign" => :sign,
+                           #= the frontend's positiveMax of a stream connection (inStream of three or more
+                              connectors): max(flow, eps), as the scalar code (modelicaBuiltins.jl) =#
+                           "OMCPositiveMax" => :max)
 
 const MATH_WRAPPED = ("sin", "cos", "tan", "asin", "acos", "atan", "atan2", "sinh", "cosh", "tanh", "exp", "log", "log10")
 
@@ -413,6 +454,8 @@ function _evalStatic(g::Gen, x::IR, d::Matrix{Int}, col::Int; structural::Bool =
     x.op == :if && return a[1] ? a[2] : a[3]
     x.op == :index && return a[1][a[2:end]...]
     x.op == :vect && return a
+    #= an array by its elements, column-major, its dimensions first (`_valueIRx`) =#
+    x.op == :arrayval && return length(a[1]) == 1 ? a[2:end] : reshape(a[2:end], a[1]...)
     (x.op in (:initial, :sample) || !isdefined(Base, x.op)) && ns("condition $(x.op)() in an if-equation")
     return getfield(Base, x.op)(a...)
   end
@@ -420,12 +463,16 @@ function _evalStatic(g::Gen, x::IR, d::Matrix{Int}, col::Int; structural::Bool =
 end
 
 """
-Whether a condition depends on loop indices and parameters only.
+Whether a condition depends on loop indices and parameters only, by what `_evalStatic` evaluates (no call of a
+Modelica function, `:fcall`: such a condition is evaluated when the model runs). Not a parameter with fixed = false:
+the initialization computes it, so a condition on it is evaluated when the model runs (MSL DCPowerSupply's
+`if cp then`, cp from an initial algorithm).
 """
 _isStatic(g::Gen, x::IR)::Bool =
   x isa Lit || x isa Slot ||
-  (x isa Ref && !x.der && g.vars[x.name].kind == :param && all(s -> _isStatic(g, s), x.subs)) ||
-  (x isa Op && !(x.op in (:initial, :sample)) && all(a -> _isStatic(g, a), x.args))
+  (x isa Ref && !x.der && g.vars[x.name].kind == :param && !(x.name in g.freeParams) &&
+   all(s -> _isStatic(g, s), x.subs)) ||
+  (x isa Op && !(x.op in (:initial, :sample, :fcall)) && all(a -> _isStatic(g, a), x.args))
 
 """
 initial() activates a when at the initialization only as its condition (MLS 8.6, as
@@ -446,6 +493,9 @@ function _initAlgTargets(g::Gen, stmts::Vector{Stmt})
     if st isa SAssign
       (g.vars[st.target.name].kind == :discrete || st.target.name in g.freeParams) ||
         ns("initial algorithm assigns $(st.target.name), not a discrete variable or a parameter with fixed = false")
+    elseif st isa SPreStart
+      g.vars[st.target.name].kind == :discrete ||
+        ns("pre() of $(st.target.name), not a discrete variable, given a value")
     elseif st isa SIf
       foreach(b -> _initAlgTargets(g, b[2]), st.branches)
     elseif st isa SFor || st isa SWhile
@@ -608,7 +658,7 @@ end
 "The ids of the event sources in statements that `want` takes, into `ids`."
 function _sourceIds!(ids::Set{Int}, stmts::Vector{Stmt}, want::F)::Set{Int} where {F}
   for st in stmts
-    st isa SAssign && _sourceIds!(ids, st.value, want)
+    st isa Union{SAssign, SPreStart} && _sourceIds!(ids, st.value, want)
     if st isa SIf || st isa SWhen
       for (c, b) in st.branches
         _sourceIds!(ids, c, want)
@@ -651,28 +701,73 @@ function _sourceSlots(g::Gen, nRelTotal::Int, relBases::Vector{Int}, whenRelBase
 end
 
 """
+The first slot of each slot's equation instance in the relation numbering: a class's, a when-equation's or an
+algorithm's at one column of its domain, whose relations are the slots from its base (`base + (col - 1) * nrel + id`).
+The relations of one instance (an if-expression's conditions) have the same; a slot of no instance its own.
+"""
+function _relationInstances(g::Gen, nRelTotal::Int, relBases::Vector{Int}, whenRelBases::Vector{Int},
+                            algRelBases::Vector{Int})::Vector{Int}
+  local first::Vector{Int} = collect(1:nRelTotal)
+  local mark!::Function = function (base::Int, nrel::Int, ncols::Int)
+    for col in 1:ncols, id in 1:nrel
+      first[base + (col - 1) * nrel + id] = base + (col - 1) * nrel + 1
+    end
+  end
+  for (ci, c) in enumerate(g.classes)
+    c.nrel == 0 || mark!(relBases[ci], c.nrel, size(c.domain, 2))
+  end
+  for (wi, w) in enumerate(g.whens)
+    w.nrel == 0 || mark!(whenRelBases[wi], w.nrel, size(w.domain, 2))
+  end
+  for (ai, a) in enumerate(g.algs)
+    a.nrel == 0 || mark!(algRelBases[ai], a.nrel, size(a.domain, 2))
+  end
+  return first
+end
+
+"""
 The slots of the relation numbering that are relations (`_rel`, `p.rel`), not an event-generating function's two
 crossing functions (`_evfn`).
 """
 _relationSlots(g::Gen, nRelTotal::Int, relBases::Vector{Int}, whenRelBases::Vector{Int}, algRelBases::Vector{Int})::BitVector =
   .!_sourceSlots(g, nRelTotal, relBases, whenRelBases, algRelBases, (x::IR) -> x isa EvFn, 2)
 
-"The slots of the relation numbering that are relations of time and a parameter expression (`_isTimeRelation`)."
+"The slots of the relation numbering that are relations of time and an expression of the events (`_isTimeRelation`)."
 _timeRelationSlots(g::Gen, nRelTotal::Int, relBases::Vector{Int}, whenRelBases::Vector{Int}, algRelBases::Vector{Int})::BitVector =
   _sourceSlots(g, nRelTotal, relBases, whenRelBases, algRelBases, (x::IR) -> x isa Rel && _isTimeRelation(g, x), 1)
 
-"Whether the relation `x` is of `time` and a parameter expression (`time > 0.6`): a time event at its exact time."
+"""
+Whether the relation `x` is of `time` and an expression that changes only at events: a time event at its exact time.
+A parameter expression (`time > 0.6`), or arithmetic of parameters, discrete variables and pre() (`_eventConstant`,
+OpenModelica's `timeEventTrigger`): `time < T0 + Trising` with T0 a when-equation's. With the hysteresis of a state
+event, 1e-10 (1 + |time|), such a relation changed 1e-10 s late: after the end of MSL Spice3 Inverter's run of
+1e-11 s, its V_pulse sources ramping on to 200 V instead of 5 V.
+"""
 _isTimeRelation(g::Gen, x::Rel)::Bool =
-  (x.lhs isa TimeIR && _parametersOnly(g, x.rhs)) || (x.rhs isa TimeIR && _parametersOnly(g, x.lhs))
+  (x.lhs isa TimeIR && _timeEventOperand(g, x.rhs)) || (x.rhs isa TimeIR && _timeEventOperand(g, x.lhs))
+
+"What a relation of `time` is a time event against (`_isTimeRelation`)."
+_timeEventOperand(g::Gen, x::IR)::Bool = _parametersOnly(g, x) || _eventConstant(g, x)
+
+"""
+Whether `x` changes only at events: literals, iterators, parameters, discrete variables, pre() of a variable, and
+their sums, differences, products, quotients and powers (OpenModelica's `isEventConstantExp`).
+"""
+function _eventConstant(g::Gen, x::IR)::Bool
+  (x isa Lit || x isa Slot || x isa Pre) && return true
+  x isa Ref && return g.vars[x.name].kind in (:param, :discrete) && !x.der && all(s::IR -> _eventConstant(g, s), x.subs)
+  x isa Op && return x.op in (:+, :-, :*, :/, :^) && all(a::IR -> _eventConstant(g, a), x.args)
+  return false
+end
 
 """
 Whether an expression varies in time other than through the unknowns it reads: time, a state, a discrete variable
-(changed at events), a relation or event-generating function, pre(), sample(), initial().
+(changed at events), a relation or event-generating function, pre(), sample(), initial(), delay() (its history).
 """
 function _readsDynamic(g::Gen, x::IR)::Bool
   (x isa TimeIR || x isa Pre || x isa Rel || x isa EvFn) && return true
   x isa Ref && return g.vars[x.name].kind in (:state, :discrete) || x.der || any(s::IR -> _readsDynamic(g, s), x.subs)
-  x isa Op && return x.op in (:sample, :sampleof, :initial) || any(a::IR -> _readsDynamic(g, a), x.args)
+  x isa Op && return x.op in (:sample, :sampleof, :initial, :delay) || any(a::IR -> _readsDynamic(g, a), x.args)
   return false
 end
 
@@ -743,8 +838,8 @@ function _aliasTerms(c::EqClass)::Union{Nothing, Tuple{Ref, Ref, Bool}}
   return (x, y, n1 == n2)
 end
 
-"The variables the initial algorithms assign."
-function _initAlgAssigned(g::Gen)::Set{String}
+"The variables the initial algorithms assign (`which`: those of the algorithms it marks)."
+function _initAlgAssigned(g::Gen, which::BitVector = trues(length(g.initAlgs)))::Set{String}
   local names::Set{String} = Set{String}()
   local visit!::Function = function (stmts::Vector{Stmt})
     for st in stmts
@@ -753,9 +848,88 @@ function _initAlgAssigned(g::Gen)::Set{String}
       (st isa SFor || st isa SWhile) && visit!(st.body)
     end
   end
-  foreach(a::AlgClass -> visit!(a.body), g.initAlgs)
+  for (k::Int, a::AlgClass) in enumerate(g.initAlgs)
+    which[k] && visit!(a.body)
+  end
   return names
 end
+
+"""
+    _parameterAlgorithms(g) -> BitVector
+
+The initial algorithms that compute parameters and discrete values from parameters: they assign parameters, discrete
+variables (their initial value or pre() of it) no lifted cluster of discrete equations assigns, and the local of a
+tuple-valued call only, and read literals, iterators, parameters and discrete values, each parameter with fixed = false
+and each discrete value (or pre() of one) among them one such an algorithm assigns. They run before the initial
+system, which reads what they assign (MSL Engine1b_analytic: `rodLength = length(rRod_ia)`, `length = rodLength`, then
+the initial equation `positiveBranch = selectBranch(length, ...)`; MSL Noise's `r_raw = generator.random(pre(state))`,
+read by Variance's `mu = u`). The others run after it.
+"""
+function _parameterAlgorithms(g::Gen)::BitVector
+  local early::BitVector = falses(length(g.initAlgs))
+  #= the discrete variables of lifted clusters: their initialized values come with the clusters (`initialClusters!`) =#
+  local clusterNames::Set{String} = Set{String}()
+  for w::WhenClass in g.whens, (kind::Symbol, target::Ref, _) in w.body
+    (w.everyEvent && kind == :assign) && push!(clusterNames, target.name)
+  end
+  local isDiscrete::Function = (r::Ref) -> g.vars[r.name].kind == :discrete && !r.der
+  local isParam::Function = (r::Ref) -> g.vars[r.name].kind == :param && !r.der
+  local isTarget::Function = (r::Ref) -> isParam(r) || (isDiscrete(r) && !(r.name in clusterNames))
+  local reads::Vector{Vector{Ref}} = Vector{Ref}[Ref[] for _ in g.initAlgs]
+  local exp!::Function = (acc::Vector{Ref}, x::IR) -> begin
+    if x isa Ref
+      push!(acc, x)
+      foreach(s::IR -> exp!(acc, s), x.subs)
+    elseif x isa Pre
+      exp!(acc, x.ref)
+    elseif x isa Rel
+      exp!(acc, x.lhs); exp!(acc, x.rhs)
+    elseif x isa Op
+      x.op in (:sample, :initial) && return false
+      all(a::IR -> exp!(acc, a), x.args) || return false
+    elseif !(x isa Lit || x isa Slot)
+      return false
+    end
+    return true
+  end
+  local stmts!::Function = (acc::Vector{Ref}, body::Vector{Stmt}) -> all(body) do st::Stmt
+    if st isa SAssign || st isa SPreStart
+      isTarget(st.target) && all(s::IR -> exp!(acc, s), st.target.subs) && exp!(acc, st.value)
+    elseif st isa SIf
+      all(b::Tuple{IR, Vector{Stmt}} -> exp!(acc, b[1]) && stmts!(acc, b[2]), st.branches)
+    elseif st isa SFor
+      stmts!(acc, st.body)
+    elseif st isa SCall && st.call isa Op && st.call.op == :setlocal
+      #= the local of a tuple-valued call, its outputs assigned from it: (cr, c0, c1) = f(...) (MSL
+         Blocks.Continuous.Filter's coefficients, read by its steady-state initial equations der(x) = 0) =#
+      exp!(acc, st.call)
+    else
+      false
+    end
+  end
+  local readable::Function = (r::Ref) -> isParam(r) || isDiscrete(r)
+  local candidate::BitVector = BitVector([stmts!(reads[k], a.body) && all(readable, reads[k])
+                                          for (k::Int, a::AlgClass) in enumerate(g.initAlgs)])
+  #= a parameter with fixed = false or a discrete value it reads: assigned by such an algorithm (a fixed point, from
+     all candidates) =#
+  early .= candidate
+  local changed::Bool = true
+  while changed
+    local known::Set{String} = _initAlgAssigned(g, early)
+    local given::Function = (r::Ref) -> !(r.name in g.freeParams || isDiscrete(r)) || r.name in known
+    local next::BitVector = BitVector([early[k] && all(given, reads[k]) for k in eachindex(early)])
+    changed = next != early
+    early = next
+  end
+  return early
+end
+
+"""
+The parameters with fixed = false the initial system solves for: those the parameter algorithms
+(`_parameterAlgorithms`) do not compute before it.
+"""
+_initialFreeParams(g::Gen)::Set{String} =
+  setdiff(Set{String}(g.freeParams), _initAlgAssigned(g, _parameterAlgorithms(g)))
 
 "The variables algorithms (also initial ones) and when-equations assign."
 function _assignedNames(g::Gen)::Set{String}
@@ -774,6 +948,56 @@ function _assignedNames(g::Gen)::Set{String}
     push!(names, target.name)
   end
   return names
+end
+
+"""
+    _numberDelays!(g) -> Int
+
+The delay() calls of the equations and the when-equations' bodies numbered (`Gen.delays`, a `DelaySite` each): each
+call's `Op(:delay)` given its base, the run's histories `base + column` its instances'. After the passes (the
+classes as the code generation takes them); the number of histories. A call elsewhere (an algorithm, an assert, an
+initial equation, a parameter's binding) keeps the base -1, which the code generation refuses. NotSupported for a
+relation or an event function in a call's argument or delay time (its events are not numbered here).
+"""
+function _numberDelays!(g::Gen)::Int
+  empty!(g.delays)
+  for (k::Int, c::EqClass) in enumerate(g.classes)
+    local lhs::IR = _numberedDelays!(g, c.lhs, c.nslots, c.domain)
+    local rhs::IR = _numberedDelays!(g, c.rhs, c.nslots, c.domain)
+    g.classes[k] = EqClass(lhs, rhs, c.nslots, c.domain, c.nrel, c.text, c.nsample)
+  end
+  for (k::Int, w::WhenClass) in enumerate(g.whens)
+    local body::Vector{Tuple{Symbol, Ref, IR}} = Tuple{Symbol, Ref, IR}[]
+    for (kind::Symbol, target::Ref, value::IR) in w.body
+      push!(body, (kind, target, _numberedDelays!(g, value, w.nslots, w.domain)))
+    end
+    g.whens[k] = WhenClass(w.cond, body, w.starts, w.nslots, w.domain, w.nrel, w.nsample, w.text, w.everyEvent)
+  end
+  return isempty(g.delays) ? 0 : g.delays[end].base + size(g.delays[end].domain, 2)
+end
+
+"`x` with its delay() calls numbered as those of a class of the domain `domain` (`_numberDelays!`), the inner first."
+function _numberedDelays!(g::Gen, x::IR, nslots::Int, domain::Matrix{Int})::IR
+  if x isa Op
+    local args::Vector{IR} = IR[_numberedDelays!(g, a, nslots, domain) for a in x.args]
+    x.op == :delay || return Op(x.op, args)
+    (_holdsEvent(args[2]) || _holdsEvent(args[3])) && ns("a relation or an event function in delay()")
+    local base::Int = isempty(g.delays) ? 0 : g.delays[end].base + size(g.delays[end].domain, 2)
+    push!(g.delays, DelaySite(base, nslots, domain, args[2], args[3]))
+    return Op(:delay, IR[Lit(base), args[2], args[3]])
+  elseif x isa Rel
+    return Rel(x.op, _numberedDelays!(g, x.lhs, nslots, domain), _numberedDelays!(g, x.rhs, nslots, domain), x.id)
+  elseif x isa EvFn
+    return EvFn(x.kind, _numberedDelays!(g, x.arg, nslots, domain), x.id)
+  end
+  return x
+end
+
+"Whether `x` holds a relation or an event function (an event of its own)."
+function _holdsEvent(x::IR)::Bool
+  x isa Union{Rel, EvFn} && return true
+  x isa Op && return any(_holdsEvent, x.args)
+  return false
 end
 
 """
@@ -809,6 +1033,7 @@ _substitutedTarget(t::Ref, alias::Dict{String, Tuple{String, Bool}})::Ref =
 function _substituted(st::Stmt, alias::Dict{String, Tuple{String, Bool}})::Stmt
   local body::Function = (b::Vector{Stmt}) -> Stmt[_substituted(x, alias) for x in b]
   st isa SAssign && return SAssign(_substitutedTarget(st.target, alias), _substituted(st.value, alias))
+  st isa SPreStart && return SPreStart(_substitutedTarget(st.target, alias), _substituted(st.value, alias))
   st isa SIf && return SIf(Tuple{IR, Vector{Stmt}}[(_substituted(c, alias), body(b)) for (c, b) in st.branches])
   st isa SFor && return SFor(st.slot, st.range, body(st.body))
   st isa SWhile && return SWhile(_substituted(st.cond, alias), body(st.body))
@@ -1179,13 +1404,15 @@ function _simplifySemiLinear!(g::Gen)::Int
 end
 
 """
-    InstanceTable(class, col, uptr, uid, upos, sptr, sid, outs, nEq, aliased)
+    InstanceTable(class, col, uptr, uid, upos, sptr, sid, outs, nEq, aliased, vanishing)
 
 The instances of a domain system's classes (`_elements`), each a row: its class (> 0 an equation class, < 0 an
 algorithm by its negated index) and column, its unknowns with their access positions (CSR: `uptr`, `uid`, `upos`), the
 states it reads (`sptr`, `sid`), the unknowns an algorithm instance assigns (empty for equations), the number of
-equation instances, and the (instance, unknown) pairs read through two different references (`x[i]` and `x[2]` at
-`i = 2`). Unknown ids: state derivatives `1:nStates`, algebraic elements after them, then the discrete unknowns.
+equation instances, the (instance, unknown) pairs read through two different references (`x[i]` and `x[2]` at
+`i = 2`), and those whose unknown has a coefficient of parameters that is zero at the instance (`_zeroDivisor`: no
+instance is matched to such an unknown, it stays one the instance reads). Unknown ids: state derivatives
+`1:nStates`, algebraic elements after them, then the discrete unknowns.
 """
 struct InstanceTable
   class::Vector{Int}     #= > 0 an equation class, < 0 an algorithm (-index) =#
@@ -1198,6 +1425,7 @@ struct InstanceTable
   outs::Vector{Vector{Int}}   #= unknowns an algorithm instance assigns (empty for equations) =#
   nEq::Int
   aliased::Set{Tuple{Int, Int}}   #= (instance, unknown) read through two different references (x[i] and x[2] at i = 2) =#
+  vanishing::Set{Tuple{Int, Int}} #= (instance, unknown) with a coefficient of parameters that is zero there =#
 end
 
 """
@@ -1244,6 +1472,8 @@ function _algAccesses!(g::Gen, stmts::Vector{Stmt}, env::Dict{Int, Int}, d::Matr
       u > 0 || ns("algorithm assigns $(st.target.name), which an equation or when-equation defines")
       push!(outs, u)
       readIR!(st.value)
+    elseif st isa SPreStart
+      readIR!(st.value)
     elseif st isa SIf || st isa SWhen
       for (c, body) in st.branches
         readIR!(c)
@@ -1280,10 +1510,15 @@ function _elements(g::Gen)::InstanceTable
   local sptr = Int[1]; local sid = Int[]
   local idx = Int[]
   local aliased::Set{Tuple{Int, Int}} = Set{Tuple{Int, Int}}()
+  local vanishing::Set{Tuple{Int, Int}} = Set{Tuple{Int, Int}}()
   local keyOf::Dict{Int, String} = Dict{Int, String}()
+  local divisors::Dict{Int, Union{Nothing, Vector{IR}}} = Dict{Int, Union{Nothing, Vector{IR}}}()
   for (ci, c) in enumerate(g.classes)
     local acc = accesses!(accesses!(Ref[], c.lhs), c.rhs)
     local keys::Vector{String} = String[irKey(r) for r in acc]
+    empty!(divisors)
+    #= an equation of discrete time: it reads the continuous variables through relations only (`off = s < 0`) =#
+    local discreteTime::Bool = !(_continuous(g, c.lhs) || _continuous(g, c.rhs))
     for j in 1:size(c.domain, 2)
       push!(class, ci); push!(col, j)
       empty!(keyOf)
@@ -1311,6 +1546,21 @@ function _elements(g::Gen)::InstanceTable
         local k::String = get!(keyOf, uid[i], keys[upos[i]])
         k == keys[upos[i]] || push!(aliased, (length(class), uid[i]))
       end
+      for i in firstAccess:length(uid)
+        (length(class), uid[i]) in aliased && continue
+        local ds::Union{Nothing, Vector{IR}} =
+          get!(() -> _explicitDivisors(g, c.lhs, c.rhs, upos[i]), divisors, upos[i])
+        (ds === nothing || isempty(ds)) && continue
+        _zeroDivisor(g, ds, c, j) && push!(vanishing, (length(class), uid[i]))
+      end
+      #= an equation of discrete time is not solved for a continuous unknown (a relation gives none): its unknown is
+         the discrete variable, which a continuous equation reading it then leaves to it (the matching gave an ideal
+         diode's `off` to `i = s * (if off then Goff else 1)` and `s` to `off = s < 0`) =#
+      if discreteTime
+        for i in firstAccess:length(uid)
+          uid[i] <= g.nStates + g.nAlg && push!(vanishing, (length(class), uid[i]))
+        end
+      end
       push!(uptr, length(uid) + 1)
       push!(sptr, length(sid) + 1)
     end
@@ -1330,13 +1580,16 @@ function _elements(g::Gen)::InstanceTable
       push!(outs, sort!(collect(o)))
     end
   end
-  return InstanceTable(class, col, uptr, uid, upos, sptr, sid, outs, nEq, aliased)
+  return InstanceTable(class, col, uptr, uid, upos, sptr, sid, outs, nEq, aliased, vanishing)
 end
 
 """
-Maximum matching instances <-> unknowns (greedy, then augmenting paths).
+Maximum matching instances <-> unknowns (greedy, then augmenting paths). No instance is matched to an unknown whose
+coefficient is zero there (`InstanceTable.vanishing`): the explicit solution divides by it (MSL Spice3 BJT2,
+`irc * p1.m_collectorResist = C.v - Cinternal` with a collector resistance of 0: `irc` was 0 / 0 from the first
+evaluation on, the Oscillator ended in DtNaN). `texts`: the classes' equations, for the message.
 """
-function _match(el::InstanceTable, nU::Int)::Vector{Int}
+function _match(el::InstanceTable, nU::Int, texts::Vector{String})::Vector{Int}
   local N = el.nEq
   local matchRow = zeros(Int, length(el.class))
   local matchCol = zeros(Int, nU)
@@ -1347,10 +1600,14 @@ function _match(el::InstanceTable, nU::Int)::Vector{Int}
     matchCol[u] = r
     nOut += 1
   end
-  N == nU - nOut || ns("$(N) equations for $(nU - nOut) unknowns (and $(nOut) assigned by algorithms)")
+  #= more equations than unknowns: the search below names one without an unknown and those it competes with =#
+  local counts::String = "$(N) equations for $(nU - nOut) unknowns (and $(nOut) assigned by algorithms)"
+  N < nU - nOut && ns(counts)
+  local vanishes::Bool = !isempty(el.vanishing)
   for r in 1:N
     for i in el.uptr[r]:(el.uptr[r + 1] - 1)
       local c = el.uid[i]
+      (vanishes && (r, c) in el.vanishing) && continue
       if matchCol[c] == 0
         matchRow[r] = c; matchCol[c] = r
         break
@@ -1376,6 +1633,7 @@ function _match(el::InstanceTable, nU::Int)::Vector{Int}
       end
       iters[end] = i + 1
       local c = el.uid[i]
+      (vanishes && (r, c) in el.vanishing) && continue
       (visited[c] == stamp || visited[c] == -1) && continue
       visited[c] = stamp
       push!(cols, c)
@@ -1388,9 +1646,27 @@ function _match(el::InstanceTable, nU::Int)::Vector{Int}
       end
       push!(rows, matchCol[c]); push!(iters, el.uptr[matchCol[c]])
     end
-    found || ns("structurally singular (index reduction needed, or under/over-determined)")
+    found || ns((N > nU - nOut ? counts * ": " : "structurally singular (index reduction needed, or " *
+                                                 "under/over-determined): ") * "no unknown left for " *
+                first(texts[el.class[r0]], 120) * _overdeterminedSet(el, matchCol, visited, stamp, r0, texts))
   end
   return matchRow
+end
+
+"""
+The equations a failed search of `_match` went through: with the equation `r0` they are one more than the unknowns
+they share. As text for the refusal, the first six of them.
+"""
+function _overdeterminedSet(el::InstanceTable, matchCol::Vector{Int}, visited::Vector{Int}, stamp::Int, r0::Int,
+                            texts::Vector{String})::String
+  local rows::Vector{Int} = Int[matchCol[c] for c in eachindex(visited) if visited[c] == stamp && matchCol[c] != 0]
+  isempty(rows) && return " (it reads no unknown)"
+  local shown::Vector{String} = unique!(String[first(texts[el.class[r]], 80) for r in rows])
+  get(ENV, "OMBACKEND_ARRAY_TRACE", "") == "true" &&
+    foreach(t -> println("[match] over-determined with ", texts[el.class[r0]], ": ", t),
+            unique!(String[texts[el.class[r]] for r in rows]))
+  return string("; with it ", length(rows) + 1, " equations share ", length(rows), " unknowns: ",
+                join(first(shown, 6), "; "), length(shown) > 6 ? "; ..." : "")
 end
 
 """
@@ -1398,7 +1674,7 @@ Kahn's algorithm in batches: all ready instances of one (class, matched access) 
 a key whose remaining instances are all ready first. Returns the batches (consecutive equal
 keys merged), the matched access per instance and the producer per unknown.
 """
-function _schedule(el::InstanceTable, matchRow::Vector{Int}, nU::Int)
+function _schedule(el::InstanceTable, matchRow::Vector{Int}, nU::Int, settled::BitVector)
   local N = length(el.class)
   local producer = zeros(Int, nU)
   for r in 1:el.nEq
@@ -1472,7 +1748,7 @@ function _schedule(el::InstanceTable, matchRow::Vector{Int}, nU::Int)
     end
   end
   done == N && return (batches, pos, producer, LoopBlocks(Vector{Int}[], zeros(Int, N), Vector{Tuple{Int, Int}}[]))
-  return _scheduleWithLoops(el, matchRow, nU, producer, pos)
+  return _scheduleWithLoops(el, matchRow, nU, producer, pos, settled)
 end
 
 """
@@ -1497,13 +1773,46 @@ block (`_loopFamilyCode`).
 const NEWTON_BLOCK_SIZE = Base.RefValue(8)
 
 """
-The large blocks of `loops` (more than `NEWTON_BLOCK_SIZE` instances: loops that couple the elements, solved by
-`blockSolve!`); NotSupported for a discrete unknown in one.
+Whether `x` has relations of `time` against what changes only at events only (`_isTimeRelation`: time events) and no
+event function: what has one value while an algebraic loop is solved.
 """
-function _largeBlocks(g::Gen, loops::LoopBlocks, matchRow::Vector{Int})::BitVector
-  local large::BitVector = BitVector(length(b) > NEWTON_BLOCK_SIZE[] for b in loops.blocks)
+function _onlyTimeRelations(g::Gen, x::IR)::Bool
+  x isa Rel && return _isTimeRelation(g, x)
+  x isa EvFn && return false
+  x isa Op && return all((a::IR) -> _onlyTimeRelations(g, a), x.args)
+  return true
+end
+
+"Whether the block `rows` has an equation with relations, and all its relations are of time (`_onlyTimeRelations`)."
+function _timeRelationsOnly(g::Gen, rows::Vector{Int}, el::InstanceTable)::Bool
+  local found::Bool = false
+  for r::Int in rows
+    el.class[r] > 0 || continue
+    local c::EqClass = g.classes[el.class[r]]
+    c.nrel == 0 && continue
+    (_onlyTimeRelations(g, c.lhs) && _onlyTimeRelations(g, c.rhs)) || return false
+    found = true
+  end
+  return found
+end
+
+"""
+The large blocks of `loops` (more than `NEWTON_BLOCK_SIZE` instances: loops that couple the elements, solved by
+`blockSolve!`); NotSupported for a discrete unknown in one. A smaller loop whose equations have relations, all of
+`time` against what changes only at events (`_onlyTimeRelations`: `0 = if time < 0.02 then ... else ...`, a source in
+a loop of MSL's LightningSegmentedTransmissionLine, "relations in an algebraic loop"), is solved the same way:
+`blockSolve!` evaluates relations, the generated Newton of a family does not, and such a relation has one value
+while the loop is solved. Not one with a relation on the loop's variables: routed here, MSL OpAmps' SignalGenerator
+settled at the unstable root of its comparator (v_out = 0, no oscillation), DCPM_withLosses and PumpingSystem
+equalled the scalarized route.
+"""
+function _largeBlocks(g::Gen, loops::LoopBlocks, matchRow::Vector{Int}, el::InstanceTable)::BitVector
+  local large::BitVector =
+    BitVector(length(b) > NEWTON_BLOCK_SIZE[] || _timeRelationsOnly(g, b, el) for b in loops.blocks)
   for (b, rs) in enumerate(loops.blocks)
-    (large[b] && any(r::Int -> matchRow[r] > g.nStates + g.nAlg, rs)) && ns("a discrete unknown in an algebraic loop")
+    large[b] || continue
+    local k::Union{Nothing, Int} = findfirst(r::Int -> matchRow[r] > g.nStates + g.nAlg, rs)
+    k === nothing || ns("a discrete unknown in an algebraic loop: " * first(g.classes[el.class[rs[k]]].text, 120))
   end
   return large
 end
@@ -1554,10 +1863,13 @@ end
 
 """
 Whether the divisors of an explicit solve (`_explicitDivisors`) are all nonzero at the instance column `col` of the
-class `c` (with the parameters' values; one that cannot be evaluated counts as zero).
+class `c` (with the parameters' values; one that cannot be evaluated counts as zero, as one that reads a parameter
+with fixed = false: the initialization computes it, MSL PrismaticWithLengthConstraint's `if positiveBranch then k2
+else -k2`).
 """
 function _nonzeroDivisors(g::Gen, divisors::Vector{IR}, c::EqClass, col::Int)::Bool
   for d in divisors
+    any(r::Ref -> r.name in g.freeParams, accesses!(Ref[], d)) && return false
     local value::Any = try
       _evalStatic(g, d, c.domain, col; structural = false)
     catch err
@@ -1567,6 +1879,26 @@ function _nonzeroDivisors(g::Gen, divisors::Vector{IR}, c::EqClass, col::Int)::B
     (value isa Real && !iszero(value)) || return false
   end
   return true
+end
+
+"""
+Whether a divisor of an explicit solve (`_explicitDivisors`) is zero at the instance column `col` of the class `c`,
+by the parameters' values; one that reads a parameter with fixed = false (its value comes with the initialization)
+or cannot be evaluated is not. The parameters stay tunable: an instance solved for another of its unknowns is right
+for any value of the coefficient.
+"""
+function _zeroDivisor(g::Gen, divisors::Vector{IR}, c::EqClass, col::Int)::Bool
+  for d in divisors
+    any(r::Ref -> r.name in g.freeParams, accesses!(Ref[], d)) && continue
+    local value::Any = try
+      _evalStatic(g, d, c.domain, col; structural = false)
+    catch err
+      err isa NotSupported || rethrow(err)
+      nothing
+    end
+    (value isa Real && iszero(value)) && return true
+  end
+  return false
 end
 
 """
@@ -1620,14 +1952,141 @@ struct TornBlock
 end
 
 """
+The number of candidates for an iteration variable `_tearBlock` compares by their cascades (`_tearCascade`), the best by
+its greedy score first; 1: the greedy choice alone.
+"""
+const TEAR_LOOKAHEAD = Base.RefValue{Int}(4096)
+
+"""
+    _tearCascade(v, known, used, open, reads, readers, solves) -> Int
+
+The number of a torn block's unknowns known once `v` is (`_tearBlock`'s state not changed): `v` and those the
+instances then left with one unknown solve explicitly, in turn.
+"""
+function _tearCascade(v::Int, known::BitVector, used::BitVector, open::Vector{Int}, reads::Vector{Vector{Tuple{Int, Int}}},
+                      readers::Vector{Vector{Int}}, solves::Function)::Int
+  local k::BitVector = copy(known); local u::BitVector = copy(used); local o::Vector{Int} = copy(open)
+  local queue::Vector{Int} = Int[]
+  local learned::Int = 0
+  local next::Int = v
+  while true
+    k[next] = true
+    learned += 1
+    for e in readers[next]
+      o[e] -= 1
+      (o[e] == 1 && !u[e]) && push!(queue, e)
+    end
+    next = 0
+    while !isempty(queue) && next == 0
+      local e::Int = popfirst!(queue)
+      (u[e] || o[e] != 1) && continue
+      local (x::Int, access::Int) = reads[e][findfirst(y::Tuple{Int, Int} -> !k[y[1]], reads[e])]
+      solves(e, x, access) || continue
+      u[e] = true
+      next = x
+    end
+    next == 0 && return learned
+  end
+end
+
+"""
+    _piecewiseInUnknowns(x, reads) -> Bool
+
+Whether `x` is piecewise in the unknowns of an algebraic loop, with a kink or a jump between its pieces (`reads(r)`:
+the access `r` may be one, as for `_affineIn`): a relation under `noEvent`, `abs`, `min`, `max`, `sign`, `floor`,
+`ceil` or `trunc` of what reads one, an if-expression whose condition reads one. A relation with events and an
+event-generating function hold their values in the loop's solve (`_affineIn`): an ideal thyristor's `if off[i]` is
+not piecewise in the loop's unknowns.
+"""
+function _piecewiseInUnknowns(x::IR, reads::F)::Bool where {F <: Function}
+  x isa Op || return false
+  if x.op in (:<, :<=, :>, :>=, :abs, :min, :max, :sign, :floor, :ceil, :trunc)
+    any(a::IR -> _affineIn(a, reads)[2], x.args) && return true
+  elseif x.op == :if
+    _affineIn(x.args[1], reads)[2] && return true
+  end
+  return any(a::IR -> _piecewiseInUnknowns(a, reads), x.args)
+end
+
+"""
+    _tearOrder(reads, readers, solves, lookahead) -> (order, tears, used)
+
+A block's unknowns (by index) in causal order: while an instance has one unknown left that it solves (`solves(e, v,
+access)`), it is solved for it; when none has, an unknown is torn (an iteration variable): the one whose being known
+lets the most instances be solved so, then the most read; with `lookahead > 1`, of the `lookahead` best so, the one
+that solves the most unknowns in turn (`_tearCascade`). Returns the solved (instance, unknown, access) in order, the
+torn unknowns, and the instances solved.
+"""
+function _tearOrder(reads::Vector{Vector{Tuple{Int, Int}}}, readers::Vector{Vector{Int}}, solves::Function,
+                    lookahead::Int)::Tuple{Vector{Tuple{Int, Int, Int}}, Vector{Int}, BitVector}
+  local n::Int = length(reads)
+  local known::BitVector = falses(n); local used::BitVector = falses(n)
+  local open::Vector{Int} = Int[length(reads[e]) for e in 1:n]
+  local order::Vector{Tuple{Int, Int, Int}} = Tuple{Int, Int, Int}[]
+  local tears::Vector{Int} = Int[]
+  local queue::Vector{Int} = Int[e for e in 1:n if open[e] == 1]
+  local learn!::Function = function (v::Int)
+    known[v] = true
+    for e in readers[v]
+      open[e] -= 1
+      (open[e] == 1 && !used[e]) && push!(queue, e)
+    end
+  end
+  while true
+    while !isempty(queue)
+      local e::Int = popfirst!(queue)
+      (used[e] || open[e] != 1) && continue
+      local (v::Int, access::Int) = reads[e][findfirst(x::Tuple{Int, Int} -> !known[x[1]], reads[e])]
+      solves(e, v, access) || continue
+      used[e] = true
+      push!(order, (e, v, access))
+      learn!(v)
+    end
+    all(known) && break
+    local scored::Vector{Tuple{Tuple{Int, Int}, Int}} = Tuple{Tuple{Int, Int}, Int}[]
+    for v in 1:n
+      known[v] && continue
+      local unlocks::Function = function (e::Int)
+        (used[e] || open[e] != 2) && return false
+        local other::Union{Nothing, Int} = findfirst(x::Tuple{Int, Int} -> !known[x[1]] && x[1] != v, reads[e])
+        return other !== nothing && solves(e, reads[e][other]...)
+      end
+      push!(scored, ((count(unlocks, readers[v]), count(e::Int -> !used[e], readers[v])), v))
+    end
+    sort!(scored; by = first, rev = true)
+    local best::Int = scored[1][2]
+    if lookahead > 1
+      local bestCascade::Int = -1
+      for (score, v) in first(scored, lookahead)
+        #= one that unlocks no instance solves none in turn: its cascade is itself =#
+        score[1] == 0 && break
+        local c::Int = _tearCascade(v, known, used, open, reads, readers, solves)
+        c > bestCascade && ((best, bestCascade) = (v, c))
+      end
+    end
+    push!(tears, best)
+    learn!(best)
+  end
+  return (order, tears, used)
+end
+
+"""
     _tearBlock(g, el, block, matchRow) -> TornBlock
 
 A large block torn as omc tears (greedily, each instance solved for the unknown it determines last, not its matched
-one): while an instance has one unknown of the block left that it solves explicitly (`_explicitDivisors`, a divisor
+one; `_tearOrder`): an instance is solved for an unknown it solves explicitly (`_explicitDivisors`, a divisor
 nonzero at the instance, the largest coefficient among the elements of its variable it reads, `_largestCoefficient`;
-not one it reads through two references), it is solved for it; when none has, the unknown whose being known lets the
-most instances be solved so is torn (an iteration variable). The instances left are
-the residuals. Batches by level (an instance after those it reads), then (class, access).
+not one it reads through two references). Torn twice, greedily and comparing `TEAR_LOOKAHEAD` candidates by their
+cascades (MSL EngineV6's loops in 52 iteration variables instead of 100); the one with fewer iteration variables is
+kept, the greedy one on a tie (the cascade can pick more: MSL ThreeSprings 4 instead of 3, one a spring length
+guessed 0). A block piecewise in its unknowns (`_piecewiseInUnknowns`) is torn greedily only: which unknowns are
+torn decides how the bounds between the pieces move with the iteration variables and the block's inputs. MSL
+DifferentialAmplifier's op-amp limiter, torn by the cascade in two currents (4 greedily), reached its input from the
+sources with a gain of 1e9: each step's guess, the last solution, was saturated at the next time, and Newton jumped
+between the supplies. A branch on a mode held through the solve is not piecewise in the unknowns: MSL
+ThyristorBridge2mPulse_DC_Drive's thyristors (`if off[i]`), 6 iteration variables by cascades, 12 greedily, whose
+events at the start did not settle. The instances left are the residuals. Batches by level (an instance after those
+it reads), then (class, access).
 """
 function _tearBlock(g::Gen, el::InstanceTable, block::Vector{Int}, matchRow::Vector{Int})::TornBlock
   local n::Int = length(block)
@@ -1652,43 +2111,15 @@ function _tearBlock(g::Gen, el::InstanceTable, block::Vector{Int}, matchRow::Vec
     local acc::Vector{Ref} = get!(() -> accesses!(accesses!(Ref[], c.lhs), c.rhs), accessesOf, el.class[r])
     return _largestCoefficient(g, c, el.col[r], acc, access, Int[x[2] for x in reads[e] if x[1] != v])
   end
-  local known::BitVector = falses(n); local used::BitVector = falses(n)
-  local open::Vector{Int} = Int[length(reads[e]) for e in 1:n]
-  local order::Vector{Tuple{Int, Int, Int}} = Tuple{Int, Int, Int}[]   #= (instance, unknown, access) in causal order =#
-  local tears::Vector{Int} = Int[]
-  local queue::Vector{Int} = Int[e for e in 1:n if open[e] == 1]
-  local learn!::Function = function (v::Int)
-    known[v] = true
-    for e in readers[v]
-      open[e] -= 1
-      (open[e] == 1 && !used[e]) && push!(queue, e)
-    end
-  end
-  while true
-    while !isempty(queue)
-      local e::Int = popfirst!(queue)
-      (used[e] || open[e] != 1) && continue
-      local (v::Int, access::Int) = reads[e][findfirst(x::Tuple{Int, Int} -> !known[x[1]], reads[e])]
-      solves(e, v, access) || continue
-      used[e] = true
-      push!(order, (e, v, access))
-      learn!(v)
-    end
-    all(known) && break
-    #= the unknown that leaves the most instances with one unknown, then the most read =#
-    local best::Int = 0; local bestScore::Tuple{Int, Int} = (-1, -1)
-    for v in 1:n
-      known[v] && continue
-      local unlocks::Function = function (e::Int)
-        (used[e] || open[e] != 2) && return false
-        local other::Union{Nothing, Int} = findfirst(x::Tuple{Int, Int} -> !known[x[1]] && x[1] != v, reads[e])
-        return other !== nothing && solves(e, reads[e][other]...)
-      end
-      local score::Tuple{Int, Int} = (count(unlocks, readers[v]), count(e::Int -> !used[e], readers[v]))
-      score > bestScore && ((best, bestScore) = (v, score))
-    end
-    push!(tears, best)
-    learn!(best)
+  #= (instance, unknown, access) in causal order, the iteration variables, the instances solved =#
+  local (order::Vector{Tuple{Int, Int, Int}}, tears::Vector{Int}, used::BitVector) = _tearOrder(reads, readers, solves, 1)
+  local unknowns::Set{Tuple{String, Bool}} = _unknownVariables(g, Int[matchRow[r] for r in block])
+  local readsUnknown::Function = (r::Ref) -> (r.name, r.der) in unknowns
+  if TEAR_LOOKAHEAD[] > 1 && !any(ci::Int -> _piecewiseInUnknowns(g.classes[ci].lhs, readsUnknown) ||
+                                             _piecewiseInUnknowns(g.classes[ci].rhs, readsUnknown),
+                                  Set{Int}(el.class[r] for r in block))
+    local cascaded::Tuple{Vector{Tuple{Int, Int, Int}}, Vector{Int}, BitVector} = _tearOrder(reads, readers, solves, TEAR_LOOKAHEAD[])
+    length(cascaded[2]) < length(tears) && ((order, tears, used) = cascaded)
   end
   local residuals::Vector{Int} = Int[e for e in 1:n if !used[e]]
   #= as many as iteration variables: each instance solved determines one unknown, each other unknown is torn =#
@@ -1777,12 +2208,12 @@ function _components(succ::Vector{Vector{Int}})::Vector{Int}
 end
 
 """
-The schedule of a model with algebraic loops (`_schedule`'s, where Kahn's algorithm leaves instances in cycles): the
-strongly connected sets of instances blocks (`LoopBlocks`), each solved as one; the blocks of a template batched by
-family (key (0, family), the batch listing block numbers), the other instances as `_schedule` batches them. Not an
-algorithm or a discrete unknown in a loop.
+The instances that read what each instance produces (the edges of the instances' graph), without the edges of `cuts`
+(producer, reader). With `comp` (the instances' strongly connected sets), the reads of a `settled` unknown within the
+set of its producer are cut too, into `cuts` (`_scheduleWithLoops`).
 """
-function _scheduleWithLoops(el::InstanceTable, matchRow::Vector{Int}, nU::Int, producer::Vector{Int}, pos::Vector{Int})
+function _instanceSuccessors!(cuts::Set{Tuple{Int, Int}}, el::InstanceTable, matchRow::Vector{Int},
+                              producer::Vector{Int}, settled::BitVector, comp::Vector{Int})::Vector{Vector{Int}}
   local N::Int = length(el.class)
   local succ::Vector{Vector{Int}} = [Int[] for _ in 1:N]
   for r in 1:N, i in el.uptr[r]:(el.uptr[r + 1] - 1)
@@ -1790,9 +2221,37 @@ function _scheduleWithLoops(el::InstanceTable, matchRow::Vector{Int}, nU::Int, p
     u == matchRow[r] && continue
     local q::Int = producer[u]
     (q == 0 || q == r) && continue
+    (!isempty(comp) && settled[u] && comp[q] == comp[r]) && push!(cuts, (q, r))
+    (q, r) in cuts && continue
     push!(succ[q], r)
   end
+  return succ
+end
+
+"""
+The schedule of a model with algebraic loops (`_schedule`'s, where Kahn's algorithm leaves instances in cycles): the
+strongly connected sets of instances blocks (`LoopBlocks`), each solved as one; the blocks of a template batched by
+family (key (0, family), the batch listing block numbers), the other instances as `_schedule` batches them. Not an
+algorithm in a loop. A loop through a discrete unknown the event iteration settles (`settled`: its equation reads the
+continuous variables through relations only, an ideal diode's `off = s < 0`) is cut at that unknown: its readers in the
+loop read its last value (it does not change between events; at an event the sweeps repeat until it stays, as
+OpenModelica's mixed systems), its own instance comes after the loop, which is of the continuous unknowns.
+"""
+function _scheduleWithLoops(el::InstanceTable, matchRow::Vector{Int}, nU::Int, producer::Vector{Int}, pos::Vector{Int},
+                            settled::BitVector)
+  local N::Int = length(el.class)
+  local cuts::Set{Tuple{Int, Int}} = Set{Tuple{Int, Int}}()
+  local succ::Vector{Vector{Int}} = _instanceSuccessors!(cuts, el, matchRow, producer, settled, Int[])
   local comp::Vector{Int} = _components(succ)
+  if any(settled)
+    #= cut, and the sets again: until no settled unknown is read within the set of its producer =#
+    for _ in 1:N
+      local before::Int = length(cuts)
+      succ = _instanceSuccessors!(cuts, el, matchRow, producer, settled, comp)
+      length(cuts) == before && break
+      comp = _components(succ)
+    end
+  end
   local members::Dict{Int, Vector{Int}} = Dict{Int, Vector{Int}}()
   foreach(r::Int -> push!(get!(() -> Int[], members, comp[r]), r), 1:N)
   local blocks::Vector{Vector{Int}} = Vector{Int}[]
@@ -1868,8 +2327,69 @@ function _scheduleWithLoops(el::InstanceTable, matchRow::Vector{Int}, nU::Int, p
 end
 
 """
+    _freeParameterDeps(g, el, matchRow, batches, producer, loops) -> Vector{Set{Tuple{String, Int}}}
+
+The elements (name, column-major index) of the parameters with fixed = false that every equation instance reads,
+directly or through the unknowns it reads (in schedule order, as `_stateDeps`; a loop block's instances all of the
+block's): the initialization's unknowns an initial equation of an algebraic variable can determine (MSL
+InitSpringConstant: `rev.a = 0` fixes the spring's c through the equations). Empty sets for a model without them.
+"""
+function _freeParameterDeps(g::Gen, el::InstanceTable, matchRow::Vector{Int},
+                            batches::Vector{Tuple{Tuple{Int, Int}, Vector{Int}}}, producer::Vector{Int},
+                            loops::LoopBlocks)::Vector{Set{Tuple{String, Int}}}
+  local N::Int = length(el.class)
+  local deps::Vector{Set{Tuple{String, Int}}} = [Set{Tuple{String, Int}}() for _ in 1:N]
+  isempty(g.freeParams) && return deps
+  local free::Set{String} = _initialFreeParams(g)
+  local done::BitVector = falses(N)
+  #= the free parameter elements an instance reads itself =#
+  local own::Function = (r::Int, s::Set{Tuple{String, Int}}) -> begin
+    el.class[r] > 0 || return s
+    local c::EqClass = g.classes[el.class[r]]
+    for a::Ref in accesses!(accesses!(Ref[], c.lhs), c.rhs)
+      a.name in free || continue
+      local info::VarInfo = g.vars[a.name]
+      local idx::Vector{Int} = Int[_evalInt(g, x, c.domain, el.col[r]) for x in a.subs]
+      push!(s, (a.name, isempty(info.dims) ? 1 : LinearIndices(Tuple(info.dims))[idx...]))
+    end
+    return s
+  end
+  local through::Function = (r::Int, s::Set{Tuple{String, Int}}, skip::Function) -> begin
+    for i::Int in el.uptr[r]:(el.uptr[r + 1] - 1)
+      local q::Int = producer[el.uid[i]]
+      (q == 0 || skip(q) || !done[q]) && continue
+      union!(s, deps[q])
+    end
+    return s
+  end
+  for ((ci::Int, _), batch::Vector{Int}) in batches
+    if ci == 0
+      for b::Int in batch
+        local rs::Vector{Int} = loops.blocks[b]
+        local s::Set{Tuple{String, Int}} = Set{Tuple{String, Int}}()
+        for r::Int in rs
+          own(r, s)
+          through(r, s, (q::Int) -> loops.blockOf[q] == b)
+        end
+        for r::Int in rs
+          deps[r] = s
+          done[r] = true
+        end
+      end
+      continue
+    end
+    for r::Int in batch
+      deps[r] = through(r, own(r, Set{Tuple{String, Int}}()), (q::Int) -> q == r)
+      done[r] = true
+    end
+  end
+  return deps
+end
+
+"""
 The states every equation instance depends on, through the algebraic unknowns it reads
-(in schedule order); nothing when that would be large.
+(in schedule order; not through a discrete unknown a loop was cut at, which comes after its readers); nothing when
+that would be large.
 """
 function _stateDeps(el::InstanceTable, matchRow, batches, producer, loops::LoopBlocks, nStates::Int)
   local N = length(el.class)
@@ -1885,7 +2405,9 @@ function _stateDeps(el::InstanceTable, matchRow, batches, producer, loops::LoopB
           union!(s, el.sid[el.sptr[r]:(el.sptr[r + 1] - 1)])
           for i in el.uptr[r]:(el.uptr[r + 1] - 1)
             local q::Int = producer[el.uid[i]]
-            (q == 0 || loops.blockOf[q] == b) && continue
+            #= not scheduled yet: a discrete unknown the loop was cut at (`_scheduleWithLoops`), constant between
+               events: no dependency on the states =#
+            (q == 0 || loops.blockOf[q] == b || !isassigned(deps, q)) && continue
             union!(s, deps[q])
           end
         end
@@ -1900,7 +2422,7 @@ function _stateDeps(el::InstanceTable, matchRow, batches, producer, loops::LoopB
       local s = Set{Int}(el.sid[el.sptr[r]:(el.sptr[r + 1] - 1)])
       for i in el.uptr[r]:(el.uptr[r + 1] - 1)
         local u = el.uid[i]
-        u == matchRow[r] && continue
+        (u == matchRow[r] || !isassigned(deps, producer[u])) && continue
         union!(s, deps[producer[u]])
       end
       deps[r] = sort!(collect(s))
@@ -2010,8 +2532,71 @@ function _affine(x::IR, key::String)::Union{Nothing, Tuple{IR, IR}}
     local abNumerator::Union{Nothing, Tuple{IR, IR}} = _affine(x.args[1], key)
     abNumerator === nothing && return nothing
     return (Op(:/, IR[abNumerator[1], x.args[2]]), Op(:/, IR[abNumerator[2], x.args[2]]))
+  elseif x.op == :if && length(x.args) == 3 && !any(r::Ref -> irKey(r) == key, accesses!(Ref[], x.args[1]))
+    #= an if-expression on a condition that does not read it (an if-equation's residual, `_ifResidual`): affine in
+       each branch; not where it is missing from one branch only (its coefficient zero there: no explicit solution) =#
+    local abThen::Union{Nothing, Tuple{IR, IR}} = _affine(x.args[2], key)
+    local abElse::Union{Nothing, Tuple{IR, IR}} = _affine(x.args[3], key)
+    (abThen === nothing || abElse === nothing) && return nothing
+    _isLit(abThen[1], 0.0) != _isLit(abElse[1], 0.0) && return nothing
+    local coefficient::IR = _isLit(abThen[1], 0.0) ? Lit(0.0) : Op(:if, IR[x.args[1], abThen[1], abElse[1]])
+    return (coefficient, Op(:if, IR[x.args[1], abThen[2], abElse[2]]))
   end
   return nothing
+end
+
+"""
+    _unknownVariables(g, ids) -> Set{Tuple{String, Bool}}
+
+The variables of the unknowns `ids` (a state's index for its derivative, an algebraic variable's after the states), as
+(name, der) of the accesses that read them: every element of an array that holds one counts (`_affineIn` then errs
+toward a nonlinear loop).
+"""
+function _unknownVariables(g::Gen, ids::AbstractArray{Int})::Set{Tuple{String, Bool}}
+  local found::Set{Tuple{String, Bool}} = Set{Tuple{String, Bool}}()
+  local nS::Int = g.nStates
+  for (name::String, info::VarInfo) in g.vars
+    local n::Int = prod(info.dims; init = 1)
+    if info.kind == :state
+      any(u::Int -> u <= nS && info.offset < u <= info.offset + n, ids) && push!(found, (name, true))
+    elseif info.kind == :alg
+      any(u::Int -> u > nS && info.offset < u - nS <= info.offset + n, ids) && push!(found, (name, false))
+    end
+  end
+  return found
+end
+
+"""
+    _affineIn(x, reads) -> Tuple{Bool, Bool}
+
+Whether `x` is affine in the unknowns of an algebraic loop, and whether it reads one (`reads(r)`: the access `r` may be
+one). Affine through +, -, negation, noEvent and homotopy of affine arguments, a product of which one factor reads
+an unknown, a quotient whose numerator does, and an if-expression whose condition does not. A relation and an
+event-generating function hold their values in a loop's solve (`_relationAt` with `mode` false), so they read none. An
+access whose subscript reads an unknown is not affine, nor is any other operation on one.
+"""
+function _affineIn(x::IR, reads::F)::Tuple{Bool, Bool} where {F <: Function}
+  if x isa Ref
+    any(s::IR -> _affineIn(s, reads)[2], x.subs) && return (false, true)
+    return (true, reads(x))
+  end
+  x isa Op || return (true, false)
+  local parts::Vector{Tuple{Bool, Bool}} = Tuple{Bool, Bool}[_affineIn(a, reads) for a in x.args]
+  any(last, parts) || return (true, false)
+  local n::Int = length(parts)
+  if x.op in (:+, :-, :neg, :noEvent, :homotopy)
+    return (all(first, parts), true)
+  elseif x.op == :*
+    return (all(first, parts) && count(last, parts) == 1, true)
+  elseif x.op == :/
+    return (n == 2 && parts[1][1] && !parts[2][2], true)
+  elseif x.op == :if
+    return (n == 3 && !parts[1][2] && parts[2][1] && parts[3][1], true)
+  elseif x.op == :probed
+    #= a relation's value with its abs() argument's probe, evaluated for its crossing only =#
+    return (parts[1][1], true)
+  end
+  return (false, true)
 end
 
 _isLit(x::IR, v::Float64)::Bool = x isa Lit && x.v isa Real && x.v == v

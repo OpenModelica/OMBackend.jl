@@ -60,8 +60,9 @@ derivatives make the block's Jacobian regular, the candidates ranked by
 3. a constant entry of the Jacobian before one that reads the unknowns (`x = L * sin(phi)`
    keeps phi the state);
 4. the largest pivot of the Jacobian at the start values (where those are not regular, their
-   pivots kept and the rest at a generic point that keeps the relations explicit equations
-   give, `propagatedValues`, then at `genericValues`, then structurally);
+   pivots kept and the rest at the start values carried through the relations explicit
+   equations give, `propagatedValues`, then at a generic point that keeps those relations,
+   then at `genericValues`, then structurally);
 5. among equals, as dummy first the derivative of a derivative variable (`\$DER.x`, which has
    no name of its own), then a variable without a fixed start, then the later declared: the
    first declared variables, and those the user fixed, stay states.
@@ -69,7 +70,7 @@ derivatives make the block's Jacobian regular, the candidates ranked by
 OpenModelica chooses the same states for most models; otherwise an alias of ours, another
 coordinate of a rigid chain, or a dynamic state set (here behind `OMBACKEND_DYNAMIC_STATE_SETS`).
 
-With arrays kept (`OMBACKEND_ARRAY_INDEX_REDUCTION`, Arrays.jl, ArrayCommit.jl, ArraySets.jl): the
+With arrays kept (`OMBACKEND_ARRAY_INDEX_REDUCTION`, arrays.jl, arrayCommit.jl, arraySets.jl): the
 plan is made on the model's element view (its arrays as their elements, its for-equations
 unrolled: the scalar graph of Abdelhak, Casella and Bachmann's Pseudo Array Causalization) and
 committed in array form where it treats the elements of each array alike: a for-equation
@@ -81,29 +82,33 @@ slicing, not yet), NotHandled, and the frontend scalarizes.
 module IndexReduction
 
 import ..OMJLIR
+import ..builtinCall
 import ..substituteIterators, ..foldSubscripts, ..expressionLargerThan, ..foldInteger, ..mapRoots, ..rowMajor,
-       ..unsubscriptedName, ..allSubscripts
+       ..unsubscriptedName, ..variableNameOf, ..allSubscripts, ..recordEquations, ..constantRecord,
+       ..bodyRecordEquations
 import ...envSwitch
+import ...LowerUtil: assignedCrefs
 import ..Evaluation: arithmetic, asRecord, divide, elementOf, evaluate, foldScalar, genericOffset,
        genericValues, ifThenElse, inlineBody, isLiteral, isOne, isZero, isZeroExp, literalCondition,
-       literalValue, minus, negate, ONE, plus, power, real, selectElement, StartValues, subscripted,
-       times, withKnownValues, functionDefinedValues, ZERO, zeroOf
+       literalValue, minus, negate, ONE, ownValues, plus, power, real, selectElement, StartValues, subscripted,
+       times, withKnownValues, withKnownValuesAndConstants, functionDefinedValues, ZERO, zeroOf
 const IR = OMJLIR
 
-include("Structure.jl")
-include("LinearConstraints.jl")
-include("Pantelides.jl")
-include("Differentiate.jl")
-include("Aliases.jl")
-include("DummyDerivatives.jl")
-include("SolveDerivatives.jl")
-include("Commit.jl")
-include("Arrays.jl")
-include("ArrayCommit.jl")
-include("ArraySlicing.jl")
-include("ComponentRolling.jl")
-include("ArraySolve.jl")
-include("ArraySets.jl")
-include("Explain.jl")
+include("structure.jl")
+include("linearConstraints.jl")
+include("pantelides.jl")
+include("differentiate.jl")
+include("aliases.jl")
+include("dummyDerivatives.jl")
+include("solveDerivatives.jl")
+include("commit.jl")
+include("arrays.jl")
+include("arrayCommit.jl")
+include("arraySlicing.jl")
+include("componentRolling.jl")
+include("arraySolve.jl")
+include("arraySets.jl")
+include("arrayAliases.jl")
+include("explain.jl")
 
 end # IndexReduction

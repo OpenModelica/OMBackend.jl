@@ -34,8 +34,42 @@
 */ =#
 
 #= Passes on the equations of the continuous-time partition (the previous backend's BDAECreate):
-   smooth() removed, duplicates removed, the bindings as equations, the asserts of if-equations
-   hoisted. =#
+   the equations of no elements removed, smooth() removed, duplicates removed, the bindings as equations, the asserts
+   of if-equations hoisted. =#
+
+"""
+    removeEmptyEquations!(model)
+
+The equations of no elements removed from every partition, its initial equations too: an array equation with a
+dimension of size 0, a for-equation over an empty range or with only such equations (MLS 10.1: an array with a
+dimension of size 0 has no elements). The scalarizing frontend leaves them out; with the arrays kept they came here,
+and the der() of a slice of size 0 stayed (no variable to introduce for it): MSL BatchPlant_StandardWater's media
+without substances (nXi = nC = 0), 7 equations, sent the model to the scalarized path and a second flatten.
+"""
+function removeEmptyEquations!(model::IR.Model)::IR.Model
+  for p in Iterators.flatten((model.continuous, model.clocked))
+    _removeEmpty!(p.equations)
+    _removeEmpty!(p.initialEquations)
+  end
+  return model
+end
+
+"`equations` without those of no elements (removeEmptyEquations!), the for-equations' bodies first."
+function _removeEmpty!(equations::Vector{IR.Equation})::Vector{IR.Equation}
+  for eq in equations
+    eq isa IR.FOR_EQUATION && _removeEmpty!(eq.body)
+  end
+  return filter!(eq -> !_hasNoElements(eq), equations)
+end
+
+"Whether an equation has no elements (removeEmptyEquations!); its body already without such equations."
+_hasNoElements(eq::IR.ARRAY_EQUATION)::Bool = _hasZeroDimension(eq.ty)
+_hasNoElements(eq::IR.FOR_EQUATION)::Bool =
+  isempty(eq.body) || (eq.iterator.range isa IR.RANGE && _hasZeroDimension(eq.iterator.range.ty))
+_hasNoElements(::IR.Equation)::Bool = false
+
+"Whether an array type has a dimension of size 0."
+_hasZeroDimension(ty::IR.T_ARRAY)::Bool = any(d -> d isa IR.DIM_SIZE && d.size == 0, ty.dimensions)
 
 """
     removeSmooth!(model)
@@ -52,7 +86,7 @@ pump; as noEvent, OpenModelica's choice, the one failed validation and the other
 """
 function removeSmooth!(model::IR.Model)::IR.Model
   local eventful = x -> x isa IR.RELATION || x isa IR.IF_EXPRESSION
-  local differentiable = e -> begin
+  local differentiable = (@nospecialize(e::IR.Expression)) -> begin
     (IR.isBuiltinCall(e, :smooth) && length(e.arguments) == 2 && e.arguments[1] isa IR.INTEGER &&
      e.arguments[1].value >= 1) || return e
     local inner = e.arguments[2]
@@ -72,6 +106,72 @@ function removeSmooth!(model::IR.Model)::IR.Model
 end
 
 """
+    freeDependentParameters!(model) -> Model
+
+A scalar parameter whose binding reads a parameter with fixed = false, directly or through other bindings, gets its
+value from the initialization as that one does (OpenModelica's initial system): fixed = false, its binding the initial
+equation `p = binding`. MSL's noise blocks: `actualGlobalSeed = if useGlobalSeed then globalSeed.seed else 0`, the
+seed an initial equation's (GlobalSeed); the array code had the value the translation computed for the binding.
+For the arrays-kept route.
+"""
+function freeDependentParameters!(model::IR.Model)::IR.Model
+  local initial::Vector{IR.Equation} = model.continuous[1].initialEquations
+  for v::IR.Variable in model.variables
+    (v.kind isa IR.PARAMETER && v.binding !== nothing &&
+     v.ty isa Union{IR.T_REAL, IR.T_INTEGER, IR.T_BOOLEAN}) || continue
+    local fixed::Union{Nothing, IR.Expression} = v.attributes.fixed
+    (fixed === nothing || (fixed isa IR.BOOLEAN && fixed.value)) || continue
+    IndexReduction.readsFreeParameter(v.binding, model.variables, Set{Symbol}([v.name])) || continue
+    push!(initial, IR.SCALAR_EQUATION(IR.CREF(v.cref, v.ty), v.binding, v.ty, IR.NO_SOURCE, IR.DEFAULT_ATTRIBUTES))
+    local a::IR.VariableAttributes = v.attributes
+    v.attributes = IR.VariableAttributes(a.start, IR.BOOLEAN(false), a.nominal, a.min, a.max, a.unit, a.displayUnit,
+                                         a.quantity, a.stateSelect)
+    v.binding = nothing
+  end
+  return model
+end
+
+"""
+    streamsWithoutEvents!(model) -> Model
+
+actualStream as the frontend writes it, `smooth(0, m * (if m > 0 then a else b))` and `smooth(0, if m > 0 then a else
+b)` (its factor `m` outside), with its condition in `noEvent`, in the equations of the main partition: for the
+arrays-kept route. The value is continuous in `m` (what `smooth(0, ...)` says), OpenModelica makes no event in
+`smooth`, and the array code computes a port's flow from the states at each point: two pressures of 1e5 Pa whose
+round-off, 3e-10 Pa, times a port's conductance of 0.3 kg/s/Pa is a flow of 1e-10 kg/s, the relation's hysteresis.
+After an event that starts a flow from rest the sign of such a flow is noise, each flip was an event, and MSL
+Fluid's RoomCO2WithControls stopped at its table's first event (59888 steps in 0.3 s; the scalarized route, whose
+flows are variables of the solver, 618 for the day).
+"""
+function streamsWithoutEvents!(model::IR.Model)::IR.Model
+  local quiet = (@nospecialize(e::IR.Expression)) -> begin
+    (IR.isBuiltinCall(e, :smooth) && length(e.arguments) == 2 && e.arguments[1] isa IR.INTEGER &&
+     e.arguments[1].value == 0) || return e
+    local streamed::IR.Expression = withQuietFlowDirection(e.arguments[2])
+    streamed === e.arguments[2] && return e
+    return IR.CALL(e.name, IR.Expression[e.arguments[1], streamed], e.ty, e.attributes)
+  end
+  foreach(eq -> IR.mapEquation!(quiet, eq), model.continuous[1].equations)
+  return model
+end
+
+"`if m > 0 then a else b`, alone or as the factor of `m`, with its condition in noEvent; another expression itself."
+function withQuietFlowDirection(@nospecialize(e::IR.Expression))::IR.Expression
+  if e isa IR.IF_EXPRESSION && isFlowDirection(e.condition)
+    return IR.IF_EXPRESSION(builtinCall(:noEvent, IR.Expression[e.condition], IR.T_BOOLEAN()), e.thenExp, e.elseExp, e.ty)
+  elseif e isa IR.BINARY && e.op === IR.MUL && e.exp2 isa IR.IF_EXPRESSION && isFlowDirection(e.exp2.condition) &&
+         e.exp1 == e.exp2.condition.exp1
+    return IR.BINARY(e.exp1, e.op, withQuietFlowDirection(e.exp2), e.ty)
+  end
+  return e
+end
+
+"Whether `c` is `m > 0` or `m >= 0` of a variable `m` (a flow's direction)."
+isFlowDirection(@nospecialize(c::IR.Expression))::Bool =
+  c isa IR.RELATION && (c.op === IR.GREATER || c.op === IR.GREATEREQ) && c.exp1 isa IR.CREF &&
+  ((c.exp2 isa IR.REAL && c.exp2.value == 0.0) || (c.exp2 isa IR.INTEGER && c.exp2.value == 0))
+
+"""
     equationKey(eq)
 
 A structural hash of an equation: its kind, its expressions, its source and attributes, its
@@ -84,7 +184,7 @@ function equationKey(eq::IR.Equation, h::UInt = zero(UInt))::UInt
     if x isa IR.Equation
       h = equationKey(x, h)
     elseif x isa Vector{IR.Equation}
-      foreach(e -> (h = equationKey(e, h)), x)
+      foreach((@nospecialize(e::IR.Equation)) -> (h = equationKey(e, h)), x)
     elseif x isa Vector{IR.EquationBranch}
       for b in x
         h = hash(b.condition, h)
@@ -134,9 +234,13 @@ others, MLS 4.4.4): a Real's (scalar) `v = e`; a Boolean's `if a > b then true e
 a when / elsewhen equation (`isLatchedBooleanBinding`: it updates at the condition's events);
 a Boolean's, Integer's
 or enumeration's `v = e` (the discrete lifting makes it a when-equation where `e` is
-discrete-time). A discrete Real with a binding is not Modelica (not supported). Parameters and
-constants (their bindings are their values), Strings, arrays and records (their bindings are
-equations already) are left.
+discrete-time). A Real array's `v = e` as a for-equation over its elements (`IndexReduction.bindingEquation`;
+arrays kept: a field of a component array, `Real b = 2 * a` of `C c[3]`; the frontend makes the binding of an array
+declared as one an equation itself and leaves none on the variable).
+A Boolean, Integer or enumeration array's (arrays kept) an equation per element
+(`IndexReduction.discreteBindingEquations`).
+A discrete Real with a binding is not Modelica (not supported). Parameters and constants (their bindings are their
+values), Strings, records and the other arrays are left.
 """
 function addBindingEquations!(model::IR.Model)::IR.Model
   for p in model.continuous
@@ -156,6 +260,9 @@ function addBindingEquations!(variables::IR.VariableSet, partition::IR.Partition
     local lhs = IR.CREF(v.cref, v.ty)
     if continuous && v.ty isa IR.T_REAL
       push!(partition.equations, IR.SCALAR_EQUATION(lhs, v.binding, v.ty, IR.NO_SOURCE, IR.DEFAULT_ATTRIBUTES))
+    elseif continuous && v.ty isa IR.T_ARRAY && v.ty.elementType isa IR.T_REAL
+      local rolled::Union{Nothing, IR.FOR_EQUATION} = IndexReduction.bindingEquation(v, variables)
+      rolled === nothing || push!(partition.equations, rolled)
     elseif discrete && v.ty isa IR.T_BOOLEAN && isLatchedBooleanBinding(v.binding)
       local b = v.binding
       local branches = IR.WhenBranch[
@@ -165,6 +272,8 @@ function addBindingEquations!(variables::IR.VariableSet, partition::IR.Partition
       push!(partition.equations, IR.WHEN_EQUATION(branches, IR.REGULAR_WHEN, IR.NO_SOURCE, IR.DEFAULT_ATTRIBUTES))
     elseif discrete && v.ty isa Union{IR.T_BOOLEAN, IR.T_INTEGER, IR.T_ENUMERATION}
       push!(partition.equations, IR.SCALAR_EQUATION(lhs, v.binding, v.ty, IR.NO_SOURCE, IR.DEFAULT_ATTRIBUTES))
+    elseif discrete && v.ty isa IR.T_ARRAY && v.ty.elementType isa Union{IR.T_BOOLEAN, IR.T_INTEGER, IR.T_ENUMERATION}
+      append!(partition.equations, IndexReduction.discreteBindingEquations(v, variables))
     elseif v.kind isa IR.DISCRETE && v.ty isa IR.T_REAL
       unsupported("a discrete Real variable with a declaration binding", v.name)
     end

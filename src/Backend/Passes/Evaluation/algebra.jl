@@ -36,7 +36,7 @@
 #= OMJLIR expressions built simplified: the constructors drop zero and one terms and fold
    literals (`0 * w` is `0`, `if c then e else e` is `e`), the literal tests, and `foldScalar`,
    which rebuilds an arithmetic node with them. Differentiation builds its derivatives with them
-   (IndexReduction/Differentiate.jl). =#
+   (IndexReduction/differentiate.jl). =#
 
 const ZERO = IR.REAL(0.0)
 
@@ -99,7 +99,8 @@ function power(a::IR.Expression, b::IR.Expression)::IR.Expression
 end
 
 "`if c then a else b`, or the branch where both are the same (one node, or literals of one value: the derivative of each branch of a piecewise function by a variable neither reads)."
-function ifThenElse(c::IR.Expression, a::IR.Expression, b::IR.Expression, ty::IR.ModelicaType)::IR.Expression
+function ifThenElse(@nospecialize(c::IR.Expression), @nospecialize(a::IR.Expression),
+                    @nospecialize(b::IR.Expression), @nospecialize(ty::IR.ModelicaType))::IR.Expression
   (a === b || (isLiteral(a) && isLiteral(b) && literalValue(a) == literalValue(b))) && return a
   local known = literalCondition(c)
   known === nothing || return known ? a : b
@@ -112,7 +113,7 @@ end
 The value of a condition of literals (`true`, `3 == 1`: an inlined function's `if axis == 1`
 for a literal axis); `nothing` for one that reads anything else.
 """
-function literalCondition(c::IR.Expression)::Union{Nothing, Bool}
+function literalCondition(@nospecialize(c::IR.Expression))::Union{Nothing, Bool}
   c isa IR.BOOLEAN && return c.value
   (c isa IR.RELATION && isLiteral(c.exp1) && isLiteral(c.exp2)) || return nothing
   local (a, b) = (literalValue(c.exp1), literalValue(c.exp2))
@@ -132,21 +133,54 @@ real(x::Float64)::IR.Expression = IR.REAL(x)
 
 A scalar arithmetic node (`ADD`, `SUB`, `MUL`, `DIV`, `POW`, unary minus of a Real) rebuilt with
 the constructors above, its zero and one terms dropped and its literals folded (`0 * w` is `0`);
-an if-expression of equal branches the branch (`ifThenElse`); another node as it is.
+an if-expression of equal branches the branch (`ifThenElse`); `size` of an array literal along its first dimension
+the number of its elements; a scalar product of two vector literals the sum of its terms; an array literal
+subscripted by Integer literals its element (`literalElement`); another node as it is.
 """
 function foldScalar(x::IR.Expression)::IR.Expression
+  x isa IR.SUBSCRIPTED && return literalElement(x)
   if x isa IR.BINARY && x.ty isa IR.T_REAL
     x.op === IR.ADD && return plus(x.exp1, x.exp2)
     x.op === IR.SUB && return minus(x.exp1, x.exp2)
     x.op === IR.MUL && return times(x.exp1, x.exp2)
     x.op === IR.DIV && return divide(x.exp1, x.exp2)
     x.op === IR.POW && return power(x.exp1, x.exp2)
+    #= a scalar product of two vector literals: the sum of their elements' products (`{dh_dX} * {der_X}`, the
+       derivative of a medium function by its mass fractions written out, where the element view of a for-equation
+       has the terms: "a for-equation whose derivative in array form is not the element's") =#
+    if x.op === IR.SCALAR_PRODUCT && x.exp1 isa IR.ARRAY && x.exp2 isa IR.ARRAY && !isempty(x.exp1.elements) &&
+       length(x.exp1.elements) == length(x.exp2.elements) &&
+       !any((y::IR.Expression) -> y isa IR.ARRAY, x.exp1.elements) &&
+       !any((y::IR.Expression) -> y isa IR.ARRAY, x.exp2.elements)
+      return foldl(plus, IR.Expression[times(a, b) for (a, b) in zip(x.exp1.elements, x.exp2.elements)])
+    end
   elseif x isa IR.UNARY && x.op === IR.UMINUS && x.ty isa IR.T_REAL
     return negate(x.exp)
   elseif x isa IR.IF_EXPRESSION
     return ifThenElse(x.condition, x.thenExp, x.elseExp, x.ty)
+  elseif x isa IR.SIZE && x.exp isa IR.ARRAY && x.dimension isa IR.INTEGER && x.dimension.value == 1
+    #= `size({a, b}, 1)`: the literal's elements' number (`if size({Xi[1]}, 1) == 2 then ... else ...`, a state record
+       chosen by the mass fractions' number in MSL Fluid: its condition is a literal's then, `ifThenElse`) =#
+    return IR.INTEGER(length(x.exp.elements))
   end
   return x
+end
+
+"""
+    literalElement(x) -> Expression
+
+`x` (`exp[subscripts]`) as what it selects where `exp` is an array literal and its subscripts Integer literals
+within its sizes (`{{0.0, 0.0}, {0.0, 0.0}}[1, 2]`: the derivative of a constant rotation matrix, written out per
+element in array form, then `0 * w`; fewer subscripts than the nesting select an inner literal); `x` as it is
+otherwise.
+"""
+function literalElement(x::IR.SUBSCRIPTED)::IR.Expression
+  local e::IR.Expression = x.exp
+  for s in x.subscripts
+    (e isa IR.ARRAY && s isa IR.INDEX && s.exp isa IR.INTEGER && 1 <= s.exp.value <= length(e.elements)) || return x
+    e = e.elements[s.exp.value]
+  end
+  return e
 end
 
 "Whether `e` is zero: a zero literal, or an array of zeros."

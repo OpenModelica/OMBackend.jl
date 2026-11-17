@@ -36,13 +36,17 @@
 #= The plan of index reduction, made without changing the model, and its commit. =#
 
 """
-    Plan(structure, differentiated, dummies, sets, known)
+    Plan(structure, differentiated, dummies, sets, known, carried, constants)
 
 What index reduction changes in a partition: the structure Pantelides' algorithm grew (its new
 derivative variables), the differentiated equations (by the index of the equation they are
 derivatives of), the dummy derivatives (the dynamic sets' candidates among them), and the dynamic
 state sets; the simulation code's values it was made with (`KNOWN_VALUES`; empty for a plan as
-written), which the derivatives' solve reads too (`solveDerivatives!`).
+written), which the derivatives' solve reads too (`solveDerivatives!`); the start values carried
+through the explicit relations for the variables that declare none (`carriedStarts`), which the
+commit writes as the guesses of the states among them, of those with an alias that declares one, and of the
+sets' states; the variables the structure read as constants (`withKnownValuesAndConstants`: no derivative variable,
+their derivatives zero where an equation that reads them is differentiated as written, `arraySeeds`).
 """
 struct Plan
   structure::Structure
@@ -50,6 +54,8 @@ struct Plan
   dummies::Set{Int}
   sets::Vector{DynamicSet}
   known::Dict{Symbol, IR.Expression}
+  carried::CarriedStarts
+  constants::Set{Symbol}
 end
 
 """
@@ -63,11 +69,13 @@ capacitance's der() out of the system). `nothing` when not set.
 const KNOWN_VALUES = Ref{Union{Nothing, Function}}(nothing)
 
 """
-    plan(model, partition; indexOne = false) -> Union{Nothing, Plan}
+    plan(model, partition; indexOne = false, initialDerivatives = false) -> Union{Nothing, Plan}
 
 The index reduction of `partition`, without changing the model; `nothing` where the partition
 is of index 1 (nothing to differentiate), unless `indexOne`: then the plan that differentiates
-nothing, which commits the states (the arrays-kept route's, `reduceIndexArrays!`). Throws
+nothing, which commits the states (the arrays-kept route's, `reduceIndexArrays!`). With `initialDerivatives` (the
+arrays-kept route's) the equations of the variables the initial equations read der() of without a derivative
+differentiated too (`initialDerivatives!`). Throws
 NotHandled where a step does not handle it.
 Made on the partition with the values known before the simulation as literals
 (`withKnownValues`), the structure the code generators see, der() of an expression expanded
@@ -75,11 +83,12 @@ Made on the partition with the values known before the simulation as literals
 """
 function plan(model::IR.Model, partition::IR.Partition;
               known::Dict{Symbol, IR.Expression} = Dict{Symbol, IR.Expression}(),
-              trace::Union{Nothing, Vector{BlockTrace}} = nothing, indexOne::Bool = false)::Union{Nothing, Plan}
+              trace::Union{Nothing, Vector{BlockTrace}} = nothing, indexOne::Bool = false,
+              initialDerivatives::Bool = false)::Union{Nothing, Plan}
   any(v -> v.ty isa IR.T_ARRAY && !(v.kind isa Union{IR.PARAMETER, IR.CONSTANT}), model.variables) &&
     throw(NotHandled("array variables (the arrays-kept path; scalarized models only)"))
   #= the structure the code generators see: the known values substituted =#
-  local folded = withKnownValues(model, partition; known)
+  local (folded::IR.Partition, constants::Set{Symbol}) = withKnownValuesAndConstants(model, partition; known)
   local functions = Dict{Symbol, IR.ModelicaFunction}(f.name => f for f in model.functions)
   local derived::Vector{Symbol} = expandDerivatives!(folded.equations, continuousNames(model.variables, folded), model.variables, functions)
   local s = Structure(model.variables, folded, model.functions; derived)
@@ -87,16 +96,16 @@ function plan(model::IR.Model, partition::IR.Partition;
   nRows == unknownCount(s) ||
     throw(NotHandled("a continuous system of $(nRows) rows over $(unknownCount(s)) unknowns (not square as the structure reads it)"))
   local preferred = artificialStates!(s, folded, model.variables; prefer = envSwitch("OMBACKEND_PREFER_STATES"))
-  preferred == 0 && return planStructure(s, nRows, folded, model; trace, known, indexOne)
+  preferred == 0 && return planStructure(s, nRows, folded, model; trace, known, indexOne, constants, initialDerivatives)
   try
-    return planStructure(s, nRows, folded, model; trace, known, indexOne)
+    return planStructure(s, nRows, folded, model; trace, known, indexOne, constants, initialDerivatives)
   catch e
     e isa NotHandled || rethrow()
     #= the artificial states of StateSelect.prefer given up where their equations do not differentiate, as
        OpenModelica's sanityCheckArtificialStates (all of them here) =#
     local t = Structure(model.variables, folded, model.functions; derived)
     artificialStates!(t, folded, model.variables; prefer = false)
-    return planStructure(t, nRows, folded, model; trace, known, indexOne)
+    return planStructure(t, nRows, folded, model; trace, known, indexOne, constants, initialDerivatives)
   end
 end
 
@@ -106,20 +115,39 @@ end
 The plan of `plan` from the structure `s` of `partition` (its first `nRows` rows the partition's, its artificial
 states' derivatives added): Pantelides' algorithm, the differentiated equations, the dummy derivatives; where nothing
 is differentiated `nothing`, or with `indexOne` the plan of no differentiation. `known`: the simulation code's values
-the plan is made with.
+the plan is made with; `constants`: the variables `partition` was folded with as constants; `initialDerivatives`: as
+`plan`'s.
 """
 function planStructure(s::Structure, nRows::Int, partition::IR.Partition, model::IR.Model;
                        trace::Union{Nothing, Vector{BlockTrace}} = nothing,
                        known::Dict{Symbol, IR.Expression} = Dict{Symbol, IR.Expression}(),
-                       indexOne::Bool = false)::Union{Nothing, Plan}
-  pantelides!(s)
-  length(s.rows) == nRows && return indexOne ? Plan(s, Dict{Int, Vector{IR.Equation}}(), Set{Int}(), DynamicSet[], known) : nothing
-  local differentiated = differentiatedEquations(s, partition, model.functions)
+                       indexOne::Bool = false, constants::Set{Symbol} = Set{Symbol}(),
+                       initialDerivatives::Bool = false)::Union{Nothing, Plan}
+  local m::PantelidesMatching = pantelides!(s)
   local sets = DynamicSet[]
-  trace === nothing || empty!(trace)
-  local dummies = dummyDerivatives(s, partition, differentiated, model.variables, model.functions; sets, trace)
-  foreach(set -> union!(dummies, set.candidates, set.linked...), sets)
-  return Plan(s, differentiated, dummies, sets, known)
+  local start = Ref{Union{Nothing, StartValues}}(nothing)
+  local dummies = Set{Int}()
+  local differentiated::Dict{Int, Vector{IR.Equation}} = Dict{Int, Vector{IR.Equation}}()
+  if length(s.rows) > nRows
+    differentiated = differentiatedEquations(s, partition, model.functions)
+    trace === nothing || empty!(trace)
+    dummies = dummyDerivatives(s, partition, differentiated, model.variables, model.functions; sets, trace, start)
+    foreach(set -> union!(dummies, set.candidates, set.linked...), sets)
+  end
+  #= the derivatives the initial equations read of variables that are no states, after the choice of states (which
+     they do not change): their equations differentiated, the derivatives dummies =#
+  if initialDerivatives
+    local rows::Int = length(s.rows)
+    union!(dummies, initialDerivatives!(s, m, initialDerivativeReads(partition.initialEquations)))
+    length(s.rows) > rows && (differentiated = differentiatedEquations(s, partition, model.functions))
+  end
+  if length(s.rows) == nRows
+    indexOne || return nothing
+    return Plan(s, Dict{Int, Vector{IR.Equation}}(), Set{Int}(), DynamicSet[], known, CarriedStarts(), constants)
+  end
+  local carried::CarriedStarts =
+    carriedStarts(s, partition, differentiated, model.variables, model.functions, start)
+  return Plan(s, differentiated, dummies, sets, known, carried, constants)
 end
 
 "The names of the continuous variables of `partition` (`isContinuousVariable`)."
@@ -157,6 +185,7 @@ function commit!(model::IR.Model, partition::IR.Partition, plan::Plan)::Nothing
     local kind = plannedKind(s, D, v)
     kind === nothing || (model.variables[s.variables[v]].kind = kind)
   end
+  applyCarried!(model.variables, plan.carried)
   for (eq, chain) in sort(collect(plan.differentiated); by = first)
     local previous = partition.equations[eq]
     for derivative in chain
@@ -168,7 +197,7 @@ function commit!(model::IR.Model, partition::IR.Partition, plan::Plan)::Nothing
   for v in selectedStates(s, D)
     linkStateDerivative!(model, partition, s.variables[v], s.variables[s.derivative[v]])
   end
-  foreach(((k, set),) -> dynamicSet!(model, partition, s, set, k), enumerate(plan.sets))
+  foreach(((k, set),) -> dynamicSet!(model, partition, s, set, k, plan.carried.values), enumerate(plan.sets))
   return nothing
 end
 
@@ -192,7 +221,7 @@ function plannedKind(s::Structure, dummies::Set{Int}, v::Int)::Union{Nothing, IR
 end
 
 """
-    dynamicSet!(model, partition, s, set, k)
+    dynamicSet!(model, partition, s, set, k, carried)
 
 The dynamic state set `set` as the `k`-th state set of the model (`\$STATESETk`, OpenModelica's
 form): its candidates are dummy derivatives (commit!), their variables `V` dummy states; the
@@ -205,27 +234,30 @@ when-equation makes candidate `d` the dummy where its pivot (`jacobian`, one row
 twice the dummy's: `A` set to the selection of the others, the states of every level
 reinitialized to it.
 """
-function dynamicSet!(model::IR.Model, partition::IR.Partition, s::Structure, set::DynamicSet, k::Int)::Nothing
-  local (variables, equations) = dynamicSetParts(model, s, set, k)
+function dynamicSet!(model::IR.Model, partition::IR.Partition, s::Structure, set::DynamicSet, k::Int,
+                     carried::Dict{Symbol, Float64})::Nothing
+  local (variables, equations) = dynamicSetParts(model.variables, s, set, k, carried)
   foreach(v -> push!(model.variables, v), variables)
   append!(partition.equations, equations)
   return nothing
 end
 
 """
-    dynamicSetParts(model, s, set, k) -> Tuple{Vector{IR.Variable}, Vector{IR.Equation}}
+    dynamicSetParts(modelVariables, s, set, k, carried) -> Tuple{Vector{IR.Variable}, Vector{IR.Equation}}
 
 The variables and equations of the dynamic state set `set` as the `k`-th state set of the model (`dynamicSet!`),
-the model not changed.
+the model not changed. `modelVariables`: the variables the set's candidates are looked up in (their references, the
+start values that guess the states).
 """
-function dynamicSetParts(model::IR.Model, s::Structure, set::DynamicSet, k::Int)::Tuple{Vector{IR.Variable}, Vector{IR.Equation}}
+function dynamicSetParts(modelVariables::IR.VariableSet, s::Structure, set::DynamicSet, k::Int,
+                         carried::Dict{Symbol, Float64})::Tuple{Vector{IR.Variable}, Vector{IR.Equation}}
   size(set.jacobian, 1) == 1 || throw(NotHandled("a dynamic state set of $(size(set.jacobian, 1)) rows"))
   local variables = IR.Variable[]
   local equations = IR.Equation[]
   local n = length(set.candidates)
   #= a variable of the model or the structure by its own reference (a matrix element as SimCode names it, a derivative
      `IR.derivativeCref`); NotHandled for another name =#
-  local realRef::Function = (name::Symbol) -> IR.CREF(haskey(model.variables, name) ? model.variables[name].cref :
+  local realRef::Function = (name::Symbol) -> IR.CREF(haskey(modelVariables, name) ? modelVariables[name].cref :
                                           haskey(s.index, name) ? s.crefs[s.index[name]] :
                                           throw(NotHandled("the state set's variable $(name), of neither the model nor the structure")), IR.T_REAL())
   local integerRef::Function = (cref::IR.ComponentRef) -> IR.CREF(cref, IR.T_INTEGER())
@@ -250,8 +282,10 @@ function dynamicSetParts(model::IR.Model, s::Structure, set::DynamicSet, k::Int)
     push!(levels, (V, x))
     for j in 1:n-1
       local derivative::IR.ComponentRef = IR.derivativeCref(x[j])
-      local var = get(model.variables, V[index(start, j)], nothing)
-      local guess = var === nothing ? nothing : var.attributes.start
+      #= its guess: the start of the candidate it selects, where that declares none the start carried to it =#
+      local var = get(modelVariables, V[index(start, j)], nothing)
+      local guess::Union{Nothing, IR.Expression} = var === nothing ? nothing : var.attributes.start
+      (guess === nothing && haskey(carried, V[index(start, j)])) && (guess = IR.REAL(carried[V[index(start, j)]]))
       local state::IR.Variable = IR.Variable(x[j], IR.T_REAL(), IR.STATE(1, derivative.name, true), nothing,
                                              IR.VariableAttributes(guess, nothing, nothing, nothing, nothing, nothing, nothing, nothing, nothing),
                                              IR.NO_DIRECTION, true, IR.NOT_CONNECTOR, IR.NO_SOURCE, :indexReduction)
@@ -291,6 +325,9 @@ The reference of a variable of the `k`-th dynamic state set: the set's part (`\$
 """
 stateSetCref(k::Int, name::Symbol, subscripts::Vector{IR.Subscript}, ty::IR.ModelicaType)::IR.ComponentRef =
   IR.ComponentRef(IR.CrefPart[IR.CrefPart(Symbol("\$STATESET", k), IR.Subscript[], IR.T_CLASS(:StateSet)), IR.CrefPart(name, subscripts, ty)])
+
+"Whether `cref` is of a dynamic state set (`stateSetCref`: its first part of the class StateSet)."
+isStateSetRef(cref::IR.ComponentRef)::Bool = !isempty(cref.parts) && cref.parts[1].ty == IR.T_CLASS(:StateSet)
 
 "The `j`-th state of the `l`-th level of the `k`-th dynamic state set: `\$STATESETk.x[j]`, `\$STATESETk.dx[j]` (its derivative level), ..."
 setStateCref(k::Int, l::Int, j::Int)::IR.ComponentRef =

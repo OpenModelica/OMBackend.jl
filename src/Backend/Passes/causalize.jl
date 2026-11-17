@@ -65,14 +65,14 @@ mapRoots!(g::G, eq::IR.ALGORITHM) where {G} = eq
 function mapRoots!(g::G, eq::IR.IF_EQUATION)::IR.Equation where {G}
   eq.branches = IR.EquationBranch[IR.EquationBranch(g(b.condition), b.equations) for b in eq.branches]
   for b in eq.branches
-    foreach(e -> mapRoots!(g, e), b.equations)
+    foreach((@nospecialize(e::IR.Equation)) -> mapRoots!(g, e), b.equations)
   end
-  foreach(e -> mapRoots!(g, e), eq.elseEquations)
+  foreach((@nospecialize(e::IR.Equation)) -> mapRoots!(g, e), eq.elseEquations)
   return eq
 end
 function mapRoots!(g::G, eq::IR.FOR_EQUATION)::IR.Equation where {G}
   eq.iterator = IR.Iterator(eq.iterator.name, g(eq.iterator.range))
-  foreach(e -> mapRoots!(g, e), eq.body)
+  foreach((@nospecialize(e::IR.Equation)) -> mapRoots!(g, e), eq.body)
   return eq
 end
 function mapRoots!(g::G, eq::IR.WHEN_EQUATION)::IR.Equation where {G}
@@ -235,14 +235,14 @@ and an array value's element at a literal index as that element (`{a, b}[2]` as 
 equations of the continuous-time partitions and the structural modes.
 """
 function moveSubscriptsIntoDer!(model::IR.Model)::IR.Model
-  local g = e -> IR.mapExp(moveSubscriptIntoDer, e)
+  local g = (@nospecialize(e::IR.Expression)) -> IR.mapExp(moveSubscriptIntoDer, e)
   for (_, p) in partitionsWithVariables(model)
     foreach(eq -> mapRoots!(g, eq), p.equations)
   end
   return model
 end
 
-function moveSubscriptIntoDer(e::IR.Expression)::IR.Expression
+function moveSubscriptIntoDer(@nospecialize(e::IR.Expression))::IR.Expression
   e isa IR.SUBSCRIPTED || return e
   if IR.isBuiltinCall(e.exp, :der) && length(e.exp.arguments) == 1
     local element = elementOfArrayValue(IR.SUBSCRIPTED(e.exp.arguments[1], e.subscripts, e.ty))
@@ -279,7 +279,8 @@ function lowerHigherOrderDerivatives!(model::IR.Model)::IR.Model
   for (variables, p) in partitionsWithVariables(model)
     local auxiliaries = Dict{IR.ComponentRef, IR.ComponentRef}()
     local equations = IR.Equation[]
-    local g = e -> IR.mapExp(x -> lowerNestedDer(x, variables, auxiliaries, equations), e)
+    local g = (@nospecialize(e::IR.Expression)) ->
+      IR.mapExp((@nospecialize(x::IR.Expression)) -> lowerNestedDer(x, variables, auxiliaries, equations), e)
     foreach(eq -> mapRoots!(g, eq), p.equations)
     append!(p.equations, equations)
   end
@@ -338,19 +339,20 @@ function chooseRuntimeIndices!(model::IR.Model)::IR.Model
   for (variables, p) in partitionsWithVariables(model)
     for eq in p.equations
       local iterators = iteratorNames(eq)
-      mapRoots!(e -> IR.mapExp(x -> runtimeIndexChoice(x, iterators), e), eq)
+      mapRoots!((@nospecialize(e::IR.Expression)) ->
+                IR.mapExp((@nospecialize(x::IR.Expression)) -> runtimeIndexChoice(x, iterators), e), eq)
     end
     for v in variables
       v.binding === nothing && continue
       local iterators = iteratorNames(v.binding)
-      v.binding = IR.mapExp(x -> runtimeIndexChoice(x, iterators), v.binding)
+      v.binding = IR.mapExp((@nospecialize(x::IR.Expression)) -> runtimeIndexChoice(x, iterators), v.binding)
     end
   end
   return model
 end
 
 "The names of the iterators of the reductions, array constructors and for-equations in `x`."
-function iteratorNames(x::Union{IR.Expression, IR.Equation})::Set{Symbol}
+function iteratorNames(@nospecialize(x::Union{IR.Expression, IR.Equation}))::Set{Symbol}
   local names = Set{Symbol}()
   local visit = e -> e isa Union{IR.REDUCTION, IR.ARRAY_CONSTRUCTOR} && foreach(it -> push!(names, it.name), e.iterators)
   if x isa IR.Expression
@@ -448,26 +450,41 @@ whose relations all are (no events, MLS 8.5); of a record value (the variable is
 result in a branch (a hoisted call equation, an assert's condition: `isNoResultCall`); in
 the branches of a lifted one, one whose condition does not depend on time (a state-dependent
 condition crosses in both directions: its branches are evaluated as a continuous product); in a
-for-equation (arrays kept), one that reads its iterator (the array code reads it inline; the scalar
-path takes such a model from the frontend's scalarized flatten). The when-equations (their code
-generation evaluates them in place), the asserts (checked where they are, not in the right-hand side: a Boolean
-if-expression of a condition lifted as a Real variable was read as a Boolean) and algorithms are left.
+for-equation (arrays kept), one that reads its iterator (the array code reads it inline; where such a
+model is scalarized after its reduction, `liftIfExpressions!(model, selected)` lifts it then); in an array
+constructor or a reduction, one that reads its iterator. The
+when-equations (their code generation evaluates them in place), the asserts (checked where they are, not in the
+right-hand side: a Boolean if-expression of a condition lifted as a Real variable was read as a Boolean) and
+algorithms are left.
 """
 function liftIfExpressions!(model::IR.Model)::IR.Model
   for (variables, p) in partitionsWithVariables(model)
-    local lifter = IfExpressionLifter(variables, Dict{Any, IR.CREF}(), IR.Equation[], Ref(0))
+    local lifter = IfExpressionLifter(variables)
     for eq in p.equations
       (eq isa IR.WHEN_EQUATION && eq.kind !== IR.STRUCTURAL_WHEN) && continue
       eq isa IR.ASSERT_EQUATION && continue
-      #= for-equations come here only with the arrays kept: an if-expression that reads the iterator stays inline
-         (lifted, its if-equation would read the iterator outside its loop: MSL RobotR3.oneAxis's
-         `moving[i] = if abs(q_end[i] - q_begin[i]) > eps then ...`, a free `i` in the generated code); the array
-         code and index reduction read it there =#
-      (eq isa IR.FOR_EQUATION && ifReadsIterator(eq)) && continue
-      mapRoots!(e -> lift(lifter, e, false), eq)
+      liftRoots!(lifter, eq)
     end
     append!(p.equations, lifter.equations)
   end
+  return model
+end
+
+"""
+    liftIfExpressions!(model, selected) -> Model
+
+The if-expressions of the equations `selected` (their positions in the model's continuous partition) lifted as
+`liftIfExpressions!(model)` lifts them, the other equations left as they are: for the equations a model reduced with
+its arrays kept had in for-equations, whose if-expressions on the iterator stayed inline until it was scalarized.
+"""
+function liftIfExpressions!(model::IR.Model, selected::Vector{Int})::IR.Model
+  isempty(selected) && return model
+  local p::IR.Partition = only(model.continuous)
+  local lifter = IfExpressionLifter(model.variables)
+  for i in selected
+    mapRoots!((@nospecialize(e::IR.Expression)) -> lift(lifter, e, false), p.equations[i])
+  end
+  append!(p.equations, lifter.equations)
   return model
 end
 
@@ -506,14 +523,60 @@ struct IfExpressionLifter
   tick::Base.RefValue{Int}
 end
 
+"A lifter of `variables`, numbering after the lifted if-expressions they already have (`ifEq_tmp<k>`)."
+function IfExpressionLifter(variables::IR.VariableSet)::IfExpressionLifter
+  local next::Int = 0
+  while haskey(variables, Symbol("ifEq_tmp", next))
+    next += 1
+  end
+  return IfExpressionLifter(variables, Dict{Any, IR.CREF}(), IR.Equation[], Ref(next))
+end
+
+"""
+The if-expressions of the equation `eq` lifted (`liftIfExpressions!`), but those of a for-equation that read its
+iterator, in an if-equation's branch too. For-equations come here only with the arrays kept: such an if-expression
+stays inline, the array code and index reduction read it in the loop. Lifted, its if-equation read the iterator outside
+the loop: MSL RobotR3.oneAxis's `moving[i] = if abs(q_end[i] - q_begin[i]) > eps then ...`, a free `i` in the
+generated code; LossyGear's `if ideal then ... else for i in 1:4 loop interpolation_result[1, i] = if smoothness ==
+... then getTable1DValueNoDer(tableID, i, ...) ...`, "unknown variable i".
+"""
+function liftRoots!(lifter::IfExpressionLifter, eq::IR.Equation)::Nothing
+  local g::Function = (@nospecialize(e::IR.Expression)) -> lift(lifter, e, false)
+  if eq isa IR.FOR_EQUATION
+    ifReadsIterator(eq) && return nothing
+    eq.iterator = IR.Iterator(eq.iterator.name, g(eq.iterator.range))
+    foreach((@nospecialize(x::IR.Equation)) -> liftRoots!(lifter, x), eq.body)
+  elseif eq isa IR.IF_EQUATION
+    eq.branches = IR.EquationBranch[IR.EquationBranch(g(b.condition), b.equations) for b in eq.branches]
+    for b in eq.branches
+      foreach((@nospecialize(x::IR.Equation)) -> liftRoots!(lifter, x), b.equations)
+    end
+    foreach((@nospecialize(x::IR.Equation)) -> liftRoots!(lifter, x), eq.elseEquations)
+  else
+    mapRoots!(g, eq)
+  end
+  return nothing
+end
+
 """
     lift(lifter, e, timeDependentOnly)
 
 `e` with its if-expressions lifted; `timeDependentOnly` in the branches of a lifted one.
 """
-function lift(lifter::IfExpressionLifter, e::IR.Expression, timeDependentOnly::Bool)::IR.Expression
+function lift(lifter::IfExpressionLifter, @nospecialize(e::IR.Expression), timeDependentOnly::Bool)::IR.Expression
   IR.isBuiltinCall(e, :noEvent) && return e
-  e isa IR.IF_EXPRESSION || return IR.mapChildren(x -> lift(lifter, x, timeDependentOnly), e)
+  #= an array constructor or a reduction with an if-expression that reads its iterator stays as it is, as a
+     for-equation with one (`ifReadsIterator`): lifted, the if-equation read the iterator outside its scope (`{... /
+     (if i == 2 then 3 else 2) ... for i in 2:n - 1}`, the work of the pressure in MSL Fluid's pipes: "unknown
+     variable i") =#
+  if e isa Union{IR.ARRAY_CONSTRUCTOR, IR.REDUCTION}
+    local bound::Set{Symbol} = Set{Symbol}(it.name for it in e.iterators)
+    local readsBound = (@nospecialize(y::IR.Expression)) -> y isa IR.CREF && y.cref.name in bound
+    local ifReads = (@nospecialize(x::IR.Expression)) -> x isa IR.IF_EXPRESSION && IR.anyExp(readsBound, x)
+    IR.anyExp(ifReads, e.body) && return e
+  end
+  e isa IR.IF_EXPRESSION || return IR.mapChildren((@nospecialize(x::IR.Expression)) ->
+                                                    lift(lifter, x, timeDependentOnly), e)
   local inner = x -> lift(lifter, x, true)
   if (timeDependentOnly && !dependsOnTime(e.condition)) || relationsAllInNoEvent(e.condition) ||
      isRecordValued(e.thenExp) || isRecordValued(e.elseExp) || isNoResultCall(e.thenExp) || isNoResultCall(e.elseExp)
@@ -533,10 +596,13 @@ function lift(lifter::IfExpressionLifter, e::IR.Expression, timeDependentOnly::B
   existing === nothing || return existing
   local name = Symbol("ifEq_tmp", lifter.tick[])
   lifter.tick[] += 1
-  local v = IR.CREF(IR.ComponentRef(name, IR.T_REAL()), IR.T_REAL())
-  push!(lifter.variables, IR.Variable(name, IR.T_REAL(), IR.ALGEBRAIC(), nothing, IR.NO_ATTRIBUTES, IR.NO_DIRECTION,
+  #= an array-valued if-expression (arrays kept): an array variable, its branches array equations =#
+  local ty::IR.ModelicaType = e.ty isa IR.T_ARRAY ? e.ty : IR.T_REAL()
+  local v = IR.CREF(IR.ComponentRef(name, ty), ty)
+  push!(lifter.variables, IR.Variable(name, ty, IR.ALGEBRAIC(), nothing, IR.NO_ATTRIBUTES, IR.NO_DIRECTION,
                                       false, IR.NOT_CONNECTOR, IR.NO_SOURCE, :liftIfExpressions))
-  local assign = x -> IR.Equation[IR.SCALAR_EQUATION(v, x, IR.T_REAL(), IR.NO_SOURCE, IR.DEFAULT_ATTRIBUTES)]
+  local assign = x -> IR.Equation[ty isa IR.T_ARRAY ? IR.ARRAY_EQUATION(v, x, ty, IR.NO_SOURCE, IR.DEFAULT_ATTRIBUTES) :
+                                  IR.SCALAR_EQUATION(v, x, IR.T_REAL(), IR.NO_SOURCE, IR.DEFAULT_ATTRIBUTES)]
   push!(lifter.equations, IR.IF_EQUATION(IR.EquationBranch[IR.EquationBranch(c, assign(x)) for (c, x) in zip(conditions, values)],
                                          assign(elseValue), IR.NO_SOURCE, IR.DEFAULT_ATTRIBUTES))
   lifter.lifted[key] = v
@@ -596,7 +662,7 @@ function expandRecordFieldArrays!(variables::IR.VariableSet)::Nothing
      previous backend's). =#
   local groups = Dict{String, Tuple{IR.ComponentRef, IR.Variable, Dict{Vector{Int}, IR.Expression}}}()
   for v in variables
-    if !isRecordFieldArray(v.cref)
+    if !isRecordFieldArray(v.cref) || isOfComponentArray(v)
       push!(out, v)
     elseif !isempty(v.cref.parts[end].subscripts)
       push!(out, v)
@@ -621,6 +687,14 @@ function expandRecordFieldArrays!(variables::IR.VariableSet)::Nothing
   foreach(v -> push!(variables, v), out)
   return nothing
 end
+
+"""
+Whether the array `v` holds the dimensions of a component array besides its own (`cylinders.R.T` of
+`Shape cylinders[3]`, arrays kept: `Real[3, 3, 3]`, the field's own type `Real[3, 3]`). Such an array stays one
+variable: its elements by the field's own type alone would be those of one component.
+"""
+isOfComponentArray(v::IR.Variable)::Bool =
+  v.ty isa IR.T_ARRAY && length(IR.dimensions(v.ty)) > length(IR.dimensions(v.cref.parts[end].ty))
 
 """
 Whether `cref` is an array field of a record: its last part of an array type, the one before of a record type; not a
@@ -670,11 +744,26 @@ function recordFieldArrayElements(v::IR.Variable)::Vector{IR.Variable}
     local index = collect(Tuple(i))
     local cref::IR.ComponentRef = IR.withLastSubscripts(v.cref, IR.Subscript[IR.INDEX(IR.INTEGER(k)) for k in index])
     local binding = v.binding === nothing ? nothing : bindingElement(v.binding, index)
-    push!(out, IR.Variable(cref, ty.elementType, v.kind, binding, v.attributes, v.direction, v.isProtected, v.connector,
+    #= the element's own start, fixed, nominal, min and max: with the array's, `state.X[1]` had the start
+       `{0.01, 0.99}` (MSL Media MoistAir: "the start of medium.state.X[1] does not evaluate") =#
+    local a::IR.VariableAttributes = v.attributes
+    local attributes::IR.VariableAttributes =
+      IR.VariableAttributes(attributeElement(a.start, index), attributeElement(a.fixed, index),
+                            attributeElement(a.nominal, index), attributeElement(a.min, index),
+                            attributeElement(a.max, index), a.unit, a.displayUnit, a.quantity, a.stateSelect)
+    push!(out, IR.Variable(cref, ty.elementType, v.kind, binding, attributes, v.direction, v.isProtected, v.connector,
                            v.source, :expandRecordFieldArrays))
   end
   return out
 end
+
+"""
+The element `index` of an attribute of an array variable: of an array value (a start `{0.01, 0.99}`) its element
+(`bindingElement`), a scalar's (given for each element) itself.
+"""
+attributeElement(::Nothing, ::Vector{Int})::Nothing = nothing
+attributeElement(a::IR.Expression, index::Vector{Int})::Union{Nothing, IR.Expression} =
+  (a isa IR.ARRAY || IR.typeOf(a) isa IR.T_ARRAY) ? bindingElement(a, index) : a
 
 """
 The element `index` of an array binding: of an array value its element (`nothing` outside
@@ -721,12 +810,27 @@ function expandEquations(equations::Vector{IR.Equation}; arrays::Bool)::Vector{I
       append!(out, fields !== nothing ? fields : elementEquations(eq, [[k] for k in 1:eq.size], eq.ty))
     elseif arrays && eq isa IR.ARRAY_EQUATION
       local sizes = Int[knownSize(d, eq) for d in eq.ty.dimensions]
-      append!(out, elementEquations(eq, rowMajor(sizes), eq.ty))
+      foreach(element -> append!(out, recordElementEquations(element)), elementEquations(eq, rowMajor(sizes), eq.ty))
     else
       push!(out, eq)
     end
   end
   return out
+end
+
+"""
+    recordElementEquations(eq) -> Vector{Equation}
+
+An element equation of an array equation of records (`{setState_phX(...), setState_phX(...)} = states`, a Complex
+vector's `aw = {...}`: `states[1] = setState_phX(...)`) as the equations of its fields (`fieldEquations`:
+`states[1].p = call[1]`), a reference on one side; `eq` itself for another. Left whole it is one row for the unknowns
+of all its fields (MSL Fluid's flow models, with arrays kept: fewer rows than unknowns).
+"""
+function recordElementEquations(eq::IR.Equation)::Vector{IR.Equation}
+  (eq isa IR.SCALAR_EQUATION && eq.ty isa IR.T_RECORD) || return IR.Equation[eq]
+  local fields::Union{Nothing, Vector{IR.Equation}} =
+    fieldEquations(IR.RECORD_EQUATION(eq.lhs, eq.rhs, eq.ty, length(eq.ty.fields), eq.source, eq.attributes))
+  return fields === nothing ? IR.Equation[eq] : fields
 end
 
 "The size of an equation's dimension; an unknown one is not supported (its equations would be left out)."
@@ -866,11 +970,11 @@ function unrollConstantReductions!(model::IR.Model)::IR.Model
 end
 
 "`e` with its constant reductions unrolled, top-down: an unrolled one's elements in turn."
-unroll(e::IR.Expression)::IR.Expression = IR.mapChildren(unroll, unrollAt(e))
+unroll(@nospecialize(e::IR.Expression))::IR.Expression = IR.mapChildren(unroll, unrollAt(e))
 
 const FOLDED_REDUCERS = (:sum, :product, :min, :max)
 
-function unrollAt(e::IR.Expression)::IR.Expression
+function unrollAt(@nospecialize(e::IR.Expression))::IR.Expression
   if e isa IR.CALL && e.attributes.builtin && e.name in FOLDED_REDUCERS && length(e.arguments) == 1
     local arg = e.arguments[1]
     local elements = arg isa IR.ARRAY_CONSTRUCTOR ? reductionElements(arg.body, arg.iterators) :
@@ -937,11 +1041,18 @@ end
 
 """
 The reduction `reducer` of `elements` as a chain of `+` or `*`, or nested `min`/`max` calls (of
-`attributes`); `nothing` for none.
+`attributes`). Of no elements: `sum` is 0 and `product` 1 of a Real or Integer result (MLS 10.3.4; a tank's
+`sum(topPorts.m_flow)` without top ports, arrays kept: `sum({})` reached the generated code as `sum(Any[])`, MSL
+AST_BatchPlant's tank tests), `nothing` for `min`, `max` and another type.
 """
 function foldReduction(reducer::Symbol, elements::Vector{IR.Expression}, ty::IR.ModelicaType,
                        attributes::IR.CallAttributes)::Union{Nothing, IR.Expression}
-  isempty(elements) && return nothing
+  if isempty(elements)
+    reducer in (:sum, :product) || return nothing
+    ty isa IR.T_REAL && return IR.REAL(reducer === :sum ? 0.0 : 1.0)
+    ty isa IR.T_INTEGER && return IR.INTEGER(reducer === :sum ? 0 : 1)
+    return nothing
+  end
   local acc = elements[1]
   for x in elements[2:end]
     acc = reducer === :sum ? IR.BINARY(acc, IR.ADD, x, ty) :

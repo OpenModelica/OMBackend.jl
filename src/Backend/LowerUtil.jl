@@ -66,7 +66,8 @@ isScalarType(ty::IR.ModelicaType)::Bool = ty isa Union{IR.T_REAL, IR.T_INTEGER, 
 An assignment, a tuple's as the frontend's DAE conversion made it: `() := f(x)` the call as a
 statement, `(a) := f(x)` the assignment of the call's first output.
 """
-function lowerAssignment(lhs::IR.Expression, rhs::IR.Expression, source::IR.Source)::IR.Statement
+function lowerAssignment(@nospecialize(lhs::IR.Expression), @nospecialize(rhs::IR.Expression),
+                         source::IR.Source)::IR.Statement
   lhs isa IR.TUPLE || return IR.ASSIGNMENT(lhs, rhs, source)
   isempty(lhs.elements) && return IR.NORETCALL(rhs, source)
   length(lhs.elements) == 1 &&
@@ -118,7 +119,8 @@ is true only at the initialization, where the when is not active, and false afte
 initial() or x > 0.6` fires at x's crossing only, as in OpenModelica). A when-statement's
 condition keeps it (the algorithm lifting reads it as false, as the previous backend did).
 """
-function whenBranch(condition::IR.Expression, body::Vector{IR.Statement}; dropInitialDisjuncts::Bool = true)::IR.WhenBranch
+function whenBranch(@nospecialize(condition::IR.Expression),
+                    body::Vector{IR.Statement}; dropInitialDisjuncts::Bool = true)::IR.WhenBranch
   local triggers = IR.Expression[]
   local (atInitial, atTerminal) = (false, false)
   for member in (condition isa IR.ARRAY ? condition.elements : IR.Expression[condition])
@@ -135,7 +137,7 @@ function whenBranch(condition::IR.Expression, body::Vector{IR.Statement}; dropIn
 end
 
 "`e` without its `initial()` disjuncts (of `or`)."
-function withoutInitialDisjunct(e::IR.Expression)::IR.Expression
+function withoutInitialDisjunct(@nospecialize(e::IR.Expression))::IR.Expression
   (e isa IR.LBINARY && e.op === IR.OR) || return e
   local l = withoutInitialDisjunct(e.exp1)
   local r = withoutInitialDisjunct(e.exp2)
@@ -229,7 +231,7 @@ end
 
 "What a statement reads outside `pre()` (its values and conditions; `Touch`)."
 function readTouches!(out::Vector{Touch}, s::IR.Statement)::Vector{Touch}
-  local visit::Function = (e::IR.Expression) -> IR.mapExpTopDown(e) do x
+  local visit::Function = (@nospecialize(e::IR.Expression)) -> IR.mapExpTopDown(e) do @nospecialize(x::IR.Expression)
     IR.isBuiltinCall(x, :pre) && return (x, false)
     x isa IR.CREF && push!(out, touchOf(x))
     return (x, true)

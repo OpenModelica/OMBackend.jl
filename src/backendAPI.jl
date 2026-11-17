@@ -209,7 +209,7 @@ end
     In-backend MTK path. Same module/codegen as MTK_MODE, but additionally
     constructs the System and runs structural_simplify in the backend at
     translate time and dumps the post-simplify System. Simulate reuses the
-    existing module interface. Implementation in CodeGeneration/iMTKGen.jl.
+    existing module interface. Implementation in CodeGeneration/IMTKGen.jl.
   =#
   IMTK_MODE = 5
 end
@@ -287,12 +287,23 @@ The models (canonical names) the last translate lowered with their arrays kept u
 const ARRAY_REDUCED_MODELS = Set{String}()
 
 """
+The models (canonical names) whose last translate took the flat model with arrays kept and scalarized it in the
+backend (`backendScalarizedModel`; OMBACKEND_BACKEND_SCALARIZATION): the array form did not take them, and the
+frontend did not flatten them a second time.
+"""
+const BACKEND_SCALARIZED_MODELS = Set{String}()
+
+"""
 Why the arrays-kept paths did not take a model at its last translate (canonical name => path => reason): what OM's
-translate reports when it falls back to the scalarizing flatten (`scalarizedFallbackReason`).
+translate reports in its error where none takes the model (`scalarizedFallbackReason`, OM's
+`ARRAY_PRESERVING_CODEGEN_NOT_SUPPORTED`).
 """
 const ARRAY_PATH_REASONS = Dict{String, Dict{String, String}}()
 
-"The arrays-kept path `path` (array code generation, array index reduction) did not take the model `name`, for `reason`."
+"The arrays-kept paths, in the order a translate tries them (`declineArrayPath!`, `scalarizedFallbackReason`)."
+const ARRAY_PATHS = ("array index reduction", "array code after index reduction", "backend scalarization")
+
+"The arrays-kept path `path` (one of ARRAY_PATHS) did not take the model `name`, for `reason`."
 function declineArrayPath!(name::String, path::String, reason::String)::Nothing
   get!(Dict{String, String}, ARRAY_PATH_REASONS, name)[path] = reason
   return nothing
@@ -301,13 +312,13 @@ end
 """
     scalarizedFallbackReason(name) -> String
 
-Why the model `name` (canonical) goes through the scalarizing flatten: the reasons the arrays-kept
-paths gave at its last translate (array index reduction, then the array code after it).
+Why no arrays-kept path took the model `name` (canonical): the reasons the arrays-kept paths gave at its last
+translate (array index reduction, the array code after it, the backend's scalarization). OM's translate throws them
+(`ARRAY_PRESERVING_CODEGEN_NOT_SUPPORTED`); it no longer flattens a second time with scalarization (JKRT 2026-11-15).
 """
 function scalarizedFallbackReason(name::String)::String
   local reasons = get(ARRAY_PATH_REASONS, name, Dict{String, String}())
-  local parts::Vector{String} = String["$(path): $(reasons[path])" for path in ("array index reduction", "array code after index reduction")
-                        if haskey(reasons, path)]
+  local parts::Vector{String} = String["$(path): $(reasons[path])" for path in ARRAY_PATHS if haskey(reasons, path)]
   return isempty(parts) ? "no reason recorded" : join(parts, "; ")
 end
 
@@ -507,36 +518,35 @@ function reducedArrayModel(lower::Function, name::String)::Union{Nothing, OMJLIR
   end
   local reduction::Module = Passes.IndexReduction
   return _arrayReductionStep(name, decline) do
-    local lowered::OMJLIR.Model = lower()
+    local lowered::OMJLIR.Model = @BACKEND_PERFLOG "[backendAPI] lowered (arrays kept)" lower()
     #= arrays to keep: for-equations or array equations over continuous arrays, or separately declared components
        rolled into arrays (OMBACKEND_ROLL_COMPONENTS) =#
     local roll::Bool = envSwitch("OMBACKEND_ROLL_COMPONENTS") && !isempty(reduction.componentGroups(lowered.variables))
     local own::Bool = reduction.hasContinuousArrays(lowered) && reduction.hasArrayEquations(lowered)
-    #= the passes lower clocked partitions to when-equations on sample(): the array code does not keep their semantics
-       (a tick's value at the start, the order of a partition's equations), the scalar path does =#
-    local clocked::Bool = Passes.hasClocks(lowered)
-    local model::OMJLIR.Model = Passes.runPassesKeepingArrays!(lowered)
-    #= if-expressions that read a for-equation's iterator, which the passes left inline: the array code reads them, the
-       scalarized form of a reduced model would need them lifted =#
-    local inlineIfs::Bool = any(eq::OMJLIR.Equation -> eq isa OMJLIR.FOR_EQUATION && Passes.ifReadsIterator(eq),
-                                model.continuous[1].equations)
-    local rolled::Bool = roll && reduction.rollComponents!(model) > 0
-    if own || rolled
-      local reduced::Bool = reduction.reduceIndexArrays!(model)
-      if !reduced && clocked
-        decline("index 1 with clocked partitions")
-        return nothing
-      elseif reduced && inlineIfs
-        decline("an if-expression that reads a for-equation's iterator, in a model of index above one")
-        return nothing
+    #= the passes lower clocked partitions to when-equations on sample() (`lowerClockedPartitions!`): nothing of a
+       clock is left for the array code, which takes them as any when-equation (a tick at the start, a when body's
+       assignments in their order) =#
+    local model::OMJLIR.Model = @BACKEND_PERFLOG "[backendAPI] passes keeping arrays" Passes.runPassesKeepingArrays!(lowered)
+    local rolled::Bool = roll && (@BACKEND_PERFLOG "[backendAPI] rollComponents!" reduction.rollComponents!(model)) > 0
+    if rolled
+      #= the rolled instances' elements treated differently by the plan (a gear between rolled inertias, one of them
+         no state: slicing that splits most of the rolled arrays), or another form the rolled arrays do not take:
+         the components as declared (rolling only saves equations); the model is lowered again, the reduction's
+         splits changed it =#
+      try
+        @BACKEND_PERFLOG "[backendAPI] reduceIndexArrays! (rolled)" reduction.reduceIndexArrays!(model)
+      catch err
+        err isa reduction.NotHandled || rethrow()
+        @info "[index reduction] $(name): rolled components not taken ($(sprint(showerror, err))), as declared"
+        model = Passes.runPassesKeepingArrays!(lower())
+        reduction.reduceIndexArrays!(model; arrays = own)
       end
-    elseif clocked
-      decline("index 1 with clocked partitions")
-      return nothing
-    elseif !reduction.commitIndexOne!(model)
-      #= none to keep and of index above one: the model reduces as the scalarized one =#
-      decline("no for-equations or array equations over continuous arrays, of index above one")
-      return nothing
+    elseif own
+      @BACKEND_PERFLOG "[backendAPI] reduceIndexArrays!" reduction.reduceIndexArrays!(model)
+    else
+      #= none to keep: its index reduced, or its states committed, in the array form all the same (the array code
+         takes a model of scalars as arrays of no dimensions) =#
+      reduction.reduceIndexArrays!(model; arrays = false)
     end
     model
   end
@@ -555,8 +565,14 @@ function scalarizedReducedModel(name::String, reduced::OMJLIR.Model)::Union{Noth
   local decline::Function = (reason::String) -> declineArrayPath!(name, "array index reduction", reason)
   local reduction::Module = Passes.IndexReduction
   reduction.indexReduced(reduced) || return nothing
+  #= if-expressions that read a for-equation's iterator, which the passes left inline (the array code reads them
+     there): lifted once their for-equations are unrolled, as the scalar passes lift the others =#
+  local inline::Set{Int} = Set{Int}(i for (i, eq) in enumerate(reduced.continuous[1].equations)
+                                    if eq isa OMJLIR.FOR_EQUATION && Passes.ifReadsIterator(eq))
   local scalar::Union{Nothing, OMJLIR.Model} = _arrayReductionStep(name, decline) do
-    local s::OMJLIR.Model = reduction.scalarizeArrays(reduced).model
+    local view::Passes.IndexReduction.Scalarized = reduction.scalarizeArrays(reduced)
+    local s::OMJLIR.Model = view.model
+    Passes.liftIfExpressions!(s, Int[j for (j, origin) in enumerate(view.origins) if origin.equation in inline])
     #= the parameter references as the scalar pipeline resolves them (the arrays-kept passes keep them for the array
        code, whose parameters can all be overridden) =#
     Passes.resolveBindingReferences!(s)
@@ -568,21 +584,44 @@ function scalarizedReducedModel(name::String, reduced::OMJLIR.Model)::Union{Noth
 end
 
 """
-`f()`, a step of the array index reduction of the model `name` (canonical): a model it does not handle (NotHandled, UnsupportedLowering)
-logged and declined (`decline`), another error (the optional route fails where it should refuse) a warning and
-declined; `nothing` then.
+    backendScalarizedModel(lower::Function, name::String) -> Union{Nothing, OMJLIR.Model}
+
+The model `name` (canonical) that `lower()` lowers to OMJLIR with its arrays kept, scalarized by the backend's
+element view (`Passes.IndexReduction.scalarizeArrays`, the view for the scalar passes) and through the scalar
+passes with index reduction (`Passes.runPasses!`): what the frontend's scalarizing flatten, lowered and through the
+passes, gives, without flattening again. For the models the array form does not take (`reducedArrayModel`).
+`nothing` where the element view does not take the model (switched off, OMBACKEND_BACKEND_SCALARIZATION; what it
+does not handle: logged; another error: a warning), the reason recorded (`declineArrayPath!`, "backend
+scalarization"): OM's translate throws then (`ARRAY_PRESERVING_CODEGEN_NOT_SUPPORTED`).
 """
-function _arrayReductionStep(f::Function, name::String, decline::Function)::Union{Nothing, OMJLIR.Model}
+function backendScalarizedModel(lower::Function, name::String)::Union{Nothing, OMJLIR.Model}
+  local decline::Function = (reason::String) -> declineArrayPath!(name, "backend scalarization", reason)
+  if !envSwitch("OMBACKEND_BACKEND_SCALARIZATION")
+    decline("switched off (OMBACKEND_BACKEND_SCALARIZATION)")
+    return nothing
+  end
+  return _arrayReductionStep(name, decline; route = "the backend's scalarization") do
+    Passes.runPasses!(Passes.IndexReduction.scalarizeArrays(lower(); passesFollow = true).model)
+  end
+end
+
+"""
+`f()`, a step of the route `route` of the model `name` (canonical) with its arrays kept: a model it does not handle
+(NotHandled, UnsupportedLowering) logged and declined (`decline`), another error (the optional route fails where it
+should refuse) a warning and declined; `nothing` then.
+"""
+function _arrayReductionStep(f::Function, name::String, decline::Function;
+                             route::String = "the array form")::Union{Nothing, OMJLIR.Model}
   local reduction::Module = Passes.IndexReduction
   try
     return f()
   catch err
     isFatal(err) && rethrow()
     if err isa Union{reduction.NotHandled, UnsupportedLowering}
-      @info "[index reduction] $(name): arrays kept, $(sprint(showerror, err)); scalarized in the frontend"
+      @info "[index reduction] $(name): arrays kept, $(route) does not take it: $(sprint(showerror, err))"
       decline(sprint(showerror, err))
     else
-      @warn "[index reduction] $(name): arrays kept, an error ($(sprint(showerror, err))); scalarized in the frontend"
+      @warn "[index reduction] $(name): arrays kept, an error in $(route) ($(sprint(showerror, err)))"
       decline("an error: $(sprint(showerror, err))")
     end
     return nothing
@@ -630,9 +669,48 @@ function generateReducedArrayODETargetCode(name::String, reduced::OMJLIR.Model):
   end
   modelName === nothing && return decline(string(modelCode))
   _registerArrayODEModule!(name, modelCode)
+  local failure::Union{Nothing, String} = _arrayStartFailure(name, modelCode)
+  if failure !== nothing
+    delete!(ARRAY_ODE_MODELS, name)
+    delete!(COMPILED_MODELS_DEJL, name)
+    return decline(failure)
+  end
   push!(ARRAY_REDUCED_MODELS, name)
   return (name, modelCode)
 end
+
+"""
+    _arrayStartFailure(name, modelCode) -> Union{Nothing, String}
+
+Why the array model `name` does not start, `nothing` where it does: a model with an algebraic loop (a large one,
+`ArrayODEGen.blockSolve!`, or a family solved by a generated Newton) has its problem built once at the translate, as
+the ModelingToolkit routes are taken only where they build (`_translateKept`). Its loops are solved by Newton from
+the start values, and a kinematic loop's Jacobian is singular there (MSL MultiBody Fourbar1: rank 2 of 12 with the
+rotation matrices at their zero starts): the simulation ended in "the initial system: the algebraic loop ... has no
+solution", with no route left to take. Not while a package image is generated (no module is evaluated then), nor
+for a model without a loop.
+"""
+function _arrayStartFailure(name::String, modelCode::Expr)::Union{Nothing, String}
+  (_calls(modelCode, CodeGeneration.ArrayODEGen.blockSolve!) || _defines(modelCode, "LOOPFAMILY_")) || return nothing
+  ccall(:jl_generating_output, Cint, ()) == 1 && return nothing
+  try
+    getMTKProblem(name)
+    return nothing
+  catch err
+    isFatal(err) && rethrow()
+    return string("the array model does not start: ", first(replace(sprint(showerror, err), r"\s+" => " "), 300))
+  end
+end
+
+"Whether the code `ex` defines a function whose name starts with `prefix` (the array code's loop families)."
+_defines(ex::Expr, prefix::String)::Bool =
+  (ex.head === :function && !isempty(ex.args) && ex.args[1] isa Expr && ex.args[1].head === :call &&
+   ex.args[1].args[1] isa Symbol && startswith(String(ex.args[1].args[1]), prefix)) ||
+  any(a -> a isa Expr && _defines(a, prefix), ex.args)
+
+"Whether the code `ex` calls the function `f` (a function object in the head of a call)."
+_calls(ex::Expr, f::Function)::Bool =
+  (ex.head === :call && !isempty(ex.args) && ex.args[1] === f) || any(a -> a isa Expr && _calls(a, f), ex.args)
 
 
 """
@@ -705,7 +783,7 @@ function generateMTKTargetCode(simCode::SimCode.SIM_CODE)::Tuple{String, Expr}
     local moduleAlreadyExists = _modelDefined(Symbol(modelName))
     COMPILED_MODELS_MTK[modelName] = (modelCode, moduleAlreadyExists, codeHash)
   end
-  Cache.store!(canonicalName(modelName), Cache.sizeOf(modelCode))
+  Cache.store!(canonicalName(modelName), () -> modelCode)
   return (modelName, modelCode)
 end
 
@@ -730,7 +808,7 @@ function generateIMTKTargetCode(simCode::SimCode.SIM_CODE)::Tuple{String, Expr}
   local cname = canonicalName(modelName)
   local structural::Bool = SimCode.hasStructuralTransitions(simCode) || SimCode.hasSubModels(simCode)
   COMPILED_MODELS_MTK[modelName] = (modelCode, structural || !haskey(IMTKGen.BUILT, cname), codeHash)
-  Cache.store!(cname, Cache.sizeOf((modelCode, get(IMTKGen.BUILT, cname, nothing), get(IMTKGen.PRISTINE_P, cname, nothing))))
+  Cache.store!(cname, () -> (modelCode, get(IMTKGen.BUILT, cname, nothing), get(IMTKGen.PRISTINE_P, cname, nothing)))
   return (modelName, modelCode)
 end
 
@@ -764,7 +842,7 @@ function generateDETargetCode(simCode::SimCode.SIM_CODE)::Tuple{String, Expr}
     local moduleAlreadyExists = _modelDefined(Symbol(modelName))
     COMPILED_MODELS_DEJL[modelName] = (modelCode, moduleAlreadyExists, codeHash)
   end
-  Cache.store!(canonicalName(modelName), Cache.sizeOf(modelCode))
+  Cache.store!(canonicalName(modelName), () -> modelCode)
   return (modelName, modelCode)
 end
 
@@ -773,7 +851,7 @@ function _registerArrayODEModule!(modelName::String, modelCode::Expr)::Nothing
   dumpGeneratedCode(modelName, modelCode)
   #= evaluated again at the next simulate: a module of this name may be another path's =#
   COMPILED_MODELS_DEJL[modelName] = (modelCode, true, hash(modelCode))
-  Cache.store!(modelName, Cache.sizeOf(modelCode))
+  Cache.store!(modelName, () -> modelCode)
   #= and the ModelingToolkit path's build goes: its module is replaced, and its code (the same
      for a model without arrays) would reuse the build at its next translate =#
   IMTKGen.forgetBuild(modelName)

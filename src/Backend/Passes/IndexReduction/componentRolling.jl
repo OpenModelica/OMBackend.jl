@@ -323,11 +323,15 @@ function equationForm(eq::IR.Equation)::RolledForm
   return SumForm(UInt[hash(t) for t in terms] <= UInt[hash(t) for t in flipped] ? terms : flipped)
 end
 
+"Whether `e` is a sum or difference of scalars: `+`, `-`, and the element-wise `.+`, `.-` of a scalar type."
+isScalarSum(e::IR.Expression)::Bool =
+  e isa IR.BINARY && (e.op in (IR.ADD, IR.SUB) || (e.op in (IR.ADD_EW, IR.SUB_EW) && !(e.ty isa IR.T_ARRAY)))
+
 "The signed terms of a sum (`(true, a)`, `(false, b)`), zeros left out, each term's form (`termForm`)."
 function signedTerms!(out::Vector{Tuple{Bool, TermForm}}, e::IR.Expression, positive::Bool)::Vector{Tuple{Bool, TermForm}}
-  if e isa IR.BINARY && e.op in (IR.ADD, IR.SUB)
+  if isScalarSum(e)
     signedTerms!(out, e.exp1, positive)
-    signedTerms!(out, e.exp2, e.op == IR.ADD ? positive : !positive)
+    signedTerms!(out, e.exp2, e.op in (IR.ADD, IR.ADD_EW) ? positive : !positive)
   elseif e isa IR.UNARY && e.op == IR.UMINUS
     signedTerms!(out, e.exp, !positive)
   elseif !(e isa Union{IR.REAL, IR.INTEGER} && iszero(e.value))
@@ -338,9 +342,9 @@ end
 
 "A term's form: its sums' terms and its products' factors in a normal order; another expression as written."
 function termForm(e::IR.Expression)::TermForm
-  if (e isa IR.BINARY && e.op in (IR.ADD, IR.SUB)) || (e isa IR.UNARY && e.op == IR.UMINUS)
+  if isScalarSum(e) || (e isa IR.UNARY && e.op == IR.UMINUS)
     return SumForm(sort!(signedTerms!(Tuple{Bool, TermForm}[], e, true); by = hash))
-  elseif e isa IR.BINARY && e.op == IR.MUL
+  elseif e isa IR.BINARY && (e.op == IR.MUL || (e.op == IR.MUL_EW && !(e.ty isa IR.T_ARRAY)))
     return ProductForm(sort!(TermForm[termForm(e.exp1), termForm(e.exp2)]; by = hash))
   end
   return LeafForm(e)
@@ -387,7 +391,9 @@ function auxiliaryVariables(model::IR.Model, partition::IR.Partition, g::Compone
   for (x, ks) in readers
     (length(ks) == 1 && !(0 in ks)) || continue
     local k::Int = only(ks)
-    local role::RolledForm = equationForm(IR.mapEquation!(e::IR.Expression -> roleExpression(e, x, memberOf), deepcopy(firstReader[x])))
+    local role::RolledForm = equationForm(IR.mapEquation!((@nospecialize(e::IR.Expression)) ->
+                                                            roleExpression(e, x, memberOf),
+                                                                         deepcopy(firstReader[x])))
     haskey(roles[k], role) && throw(NotHandled("two auxiliaries of one role in $(g.members[k])"))
     roles[k][role] = x
   end
@@ -400,7 +406,7 @@ end
 
 "`e` for an auxiliary's role: the auxiliary `x` as `§` (`MEMBER_PLACEHOLDER`), an instance's references with their member as it (`memberRelative`)."
 function roleExpression(e::IR.Expression, x::Symbol, memberOf::Dict{Symbol, Tuple{Int, Int}})::IR.Expression
-  return IR.mapExp(e) do y::IR.Expression
+  return IR.mapExp(e) do @nospecialize(y::IR.Expression)
     y isa IR.CREF || return y
     unsubscriptedName(y.cref) === x && return IR.CREF(IR.ComponentRef(MEMBER_PLACEHOLDER), y.ty)
     memberReference(y.cref, memberOf) === nothing && return y
@@ -423,6 +429,10 @@ function rolledVariable(r::RolledVariable, g::ComponentGroup, groups::Vector{Com
   local first::IR.Variable = whole ? r.whole[1]::IR.Variable : r.elements[1][sort!(collect(keys(r.elements[1])))[1]]
   local innerSizes::Vector{Int} = whole ? knownSizes(first.ty, "the variable $(first.name)") : elementSizes(r)
   local elementTy::IR.ModelicaType = IR.elementType(first.ty)
+  #= the array form has no elements of external objects (`scalarVariables`): instances that hold one (a table's
+     `tableID`, MSL RadioButtonSource's BooleanTable: Interaction1) stay components =#
+  elementTy isa IR.T_EXTERNAL_OBJECT &&
+    throw(NotHandled("the variable $(variableLabel(r)), an external object"))
   local ty::IR.ModelicaType = IR.T_ARRAY(elementTy, IR.Dimension[IR.DIM_SIZE(d) for d in [n; innerSizes]])
   #= every element of every instance of one kind and type =#
   local everyOne::Vector{IR.Variable} = whole ? IR.Variable[x::IR.Variable for x in r.whole] :
@@ -439,7 +449,8 @@ function rolledVariable(r::RolledVariable, g::ComponentGroup, groups::Vector{Com
     IR.withOperatorsOf(first.cref, base)
   end
   isempty(r.operators) && (names.base[(1, r.rest)] = cref)
-  local rewrite::Function = (e::IR.Expression) -> rolledExpression(e, groups, memberOf, names, instanceLiteral)
+  local rewrite::Function = (@nospecialize(e::IR.Expression)) ->
+                              rolledExpression(e, groups, memberOf, names, instanceLiteral)
   local attribute::Function = (field::Symbol) -> rolledAttribute(r, n, innerSizes, (v::IR.Variable) -> getfield(v.attributes, field), rewrite)
   local a::IR.VariableAttributes = first.attributes
   local stateSelects::Vector{Union{Nothing, IR.StateSelect}} = Union{Nothing, IR.StateSelect}[x.attributes.stateSelect for x in everyOne]
@@ -480,7 +491,7 @@ function rolledAttribute(r::RolledVariable, n::Int, innerSizes::Vector{Int}, get
   any(x::Union{Nothing, IR.Expression} -> x === nothing, values) &&
     throw(NotHandled("an attribute of $(variableLabel(r)) of only some instances"))
   local rewritten::Vector{IR.Expression} = IR.Expression[rewrite(x::IR.Expression) for x in values]
-  local same::Bool = all(x::IR.Expression -> x == rewritten[1], rewritten) && rewritten[1] == values[1]
+  local same::Bool = all((@nospecialize(x::IR.Expression)) -> x == rewritten[1], rewritten) && rewritten[1] == values[1]
   local scalar::Bool = !(IR.typeOf(rewritten[1]) isa IR.T_ARRAY)
   same && scalar && return rewritten[1]
   if whole && !isempty(innerSizes)
@@ -576,7 +587,7 @@ element-only array) as the reference subscripted.
 """
 function rolledExpression(e::IR.Expression, groups::Vector{ComponentGroup}, memberOf::Dict{Symbol, Tuple{Int, Int}},
                           names::RolledNames, index::Function)::IR.Expression
-  return IR.mapExp(e) do x::IR.Expression
+  return IR.mapExp(e) do @nospecialize(x::IR.Expression)
     if x isa IR.CREF
       local r::Union{Nothing, IR.ComponentRef} = rolledReference(x.cref, groups, memberOf, names, index)
       return r === nothing ? x : IR.CREF(r, x.ty)
@@ -586,6 +597,47 @@ function rolledExpression(e::IR.Expression, groups::Vector{ComponentGroup}, memb
     end
     return x
   end
+end
+
+"""
+    rolledReinits(eq, groups, memberOf, names, index) -> IR.Equation
+
+`eq` with the states its when-equations reinitialize read from the rolled arrays (`rolledReference`): a reinit's
+state is a reference, not an expression, and `IR.mapEquation!` keeps it (MSL Mean's `reinit(x, 0)` of two rolled
+instances: "unknown variable meanCurrent.x" in the array code). In for- and if-equations too.
+"""
+function rolledReinits(eq::IR.Equation, groups::Vector{ComponentGroup}, memberOf::Dict{Symbol, Tuple{Int, Int}},
+                       names::RolledNames, index::Function)::IR.Equation
+  local inner::Function = (eqs::Vector{IR.Equation}) ->
+    IR.Equation[rolledReinits(e, groups, memberOf, names, index) for e in eqs]
+  if eq isa IR.WHEN_EQUATION
+    local branches::Vector{IR.WhenBranch} =
+      IR.WhenBranch[IR.WhenBranch(b.triggers, b.atInitial, b.atTerminal,
+                                  IR.Statement[rolledReinit(st, groups, memberOf, names, index) for st in b.body])
+                    for b in eq.branches]
+    return IR.WHEN_EQUATION(branches, eq.kind, eq.source, eq.attributes)
+  elseif eq isa IR.FOR_EQUATION
+    return IR.FOR_EQUATION(eq.iterator, inner(eq.body), eq.source, eq.attributes)
+  elseif eq isa IR.IF_EQUATION
+    return IR.IF_EQUATION(IR.EquationBranch[IR.EquationBranch(b.condition, inner(b.equations)) for b in eq.branches],
+                          inner(eq.elseEquations), eq.source, eq.attributes)
+  end
+  return eq
+end
+
+"A statement's reinit states read from the rolled arrays (`rolledReinits`), in the branches of an if-statement too."
+function rolledReinit(st::IR.Statement, groups::Vector{ComponentGroup}, memberOf::Dict{Symbol, Tuple{Int, Int}},
+                      names::RolledNames, index::Function)::IR.Statement
+  if st isa IR.REINIT
+    local r::Union{Nothing, IR.ComponentRef} = rolledReference(st.state, groups, memberOf, names, index)
+    return r === nothing ? st : IR.REINIT(r, st.value, st.source)
+  elseif st isa IR.IF_STATEMENT
+    local body::Function = (b::Vector{IR.Statement}) ->
+      IR.Statement[rolledReinit(x, groups, memberOf, names, index) for x in b]
+    return IR.IF_STATEMENT(IR.StatementBranch[IR.StatementBranch(b.condition, body(b.body)) for b in st.branches],
+                           body(st.elseBody), st.source)
+  end
+  return st
 end
 
 "Whether a reference reads a rolled array: its first part after its derivative parts a group's or a member's (`IR.isRolled`)."
@@ -606,7 +658,8 @@ end
 
 The instances whose variables (records, components, derivatives, auxiliaries) the equation reads (`instanceOf`).
 """
-function instancesOf(eq::IR.Equation, memberOf::Dict{Symbol, Tuple{Int, Int}}, names::RolledNames)::Set{Int}
+function instancesOf(@nospecialize(eq::IR.Equation), memberOf::Dict{Symbol, Tuple{Int, Int}},
+                     names::RolledNames)::Set{Int}
   local out::Set{Int} = Set{Int}()
   IR.foreachExp(eq) do x::IR.Expression
     x isa IR.CREF || return nothing
@@ -649,8 +702,10 @@ equations (the instance's literal subscript).
 function rolledEquations(equations::Vector{IR.Equation}, groups::Vector{ComponentGroup}, memberOf::Dict{Symbol, Tuple{Int, Int}},
                          names::RolledNames, n::Int, iterator::Symbol; aliases::Bool)::Vector{IR.Equation}
   local loop::Function = (gi::Int, k::Int) -> IR.CREF(IR.ComponentRef(iterator, IR.T_INTEGER()), IR.T_INTEGER())
-  local rewrite::Function = (eq::IR.Equation, index::Function) ->
-    IR.mapEquation!(e::IR.Expression -> rolledExpression(e, groups, memberOf, names, index), deepcopy(eq))
+  local rewrite::Function = (@nospecialize(eq::IR.Equation), index::Function) ->
+    rolledReinits(IR.mapEquation!((@nospecialize(e::IR.Expression)) ->
+                                    rolledExpression(e, groups, memberOf, names, index), deepcopy(eq)),
+                  groups, memberOf, names, index)
   local (kept::Vector{IR.Equation}, equalities::Vector{IR.Equation}) = aliases ? aliasClasses(equations, memberOf, names) : (equations, IR.Equation[])
   #= each instance's equations by their rolled forms =#
   local keyed::Vector{Dict{RolledForm, Vector{IR.Equation}}} = Dict{RolledForm, Vector{IR.Equation}}[Dict{RolledForm, Vector{IR.Equation}}() for _ in 1:n]
@@ -784,13 +839,17 @@ end
 
 The two references of an equality: a scalar equation of two references (shape 0); a for-equation of one body
 `a[i] = b[i]` over its iterator, both subscripted by it alone (shape the range's size `n`), the references the
-whole arrays. `nothing` for another equation.
+whole arrays. `nothing` for another equation, also for an equality with a side that is not Real: it gives a discrete
+variable its value in the direction it is written (MSL MultiBody's `sphereColor = cylinderColor` of Integer inputs
+beside `sphere.color = sphereColor`; chained by the names, `cylinderColor = sphere.color` gave an Integer by a Real,
+a row of the continuous system without an unknown).
 """
 function equalityPair(eq::IR.Equation)::Union{Nothing, Tuple{IR.CREF, IR.CREF, Int}}
   if eq isa IR.SCALAR_EQUATION
     (eq.lhs isa IR.CREF && eq.rhs isa IR.CREF) || return nothing
     (IR.hasSubscripts(eq.lhs.cref) && !literalSubscripts(eq.lhs.cref)) && return nothing
     (IR.hasSubscripts(eq.rhs.cref) && !literalSubscripts(eq.rhs.cref)) && return nothing
+    (isRealReference(eq.lhs) && isRealReference(eq.rhs)) || return nothing
     return (eq.lhs, eq.rhs, 0)
   elseif eq isa IR.FOR_EQUATION && length(eq.body) == 1 && eq.body[1] isa IR.SCALAR_EQUATION
     local body::IR.SCALAR_EQUATION = eq.body[1]
@@ -803,11 +862,15 @@ function equalityPair(eq::IR.Equation)::Union{Nothing, Tuple{IR.CREF, IR.CREF, I
         !any(IR.isSubscripted, @view x.cref.parts[1:end - 1])
     end
     (byIterator(body.lhs) && byIterator(body.rhs)) || return nothing
+    (isRealReference(body.lhs) && isRealReference(body.rhs)) || return nothing
     local whole::Function = (x::IR.CREF) -> IR.CREF(IR.withoutLastSubscripts(x.cref), x.ty)
     return (whole(body.lhs), whole(body.rhs), last(range))
   end
   return nothing
 end
+
+"Whether the reference is a Real's, or an element's or the whole of an array of Reals."
+isRealReference(x::IR.CREF)::Bool = IR.elementType(x.ty) isa IR.T_REAL
 
 "Whether every subscript of the reference is a literal index."
 literalSubscripts(cref::IR.ComponentRef)::Bool =

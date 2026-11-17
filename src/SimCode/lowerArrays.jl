@@ -51,7 +51,7 @@ partition, no clocks, no structural modes):
     the initialization;
   - a reference to an element of an array variable as the variable subscripted (`ASUB`, `elementReference`);
   - the bindings of the parameters the equations read (through other bindings too: `Passes.parametersRead`), the
-    others' left out (the array code takes their values, evaluated); the start and fixed attributes;
+    others' left out where their values evaluate (the array code takes those); the start and fixed attributes;
   - the values the array code takes per element evaluated on the variables' element view (`IndexReduction.elements`,
     `scalarVariables`, OMJLIR's `Evaluation.StartValues`): each variable's start and fixed attributes (as constants
     where an element has one and every element's evaluates; a missing one the default, `0.0` and `false`, a
@@ -69,8 +69,11 @@ function lowerArraySystem(model::IR.Model)::SIM_CODE
   local evaluated::Dict{Symbol, ElementValues} = elementValues(model.variables, E, model.functions)
   local variables::IR.VariableSet = elementReferenceVariables(model.variables)
   local read::Set{Symbol} = Passes.parametersRead(model)
+  #= a parameter no equation reads keeps its binding where its value does not evaluate (a table's `t_min =
+     getTimeTableTmin(tableID)`, an external object's): the array code computes it at each start =#
   for v in variables
-    (v.kind isa Union{IR.PARAMETER, IR.CONSTANT} && !(v.name in read)) && (v.binding = nothing)
+    (v.kind isa Union{IR.PARAMETER, IR.CONSTANT} && !(v.name in read) && evaluated[v.name].values !== nothing) &&
+      (v.binding = nothing)
   end
   local partition::IR.Partition = model.continuous[1]
   local vars::Vector{IR.Variable} = IR.Variable[v for v in variables if !(v.kind isa IR.STATE_DER)]
@@ -362,9 +365,15 @@ arrayStatement(names::Names, s::IR.IF_STATEMENT)::Statement =
 
 function arrayStatement(names::Names, s::IR.REINIT)::Statement
   local c::IR.ComponentRef = s.state
-  (IR.hasSubscripts(c) && !(simName(names, c) in names.known)) || return simStatement(names, s)
+  IR.hasSubscripts(c) || return simStatement(names, s)
   local base::IR.ComponentRef = IR.withoutSubscripts(c)
-  simName(names, base) in names.known || unsupported("a reinit of an element of no variable", IR.toString(c))
+  #= an element of an array variable by its subscripts, also where the element's own name is known (a rolled
+     component's state `mean1|mean2[1].x` is known as `mean1.x` too: "unknown variable mean1.x" in the array code);
+     an element that is a variable of its own (an array split for index reduction) by its name =#
+  if !(simName(names, base) in names.known)
+    simName(names, c) in names.known && return simStatement(names, s)
+    unsupported("a reinit of an element of no variable", IR.toString(c))
+  end
   local subscripts::Vector{Exp} = Exp[]
   for x in allSubscripts(c)
     x isa IR.INDEX || unsupported("a reinit of a slice", IR.toString(c))

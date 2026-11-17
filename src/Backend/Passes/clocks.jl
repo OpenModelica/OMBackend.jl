@@ -117,10 +117,14 @@ function isClockExpression(e::IR.Expression, clockVars::Set{Symbol})::Bool
   return false
 end
 
-"Scan the expression `e` into `s`, deciding where to descend."
-function scanExp!(s::EquationScan, e::IR.Expression)::Nothing
+"""
+Scan the expression `e` into `s`, deciding where to descend. A reference to an element of an array variable (arrays
+kept: `y[1]`, no variable of that name) is one to the array.
+"""
+function scanExp!(s::EquationScan, @nospecialize(e::IR.Expression))::Nothing
   if e isa IR.CREF
-    local name = e.cref.name
+    local name::Symbol = e.cref.name
+    (name in s.clockVars || name in s.unknowns) || (name = unsubscriptedName(e.cref))
     if name in s.clockVars
       s.boundary === nothing && (s.clockExpressions = true)
     elseif name in s.unknowns
@@ -132,7 +136,7 @@ function scanExp!(s::EquationScan, e::IR.Expression)::Nothing
   elseif e isa IR.CALL
     scanCall!(s, e) || return nothing
   end
-  foreach(c -> scanExp!(s, c), IR.children(e))
+  foreach((@nospecialize(c::IR.Expression)) -> scanExp!(s, c), IR.children(e))
   return nothing
 end
 
@@ -188,7 +192,7 @@ function scanEquation(eq::IR.Equation, unknowns::Set{Symbol}, clockVars::Set{Sym
     end
     return s
   end
-  IR.foreachRootExp(e -> scanExp!(s, e), eq)
+  IR.foreachRootExp((@nospecialize(e::IR.Expression)) -> scanExp!(s, e), eq)
   return s
 end
 

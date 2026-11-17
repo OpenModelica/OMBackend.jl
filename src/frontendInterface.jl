@@ -71,7 +71,8 @@ The OMJLIR model of the flat model `fm` and its functions (the frontend's functi
 through the passes (Passes.PIPELINE): what the simulation code is lowered from. A flat model
 with arrays kept (`scalarized = false`, OM's `scalarize = false`) whose index OMBackend reduces in
 array form is lowered with its arrays (`arrayReducedModel`; not with `arrayReduction` false: a caller
-that tried it); another is scalarized first: the backend takes scalars.
+that tried it); another is scalarized by the backend's element view before the scalar passes
+(`backendScalarizedModel`), by the frontend only where that view does not take the model.
 """
 function omjlirModel end
 
@@ -105,9 +106,12 @@ function reducedArrayModel end
     translateReducedArrays(fm; functionList, BackendMode, warnMissingStartValues, eliminateNonDynamic,
                            observedFilter, checkSimCode) -> Union{Nothing, Tuple}
 
-`translate` of a flat model with arrays kept whose index OMBackend reduces in array form
-(`arrayReducedModel`); `nothing` where it does not (OM's translate then flattens with
-scalarization).
+`translate` of a flat model with arrays kept: its index reduced in array form (`reducedArrayModel`), to the
+array code (`generateReducedArrayODETargetCode`), else the reduced model scalarized (`scalarizedReducedModel`);
+where the array form does not take it, or what it made does not translate or build, the model scalarized by the
+backend before the scalar passes (`backendScalarizedModel`, recorded in BACKEND_SCALARIZED_MODELS). `nothing`
+where none of these takes the model (OM's translate then throws `ARRAY_PRESERVING_CODEGEN_NOT_SUPPORTED` with the
+reasons, `scalarizedFallbackReason`).
 """
 function translateReducedArrays end
 

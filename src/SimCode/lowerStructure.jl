@@ -154,7 +154,7 @@ function referenceNames(names::Names, e::IR.Expression)::Vector{String}
 end
 
 "The simulation names of the states whose derivatives `e` reads."
-function derivativeNames(names::Names, e::IR.Expression)::Vector{String}
+function derivativeNames(names::Names, @nospecialize(e::IR.Expression))::Vector{String}
   local out = String[]
   IR.foreachExp(e) do x
     x isa IR.CREF || return
@@ -172,7 +172,7 @@ arms included.
 """
 function statesUsedByWhens(whens::Vector{WHEN_EQUATION}, stateNames::Set{String})::Vector{String}
   local used = OrderedSet{String}()
-  local visit = e -> foreach(n -> n in stateNames && push!(used, n), allCrefNames(e))
+  local visit = (@nospecialize(e::Exp)) -> foreach(n -> n in stateNames && push!(used, n), allCrefNames(e))
   for w in whens
     local stmts = w.whenEquation
     while stmts !== nothing
@@ -192,7 +192,7 @@ end
 The names of the references in `e`, each once, in the reverse order of their first occurrence
 (the previous backend's order, a list built by consing).
 """
-function allCrefNames(e::Exp)::Vector{String}
+function allCrefNames(@nospecialize(e::Exp))::Vector{String}
   local out = String[]
   foreachExp(x -> x isa Union{EXP_CREF, DER, PRE} && push!(out, crefName(x.cref)), e)
   return reverse(unique(out))

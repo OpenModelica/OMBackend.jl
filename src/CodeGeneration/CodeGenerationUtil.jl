@@ -411,12 +411,12 @@ cleared where it reads a variable, a parameter without a binding (a free one an 
 equation determines), a name the table does not have, a cyclic binding. With `keepTunable`, a
 tunable parameter (withTunableParameters) stays a reference, read at run time.
 """
-function _substituteBoundParameters(exp::SC.Exp, simCode::SC.SIM_CODE;
+function _substituteBoundParameters(@nospecialize(exp::SC.Exp), simCode::SC.SIM_CODE;
                                     skipNames::OrderedSet{String} = OrderedSet{String}(),
                                     shouldEval::Base.RefValue{Bool} = Ref(true),
                                     seen::OrderedSet{String} = OrderedSet{String}(),
                                     keepTunable::Bool = false)::SC.Exp
-  local replace = e::SC.Exp -> begin
+  local replace = (@nospecialize(e::SC.Exp)) -> begin
     e isa SC.EXP_CREF || return e
     local key = SC.crefName(e.cref)
     key in skipNames && return e
@@ -573,7 +573,7 @@ end
   Parameters are constants and discretes change at events only: a condition of those (`(tLH >
   0 or tHL > 0) and change(x)`) is an event-driven discrete callback.
 """
-function isContinuousCondition(cond::SC.Exp, simCode::SC.SIM_CODE)::Bool
+function isContinuousCondition(@nospecialize(cond::SC.Exp), simCode::SC.SIM_CODE)::Bool
   local names = SC.allCrefNames(cond)
   (length(names) == 1 && only(names) == "time") && return true
   local ht = simCode.stringToSimVarHT
@@ -666,7 +666,7 @@ references: `<name>_<field>`); empty for another argument. A connector-typed Com
 (`Modelica.ComplexBlocks.Interfaces.ComplexInput u`) the same, if one of its fields is a
 variable.
 """
-function flattenRecordCallArg(arg::SC.Exp, simCode::SC.SIM_CODE)::Vector{Symbol}
+function flattenRecordCallArg(@nospecialize(arg::SC.Exp), simCode::SC.SIM_CODE)::Vector{Symbol}
   (arg isa SC.EXP_CREF && arg.ty isa SC.TYPE_COMPLEX) || return Symbol[]
   local record::SC.IR.ComponentRef = SC.irRef(arg.cref)
   local flat = Symbol[Symbol(SC.identifierOf(simCode, SC.fieldCref(record, f))) for f in arg.ty.fieldNames]
@@ -778,7 +778,7 @@ function _replaceHvcats(expr, replacements::Dict{HvcatKey, Symbol})
 end
 
 #= ===================================================================
-   Utilities migrated out of MTK_CodeGeneration.jl. These are pure
+   Utilities migrated out of mtkCodeGeneration.jl. These are pure
    predicates / collectors / Expr transforms — no MTK-specific codegen.
    =================================================================== =#
 

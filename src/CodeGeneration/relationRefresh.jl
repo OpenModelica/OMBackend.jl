@@ -571,12 +571,15 @@ A when on a discrete condition (a changed discrete, a Boolean, an algorithm
 section's inputs): its condition and body, as a DiscreteCallback's. Where a
 model has buffered relations, the event iteration (`withRelationRefresh`)
 runs it, after the whens on a relation; otherwise its DiscreteCallback does.
+Not parametric: typed by its functions (closures of the model's module, a type each), it and its callback were
+compiled once per when (MSL BatchPlant_StandardWater's 55: 1.0 s of each build). The event iteration calls its
+functions dynamically either way (`EventIteration.discreteWhens`).
 """
-struct DiscreteWhenAffect{C, A, I}
-  condition::C               # (u, t, integrator[, follow::Bool]) -> Bool: whether it fires; where it does
+struct DiscreteWhenAffect
+  condition::Function        # (u, t, integrator[, follow::Bool]) -> Bool: whether it fires; where it does
                              # not and `follow`, its change()/edge() memory takes the values
-  affect!::A                 # (integrator[, pre]) -> nothing; pre(v) read from `pre` (default: u on entry)
-  initialize!::I             # (u, t, integrator) -> nothing: its state (an edge latch) at the start
+  affect!::Function          # (integrator[, pre]) -> nothing; pre(v) read from `pre` (default: u on entry)
+  initialize!::Function      # (u, t, integrator) -> nothing: its state (an edge latch) at the start
   reads::Vector{String}      # the names its condition and body read at their current values (not under pre())
   writes::Vector{String}     # the names its body assigns (`_sweepOrder`)
 end
@@ -618,6 +621,19 @@ end
 _compiledCondition(f::RuntimeGeneratedFunctions.RuntimeGeneratedFunction, shared::Tuple, x::AbstractVector, t::Real,
                    integrator, follow::Bool)::Bool = f(x, t, integrator, follow, shared...)
 
+"""
+    whenTrace(tag, t, value)
+
+A when callback's debug line (`JULIA_DEBUG=OMBackend`): `tag` names the callback and the point (`"[CB-DC5 cond]
+eval"`), `value` what it shows (the condition's value, the state after the affect, the names without a state).
+A call of a compiled function, not `@debug` in the generated code: each `@debug` expanded to 3.8 KB of logging code,
+and MSL BatchPlant's 220 took 0.16 s of lowering.
+"""
+function whenTrace(tag::String, t::Real, @nospecialize(value))::Nothing
+  @debug tag t value = value isa AbstractVector ? copy(value) : value
+  return nothing
+end
+
 const _NO_WHEN_INITIALIZE = (u, t, integrator) -> nothing
 
 """
@@ -632,16 +648,30 @@ a step later instead). `reads` and `writes`: the names it reads at their
 current values and those it assigns, which place it in the event iteration's
 sweep (`_sweepOrder`).
 """
-discreteWhenCallback(condition, affect!, initialize! = _NO_WHEN_INITIALIZE;
-                     reads::Vector{String} = String[], writes::Vector{String} = String[]) =
-  DiffEqBase.DiscreteCallback((u, t, integrator) -> condition(u, t, integrator, !_changedThisStep(integrator)),
-                              DiscreteWhenAffect(condition, affect!, initialize!, reads, writes);
-                              initialize = (c, u, t, integrator) -> begin
-                                initialize!(u, t, integrator)
-                                _derivativeDiscontinuity!(integrator, false)
-                                nothing
-                              end,
-                              save_positions = (true, true))
+function discreteWhenCallback(condition::Function, @nospecialize(affect!::Function),
+                              @nospecialize(initialize!::Function) = _NO_WHEN_INITIALIZE;
+                              reads::Vector{String} = String[], writes::Vector{String} = String[])
+  local when::DiscreteWhenAffect = DiscreteWhenAffect(condition, affect!, initialize!, reads, writes)
+  return DiffEqBase.DiscreteCallback(_WhenCheck(condition), when; initialize = _WhenInitialize(when),
+                                     save_positions = (true, true))
+end
+
+"A discrete when's DiscreteCallback condition: `condition` with its change() memory following the values unless an
+earlier callback changed them this step. Typed by the condition (a TieredCondition: one type for all whens)."
+struct _WhenCheck{C <: Function}
+  condition::C
+end
+(c::_WhenCheck)(u, t, integrator)::Bool = c.condition(u, t, integrator, !_changedThisStep(integrator))
+
+"A discrete when's DiscreteCallback initialization: its `initialize!`, then the solver told of a discontinuity."
+struct _WhenInitialize
+  when::DiscreteWhenAffect
+end
+function (w::_WhenInitialize)(c, u, t, integrator)::Nothing
+  w.when.initialize!(u, t, integrator)
+  _derivativeDiscontinuity!(integrator, false)
+  return nothing
+end
 
 #= What the event iteration updates. `reinit` solves the algebraic
    unknowns (nothing: EventReinit). =#
@@ -833,14 +863,81 @@ end
    start), if smaller than the current step. Not for a DAE problem: DFBDF
    restarted from a smaller step ended in NaN (DAEIfReinit). =#
 """
-OrdinaryDiffEq's initial step estimate after an event (auto_dt_reset!). It reads the next
-tstop: at an event on the last one there is none left (MSL 4 RobotR3: a BoundsError in
-first_tstop), and no step to size either.
+OrdinaryDiffEq's initial step estimate after an event (auto_dt_reset!), proposed for the next step
+(`dtpropose`, which OrdinaryDiffEqCore's `apply_step!` takes). It reads the next tstop: at an event on
+the last one there is none left (MSL 4 RobotR3: a BoundsError in first_tstop), and no step to size
+either. `integrator.dt` keeps the length of the step that ended at the event: the step's interpolation
+divides by it, and a callback after this one that interpolates the step read it with the estimate
+instead (the array path's asserts, `_assertPending!`: MSL BranchingDynamicPipes, a restart of 2.2e-6 s
+in a step of 0.013 s, values 3000 steps out, a medium at 4125 K and a DomainError in its saturation
+pressure).
 """
 function _autoDtReset!(integrator)
   local tstops = integrator.opts.tstops
   isempty(tstops) && return nothing
+  local stepDt = integrator.dt
   ModelingToolkit.SciMLBase.auto_dt_reset!(integrator)
+  isfinite(integrator.dtpropose) || (integrator.dtpropose = _finiteInitialStep(integrator, integrator.dtpropose))
+  integrator.dt = stepDt
+  return nothing
+end
+
+"""
+    _finiteInitialStep(integrator, estimate) -> step
+
+OrdinaryDiffEq's initial step `estimate` (`auto_dt_reset!`, Hairer's) where it is finite; else Hairer's estimate again,
+its probe kept where the right-hand side is finite. The probe is an explicit Euler step of 1e-6 s (at most the next
+stop) from the state, and the right-hand side there gave the estimate: from junction voltages of 0, a derivative of
+5e19 V/s took the probe to 5e12 V, where the diode's exponential is not finite and the estimate NaN (MSL
+Spice3BenchmarkRtlInverter: DtNaN at the start; a given first step of 1e-15 s solves it). Here the probe 10 times
+shorter until the change of the right-hand side there has a finite norm. `estimate` unchanged for a problem with a
+mass matrix, whose right-hand side is no derivative, and where none of 30 probes is finite.
+"""
+function _finiteInitialStep(integrator, estimate::Float64)::Float64
+  local f = integrator.f
+  (OrdinaryDiffEq.OrdinaryDiffEqCore._is_identity_massmatrix(f.mass_matrix) && !isempty(integrator.opts.tstops)) ||
+    return estimate
+  local (u0::Vector{Float64}, t::Float64, p) = (integrator.u, Float64(integrator.t), integrator.p)
+  local tdir::Float64 = Float64(integrator.tdir)
+  local opts = integrator.opts
+  local f0::Vector{Float64} = similar(u0)
+  f(f0, u0, p, t)
+  local scale::Vector{Float64} = opts.abstol .+ abs.(u0) .* opts.reltol
+  local d1::Float64 = opts.internalnorm(f0 ./ scale, t)
+  isfinite(d1) || return estimate
+  local order::Int = OrdinaryDiffEq.OrdinaryDiffEqCore.alg_order(integrator.alg)
+  local dtmax::Float64 = min(abs(opts.dtmax), abs(OrdinaryDiffEq.OrdinaryDiffEqCore.first_tstop(integrator) - t))
+  local h::Float64 = min(1.0e-6, dtmax)
+  local f1::Vector{Float64} = similar(u0)
+  for _ in 1:30
+    f(f1, u0 .+ (tdir * h) .* f0, p, t + tdir * h)
+    #= finite, and its norm too: 9e162 V/s at the probe of 2e-19 s overflowed to Inf, the step 0 =#
+    local d2::Float64 = opts.internalnorm((f1 .- f0) ./ scale, t) / h
+    if isfinite(d2)
+      local d::Float64 = max(d1, d2)
+      local dt1::Float64 = d <= 1.0e-15 ? max(1.0e-6, 1.0e-3 * h) : 10.0^(-(2 + log10(d)) / order)
+      return tdir * max(abs(opts.dtmin), min(100 * h, dt1, dtmax))
+    end
+    h /= 10
+  end
+  return estimate
+end
+
+"""
+    _finiteFirstStep!(integrator)
+
+At a solve's start (a callback's `initialize`, before OrdinaryDiffEq sizes the first step): the first step
+(`_finiteInitialStep`) where OrdinaryDiffEq's estimate is not finite, set as a given one; nothing otherwise, nor for
+a given step.
+"""
+function _finiteFirstStep!(integrator)::Nothing
+  (iszero(integrator.dt) && integrator.opts.adaptive && !isempty(integrator.opts.tstops)) || return nothing
+  local estimate::Float64 = OrdinaryDiffEq.OrdinaryDiffEqCore._determine_initdt(integrator)
+  isfinite(estimate) && return nothing
+  local dt::Float64 = _finiteInitialStep(integrator, estimate)
+  isfinite(dt) || return nothing
+  integrator.dt = dt
+  integrator.dtpropose = dt
   return nothing
 end
 
@@ -888,8 +985,8 @@ function _restartStepSize!(integrator::OrdinaryDiffEq.OrdinaryDiffEqCore.ODEInte
     stall[] = start <= t <= start + window ? (start, count + 1) : (t, 1)
     last(stall[]) > 1 && (dt = min(_instantLength(t), cap))
   end
-  integrator.dt = integrator.tdir * dt
-  integrator.dtpropose = integrator.dt
+  #= proposed: `integrator.dt` stays the step's that ended at the event (`_autoDtReset!`) =#
+  integrator.dtpropose = integrator.tdir * dt
   return nothing
 end
 
@@ -1104,7 +1201,7 @@ own (MTK's: an if-equation's pure time events, NoInit): the event iteration
 solves its algebraic unknowns again after such an event too, after the
 step-end recorder took the left limit (withDelayRecords). Without the
 iteration nothing did, but the merged continuous callback's re-solve with
-the integrator's algorithm (DirectRHSGeneration.jl `_mergeableReinit`),
+the integrator's algorithm (directRHSGeneration.jl `_mergeableReinit`),
 inside the callback: there delay() recorded no jump, and where that re-solve
 is gone, the unknowns kept their old values until the next step's end (a
 `time > 1.5` branch read by delay() recorded a ramp over the step).

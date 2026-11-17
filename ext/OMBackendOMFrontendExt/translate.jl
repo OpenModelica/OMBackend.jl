@@ -68,6 +68,7 @@ function translate(fm::F.FlatModel;
   try
     delete!(ARRAY_ODE_MODELS, canonicalName(fm.name))
     omjlir === nothing && delete!(ARRAY_REDUCED_MODELS, canonicalName(fm.name))
+    omjlir === nothing && delete!(BACKEND_SCALARIZED_MODELS, canonicalName(fm.name))
     #= an attempt with the arrays kept records its own reasons (as translateReducedArrays); a scalarized translate after
        it, or the reduced model's (`omjlir`), keeps them for OM's report =#
     (scalarized || omjlir !== nothing) || delete!(ARRAY_PATH_REASONS, canonicalName(fm.name))
@@ -108,7 +109,12 @@ function omjlirModel(fm::F.FlatModel; functionList::Union{Nothing, FunctionList}
     local reduced = arrayReducedModel(fm; functionList)
     reduced === nothing || return reduced
   end
-  scalarized || (fm = @BACKEND_PERFLOG "[backendAPI] scalarizeKeptArrays" F.scalarizeKeptArrays(fm))
+  if !scalarized
+    #= the kept arrays scalarized by the backend; by the frontend where its element view does not take the model =#
+    local scalar::Union{Nothing, OMJLIR.Model} = backendScalarizedModel(fm; functionList)
+    scalar === nothing || return scalar
+    fm = @BACKEND_PERFLOG "[backendAPI] scalarizeKeptArrays" F.scalarizeKeptArrays(fm)
+  end
   local model = lowerFlatModel(fm; functions = something(functionList, MetaModelica.nil))
   return Passes.runPasses!(model)
 end
@@ -126,42 +132,78 @@ function reducedArrayModel(fm::F.FlatModel;
   end
 end
 
+function backendScalarizedModel(fm::F.FlatModel;
+                                functionList::Union{Nothing, FunctionList} = nothing)::Union{Nothing, OMJLIR.Model}
+  return backendScalarizedModel(canonicalName(fm.name)) do
+    lowerFlatModel(fm; functions = something(functionList, MetaModelica.nil))
+  end
+end
+
 function translateReducedArrays(fm::F.FlatModel;
                                 functionList::Union{Nothing, FunctionList} = nothing,
                                 BackendMode::OMBackend.BackendMode = DEFAULT_BACKEND_MODE[],
                                 warnMissingStartValues::Union{Nothing, Bool} = nothing,
                                 eliminateNonDynamic::Union{Nothing, Bool, SimCode.EliminationOptions} = nothing,
                                 observedFilter::Union{Nothing, Vector{String}, Vector{Regex}} = nothing,
-                                checkSimCode::Bool = true)
-  delete!(ARRAY_ODE_MODELS, canonicalName(fm.name))
-  delete!(ARRAY_PATH_REASONS, canonicalName(fm.name))
-  local reduced::Union{Nothing, OMJLIR.Model} = @BACKEND_PERFLOG "[backendAPI] reducedArrayModel" reducedArrayModel(fm; functionList)
-  reduced === nothing && return nothing
-  local arrayCode::Union{Nothing, Tuple{String, Expr}} =
-    @BACKEND_PERFLOG "[backendAPI] generateReducedArrayODECode" generateReducedArrayODETargetCode(canonicalName(fm.name), reduced)
-  arrayCode === nothing || return arrayCode
-  local model::Union{Nothing, OMJLIR.Model} = scalarizedReducedModel(canonicalName(fm.name), reduced)
-  model === nothing && return nothing
-  local name = canonicalName(fm.name)
-  #= The array form only where it translates and builds; otherwise its build is forgotten and OM's translate
-     scalarizes as before. Coverage 21 (the array form's first): a lifted if-expression left a for-equation's
-     iterator free (UndefVarError), a build failed (BoundsError) and the tables it had allocated were freed
-     under the problem that read them (Rotational Friction, CoupledClutches, Translational Brake). =#
-  local decline = (reason::String) -> begin
-    @info "[index reduction] $(name): arrays kept, the reduced model $(reason); scalarized in the frontend"
-    declineArrayPath!(name, "array index reduction", "the reduced model " * reason)
-    IMTKGen.forgetBuild(name)
-    delete!(COMPILED_MODELS_MTK, name)
-    delete!(ARRAY_REDUCED_MODELS, name)
-    nothing
+                                checkSimCode::Bool = true)::Union{Nothing, Tuple{String, Expr}}
+  local name::String = canonicalName(fm.name)
+  delete!(ARRAY_ODE_MODELS, name)
+  delete!(ARRAY_PATH_REASONS, name)
+  delete!(BACKEND_SCALARIZED_MODELS, name)
+  local options = (; functionList, BackendMode, warnMissingStartValues, eliminateNonDynamic, observedFilter,
+                   checkSimCode)
+  local result::Union{Nothing, Tuple{String, Expr}} = nothing
+  local reduced::Union{Nothing, OMJLIR.Model} =
+    @BACKEND_PERFLOG "[backendAPI] reducedArrayModel" reducedArrayModel(fm; functionList)
+  if reduced !== nothing
+    result = @BACKEND_PERFLOG "[backendAPI] generateReducedArrayODECode" generateReducedArrayODETargetCode(name,
+                                                                                                           reduced)
+    result === nothing || return result
+    local model::Union{Nothing, OMJLIR.Model} = scalarizedReducedModel(name, reduced)
+    model === nothing || (result = _translateKept(fm, model, "array index reduction", "the reduced model"; options...))
+    result === nothing || return result
   end
-  local result = try
-    translate(fm; functionList, BackendMode, warnMissingStartValues, eliminateNonDynamic, observedFilter, checkSimCode,
-              omjlir = model)
+  #= the array form does not take the model, or what it made does not translate: the kept arrays scalarized by the
+     backend before the scalar passes, so the frontend does not flatten again =#
+  local scalar::Union{Nothing, OMJLIR.Model} =
+    @BACKEND_PERFLOG "[backendAPI] backendScalarizedModel" backendScalarizedModel(fm; functionList)
+  scalar === nothing && return nothing
+  result = _translateKept(fm, scalar, "backend scalarization", "the model scalarized by the backend"; options...)
+  result === nothing || push!(BACKEND_SCALARIZED_MODELS, name)
+  return result
+end
+
+"""
+`translate` of the flat model `fm` with arrays kept from `model`, the OMJLIR model a route with the arrays kept made
+of it (`path`, one of ARRAY_PATHS; `subject`: what `model` is, for the reason). Taken only where it translates and
+builds: otherwise `nothing`, the reason recorded under `path`, its build forgotten, and the caller goes on with the
+next route. Coverage 21 (the array form's first): a lifted if-expression left a for-equation's iterator free
+(UndefVarError), a build failed (BoundsError) and the tables it had allocated were freed under the problem that read
+them (Rotational Friction, CoupledClutches, Translational Brake).
+"""
+function _translateKept(fm::F.FlatModel, model::OMJLIR.Model, path::String, subject::String;
+                        functionList::Union{Nothing, FunctionList},
+                        BackendMode::OMBackend.BackendMode,
+                        warnMissingStartValues::Union{Nothing, Bool},
+                        eliminateNonDynamic::Union{Nothing, Bool, SimCode.EliminationOptions},
+                        observedFilter::Union{Nothing, Vector{String}, Vector{Regex}},
+                        checkSimCode::Bool)::Union{Nothing, Tuple{String, Expr}}
+  local name::String = canonicalName(fm.name)
+  local reason::String = ""
+  try
+    local result::Tuple{String, Expr} =
+      translate(fm; functionList, BackendMode, warnMissingStartValues, eliminateNonDynamic, observedFilter,
+                checkSimCode, omjlir = model)
+    (BackendMode == IMTK_MODE && !haskey(IMTKGen.BUILT, name)) || return result
+    reason = "does not build"
   catch err
     isFatal(err) && rethrow()
-    return decline("does not translate ($(first(sprint(showerror, err), 200)))")
+    reason = "does not translate ($(first(sprint(showerror, err), 200)))"
   end
-  (BackendMode == IMTK_MODE && !haskey(IMTKGen.BUILT, name)) && return decline("does not build")
-  return result
+  @info "[index reduction] $(name): arrays kept, $(subject) $(reason)"
+  declineArrayPath!(name, path, "$(subject) $(reason)")
+  IMTKGen.forgetBuild(name)
+  delete!(COMPILED_MODELS_MTK, name)
+  delete!(ARRAY_REDUCED_MODELS, name)
+  return nothing
 end

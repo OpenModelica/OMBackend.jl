@@ -40,7 +40,9 @@ The causal level of the initialization (`causalSchedule!`): each instance of the
 order, then by column) matched to an unknown it reaches (a state element that is not fixed, directly or through the
 algebraic unknowns it depends on, or a free parameter's element: unknown `nStates + k` the `k`-th of `freeColumns`), the
 instances' number, the free parameter elements (name, column-major index). Free states no initial equation reaches
-keep their start values (as omc).
+keep their start values (as omc). An instance no unknown is left for has 0: an initial equation beyond the free
+states (two inductors in series, each with `i = 0`: one current is a state), out of the square system and checked
+at the solution (as omc removes a redundant consistent initial equation).
 """
 struct InitialMatching
   matchRow::Vector{Int}
@@ -49,8 +51,30 @@ struct InitialMatching
 end
 
 """
+    InitialSystem(blockBase, rowBase, nLoop, reads)
+
+The initialization as OpenModelica's initial system (`_initialSystem`): besides the free states and parameters of the
+square system (`InitialMatching`), the unknowns of the algebraic loops the initial equations reach are unknowns of the
+initial solve and the loops' residuals its rows, solved from the start values in blocks sorted by the structure. Per
+loop block the offset of its unknowns among the loops' unknowns (-1: solved in the equations), per instance solved
+alone (nonlinear in its unknown) its offset, the loops' unknowns' number, and per row of the solve (the square
+system's initial equations, then the loops' residuals in their unknowns' order) the unknowns it reads (the free
+states, the free parameters, then the loops' unknowns; directly or through the unknowns solved explicitly; `nothing`
+where that would be large). OpenModelica solves MSL RobotR3's locked bearing friction `a_relfric = if locked then 0
+else ...` for `sa` alone, after the initial equations fixed the accelerations: its residual is zero at the start value
+and stays there (sa = 0, the motor holds the load). A solve of the states alone has no unknown there: it kept the
+motor's current at its start and the loop put the load into the friction (sa = 1304 > tau0_max: the bearing slid).
+"""
+struct InitialSystem
+  blockBase::Vector{Int}
+  rowBase::Dict{Int, Int}
+  nLoop::Int
+  reads::Union{Nothing, Vector{Vector{Int}}}
+end
+
+"""
     Schedule(elements, nUnknowns, matchRow, batches, pos, producer, loops, hasArrays, large, deps, pattern, solutions,
-             torn, initial, needed, relNeeded, invariant)
+             torn, initial, initialSystem, needed, relNeeded, invariant)
 
 The causal level of a domain system (`causalSchedule!`): the instances' elements and the unknowns' number (states,
 algebraic variables, the discrete variables equations compute), each row's matched unknown, the schedule (batches of
@@ -59,9 +83,10 @@ whether the model keeps arrays a loop may go through, the large blocks (solved b
 rows each state derivative depends on and the Jacobian's sparsity pattern (`nothing` where not computed); each
 (class, access) a batch or a torn block solves for its unknown, solved (`_solveFor`: the target and its value;
 `nothing` where the class is nonlinear in it), each large block torn (`_tearBlock`; `nothing` for another block), the
-initialization's matching (`InitialMatching`), and per row whether the state derivatives need it (the right-hand
-side), whether the relations need it (the crossing functions), whether it is time-invariant (an explicit solution from
-parameters and invariant unknowns only: computed once per solve after the initialization).
+initialization's matching (`InitialMatching`) and its system with the loops it reaches (`InitialSystem`), and per row
+whether the state derivatives need it (the right-hand side), whether the relations need it (the crossing functions),
+whether it is time-invariant (an explicit solution from parameters and invariant unknowns only: computed once per
+solve after the initialization).
 """
 struct Schedule
   elements::InstanceTable
@@ -78,6 +103,7 @@ struct Schedule
   solutions::Dict{Tuple{Int, Int}, Union{Nothing, Tuple{Ref, IR}}}
   torn::Vector{Union{Nothing, TornBlock}}
   initial::InitialMatching
+  initialSystem::InitialSystem
   needed::BitVector
   relNeeded::BitVector
   invariant::BitVector
@@ -87,8 +113,9 @@ end
     domainPasses!(g) -> Gen
 
 The domain level's passes on the domain system `g` (`domainSystem`): its classes rerolled and folded, the alias
-variables read through their roots, semiLinear chains rewritten (MLS 3.7.2.5), and the discrete variables equations
-compute numbered as unknowns of the system (after the states and algebraic variables).
+variables read through their roots, semiLinear chains rewritten (MLS 3.7.2.5), the discrete variables equations
+compute numbered as unknowns of the system (after the states and algebraic variables), and the delay() calls
+numbered (`_numberDelays!`).
 """
 function domainPasses!(g::Gen)::Gen
   g.classes = _reroll(g.classes)
@@ -111,6 +138,7 @@ function domainPasses!(g::Gen)::Gen
       g.discUnknown[info.offset + k] = (nU += 1)
     end
   end
+  _numberDelays!(g)
   return g
 end
 
@@ -136,26 +164,35 @@ function causalSchedule!(g::Gen; keepsArrays::Bool, full::Bool, fixedMask::Vecto
     g.usesInitial && ns("initial() (OMBackend.ARRAY_PATH_FULL)")
   end
   local el::InstanceTable = _elements(g)
-  local matchRow::Vector{Int} = _match(el, nU)
+  local matchRow::Vector{Int} = _match(el, nU, String[c.text for c in g.classes])
+  #= the discrete unknowns the event iteration settles: computed from the continuous variables through relations
+     only (a Boolean's `off = s < 0`), so constant between events; a loop is cut there (`_scheduleWithLoops`) =#
+  local settled::BitVector = falses(nU)
+  for r in 1:el.nEq
+    matchRow[r] > g.nStates + g.nAlg || continue
+    local own::EqClass = g.classes[el.class[r]]
+    settled[matchRow[r]] = !(_continuous(g, own.lhs) || _continuous(g, own.rhs))
+  end
   local (batches::Vector{Tuple{Tuple{Int, Int}, Vector{Int}}}, pos::Vector{Int}, producer::Vector{Int}, loops::LoopBlocks) =
-    _schedule(el, matchRow, nU)
+    _schedule(el, matchRow, nU, settled)
   if _OMBACKEND.envSwitch("OMBACKEND_ARRAY_TRACE")
     local blockSizes::Dict{Int, Int} = Dict{Int, Int}()
     foreach(b::Vector{Int} -> (blockSizes[length(b)] = get(blockSizes, length(b), 0) + 1), loops.blocks)
     println("[arraycode] ", length(g.classes), " classes, ", length(el.class), " instances; loop blocks (instances => count): ",
             sort!(collect(blockSizes)), "; ", length(loops.families), " families")
   end
-  #= algebraic loops in the array code only where it keeps arrays (a class of more than one instance, and `keepsArrays`:
-     not only rolled components of a model of index 1): a model without arrays gains nothing from it, and the scalar
-     path solves its loops (tearing) with its initialization and events =#
+  #= whether the model keeps arrays (a class of more than one instance, and `keepsArrays`: not only rolled components
+     of a model of index 1). Its algebraic loops are the array code's either way: a model of scalars is one of
+     arrays of no dimensions (a loop that does not start declines the array code at the translate,
+     `OMBackend._arrayStartFailure`) =#
   local hasArrays::Bool = keepsArrays && any(c::EqClass -> size(c.domain, 2) > 1, g.classes)
-  (isempty(loops.blocks) || hasArrays) || ns("algebraic loop in a model without arrays (the scalar path solves it)")
-  local large::BitVector = _largeBlocks(g, loops, matchRow)
+  local large::BitVector = _largeBlocks(g, loops, matchRow, el)
   local deps::Union{Nothing, Vector{Vector{Int}}} = _stateDeps(el, matchRow, batches, producer, loops, g.nStates)
   local pattern::Union{Nothing, Tuple{Vector{Int}, Vector{Int}}} = _jacobianPattern(el, matchRow, deps, g.nStates)
-  local initial::InitialMatching = _initialMatching(g, deps, producer, fixedMask)
-  #= initial algorithms: what they assign, which initial equations may not read =#
-  local initAlgOuts::Set{String} = _initAlgAssigned(g)
+  local initial::InitialMatching =
+    _initialMatching(g, deps, producer, fixedMask, _freeParameterDeps(g, el, matchRow, batches, producer, loops))
+  #= initial algorithms that run after the initial system: what they assign, which initial equations may not read =#
+  local initAlgOuts::Set{String} = _initAlgAssigned(g, .!_parameterAlgorithms(g))
   for c in g.initClasses, r in accesses!(accesses!(Ref[], c.lhs), c.rhs)
     r.name in initAlgOuts && ns("initial equation reads $(r.name), which an initial algorithm assigns")
   end
@@ -190,8 +227,10 @@ function causalSchedule!(g::Gen; keepsArrays::Bool, full::Bool, fixedMask::Vecto
       ns("sample() in an equation not solved explicitly: $(g.classes[ci].text)")
     end
   end
+  local initialSystem::InitialSystem =
+    _initialSystem(g, el, matchRow, batches, producer, loops, large, torn, solutions, initial)
   return Schedule(el, nU, matchRow, batches, pos, producer, loops, hasArrays, large, deps, pattern, solutions, torn,
-                  initial, needed, relNeeded, invariant)
+                  initial, initialSystem, needed, relNeeded, invariant)
 end
 
 """
@@ -278,20 +317,27 @@ function _invariantRows!(solutions::Dict{Tuple{Int, Int}, Union{Nothing, Tuple{R
 end
 
 """
-    _initialMatching(g, deps, producer, fixedMask) -> InitialMatching
+    _initialMatching(g, deps, producer, fixedMask, freeDeps) -> InitialMatching
 
 The initial equations as a square system (`InitialMatching`): each instance matched (augmenting paths) to a state
 element that is not fixed (`fixedMask`) and that it depends on (directly or through the algebraic unknowns: `deps` of
-their producing rows), or to an element of a free parameter it reads. NotSupported for an instance without one
-(over-determined) or a model whose dependencies were not computed (a large pattern).
+their producing rows), or to an element of a free parameter it reads (directly or through the algebraic unknowns:
+`freeDeps`, `_freeParameterDeps`; not one an initial algorithm computes before: `_initialFreeParams`). An instance
+without one is matched to none (0: over-determined, held only if the others' solution satisfies it). NotSupported
+for a model whose dependencies were not computed (a large pattern).
 """
 function _initialMatching(g::Gen, deps::Union{Nothing, Vector{Vector{Int}}}, producer::Vector{Int},
-                          fixedMask::Vector{Bool})::InitialMatching
+                          fixedMask::Vector{Bool}, freeDeps::Vector{Set{Tuple{String, Int}}})::InitialMatching
   isempty(g.initClasses) && return InitialMatching(Int[], 0, Tuple{String, Int}[])
   #= a free parameter element (name, column-major index) is unknown g.nStates + k =#
   local freeCols::Vector{Tuple{String, Int}} = Tuple{String, Int}[]
   local freeCol::Dict{Tuple{String, Int}, Int} = Dict{Tuple{String, Int}, Int}()
+  local freeUnknown::Function = (key::Tuple{String, Int}) -> begin
+    haskey(freeCol, key) || (push!(freeCols, key); freeCol[key] = length(freeCols))
+    return g.nStates + freeCol[key]
+  end
   deps === nothing && ns("initialization of a model with a large dependency pattern")
+  local free::Set{String} = _initialFreeParams(g)
   #= candidate free states per initial equation instance =#
   local rows::Vector{Vector{Int}} = Vector{Int}[]
   for c in g.initClasses
@@ -301,12 +347,10 @@ function _initialMatching(g::Gen, deps::Union{Nothing, Vector{Vector{Int}}}, pro
       for r in acc
         local info::VarInfo = g.vars[r.name]
         if info.kind == :param
-          r.name in g.freeParams || continue
+          r.name in free || continue
           local pidx::Vector{Int} = Int[_evalInt(g, s, c.domain, j) for s in r.subs]
           local lin::Int = isempty(info.dims) ? 1 : LinearIndices(Tuple(info.dims))[pidx...]
-          local key::Tuple{String, Int} = (r.name, lin)
-          haskey(freeCol, key) || (push!(freeCols, key); freeCol[key] = length(freeCols))
-          push!(cand, g.nStates + freeCol[key])
+          push!(cand, freeUnknown((r.name, lin)))
           continue
         end
         local idx::Vector{Int} = Int[_evalInt(g, s, c.domain, j) for s in r.subs]
@@ -316,9 +360,11 @@ function _initialMatching(g::Gen, deps::Union{Nothing, Vector{Vector{Int}}}, pro
         elseif info.kind == :discrete
           local du::Int = get(g.discUnknown, off, 0)
           du > 0 && union!(cand, deps[producer[du]])
+          du > 0 && foreach(key -> push!(cand, freeUnknown(key)), freeDeps[producer[du]])
         else
           local u::Int = info.kind == :alg ? g.nStates + off : off
           union!(cand, deps[producer[u]])
+          foreach(key -> push!(cand, freeUnknown(key)), freeDeps[producer[u]])
           r.der && push!(cand, off)
         end
       end
@@ -330,8 +376,7 @@ function _initialMatching(g::Gen, deps::Union{Nothing, Vector{Vector{Int}}}, pro
   local matchRow::Vector{Int} = zeros(Int, length(rows))
   for r0 in eachindex(rows)
     local visited::Set{Int} = Set{Int}()
-    _augment!(rows, matchCol, matchRow, visited, r0) ||
-      ns("initialization over-determined (an initial equation without a free state)")
+    _augment!(rows, matchCol, matchRow, visited, r0)
   end
   return InitialMatching(matchRow, length(rows), freeCols)
 end
@@ -348,4 +393,195 @@ function _augment!(rows::Vector{Vector{Int}}, matchCol::Dict{Int, Int}, matchRow
     end
   end
   return false
+end
+
+"""
+    _initialReads(g, c, j, free) -> Tuple{Vector{Int}, Vector{Int}, Vector{Tuple{String, Int}}}
+
+What the instance `j` of the initial equation class `c` reads: the states it reads (not their derivatives), the
+unknowns (a state's derivative, an algebraic element; not a discrete one: the relations hold their values while the
+initial system is solved), the elements (name, column-major index) of the free parameters `free`; as
+`_initialMatching` reads them.
+"""
+function _initialReads(g::Gen, c::EqClass, j::Int,
+                       free::Set{String})::Tuple{Vector{Int}, Vector{Int}, Vector{Tuple{String, Int}}}
+  local states::Vector{Int} = Int[]
+  local unknowns::Vector{Int} = Int[]
+  local params::Vector{Tuple{String, Int}} = Tuple{String, Int}[]
+  for r::Ref in accesses!(accesses!(Ref[], c.lhs), c.rhs)
+    local info::VarInfo = g.vars[r.name]
+    info.kind == :discrete && continue
+    local idx::Vector{Int} = Int[_evalInt(g, s, c.domain, j) for s in r.subs]
+    if info.kind == :param
+      r.name in free || continue
+      push!(params, (r.name, isempty(info.dims) ? 1 : LinearIndices(Tuple(info.dims))[idx...]))
+      continue
+    end
+    local off::Int = info.offset + _elementOffset(info, idx, r.name) + 1
+    if info.kind == :state && !r.der
+      push!(states, off)
+    else
+      push!(unknowns, info.kind == :alg ? g.nStates + off : off)
+    end
+  end
+  return (states, unknowns, params)
+end
+
+"""
+    _initialSystem(g, el, matchRow, batches, producer, loops, large, torn, solutions, initial) -> InitialSystem
+
+The initial system with the algebraic loops the initial equations reach (`InitialSystem`): those loop blocks (a large
+block by its iteration variables and residuals, `TornBlock`) and the instances solved alone, in schedule order; each
+row's reads in the solve's unknowns, an unknown solved explicitly read through what its row reads (a large block's
+non-iteration unknowns through all the block reads). Empty for a model without initial equations.
+"""
+function _initialSystem(g::Gen, el::InstanceTable, matchRow::Vector{Int},
+                        batches::Vector{Tuple{Tuple{Int, Int}, Vector{Int}}}, producer::Vector{Int}, loops::LoopBlocks,
+                        large::BitVector, torn::Vector{Union{Nothing, TornBlock}},
+                        solutions::Dict{Tuple{Int, Int}, Union{Nothing, Tuple{Ref, IR}}},
+                        initial::InitialMatching)::InitialSystem
+  local N::Int = length(el.class)
+  local nSA::Int = g.nStates + g.nAlg
+  local blockBase::Vector{Int} = fill(-1, length(loops.blocks))
+  local rowBase::Dict{Int, Int} = Dict{Int, Int}()
+  initial.nRows == 0 && return InitialSystem(blockBase, rowBase, 0, nothing)
+  local free::Set{String} = _initialFreeParams(g)
+  #= the initial equations' instances of the square system and what each reads =#
+  local initReads::Vector{Tuple{Vector{Int}, Vector{Int}, Vector{Tuple{String, Int}}}} =
+    Tuple{Vector{Int}, Vector{Int}, Vector{Tuple{String, Int}}}[]
+  local i::Int = 0
+  for c::EqClass in g.initClasses, j::Int in 1:size(c.domain, 2)
+    i += 1
+    initial.matchRow[i] == 0 || push!(initReads, _initialReads(g, c, j, free))
+  end
+  #= the instances solved implicitly alone: nonlinear in their unknown, or reading it through two references =#
+  local implicit::BitVector = falses(N)
+  for ((ci::Int, p::Int), batch::Vector{Int}) in batches
+    ci > 0 || continue
+    (any(r::Int -> (r, matchRow[r]) in el.aliased, batch) || get(solutions, (ci, p), nothing) === nothing) || continue
+    foreach(r::Int -> (implicit[r] = true), batch)
+  end
+  #= the instances the initial equations reach, backwards through the unknowns read (a block whole) =#
+  local reached::BitVector = falses(N)
+  local stack::Vector{Int} = Int[]
+  local reach!::Function = (u::Int) -> begin
+    (0 < u <= nSA && producer[u] > 0 && !reached[producer[u]]) || return nothing
+    reached[producer[u]] = true
+    push!(stack, producer[u])
+    return nothing
+  end
+  foreach(((_, us, _),) -> foreach(reach!, us), initReads)
+  while !isempty(stack)
+    local q::Int = pop!(stack)
+    if loops.blockOf[q] > 0
+      for r::Int in loops.blocks[loops.blockOf[q]]
+        reached[r] && continue
+        reached[r] = true
+        push!(stack, r)
+      end
+    end
+    foreach(k::Int -> reach!(el.uid[k]), el.uptr[q]:(el.uptr[q + 1] - 1))
+  end
+  #= the solve's unknowns: the free states, the free parameters (as the square system orders them), the loops' =#
+  local stateCol::Dict{Int, Int} = Dict{Int, Int}()
+  local paramCol::Dict{Tuple{String, Int}, Int} = Dict{Tuple{String, Int}, Int}()
+  local nz::Int = 0
+  for k::Int in initial.matchRow
+    0 < k <= g.nStates && (stateCol[k] = (nz += 1))
+  end
+  for k::Int in initial.matchRow
+    k > g.nStates && (paramCol[initial.freeColumns[k - g.nStates]] = (nz += 1))
+  end
+  local loopCol::Dict{Int, Int} = Dict{Int, Int}()
+  local residualRows::Vector{Int} = Int[]
+  local nLoop::Int = 0
+  for ((ci::Int, _), batch::Vector{Int}) in batches
+    if ci == 0
+      for b::Int in batch
+        reached[loops.blocks[b][1]] || continue
+        blockBase[b] = nLoop
+        local t::Union{Nothing, TornBlock} = torn[b]
+        local ids::Vector{Int} = large[b] ? t.tears : Int[matchRow[r] for r in loops.blocks[b]]
+        for u::Int in ids
+          loopCol[u] = nz + (nLoop += 1)
+        end
+        append!(residualRows, large[b] ? Int[loops.blocks[b][k] for k in t.residuals] : loops.blocks[b])
+      end
+    elseif ci > 0
+      for r::Int in batch
+        (implicit[r] && reached[r]) || continue
+        rowBase[r] = nLoop
+        loopCol[matchRow[r]] = nz + (nLoop += 1)
+        push!(residualRows, r)
+      end
+    end
+  end
+  #= each reached instance's reads, in schedule order (what it reads is read before) =#
+  local reads::Vector{Vector{Int}} = Vector{Vector{Int}}(undef, N)
+  local total::Int = 0
+  local readsOf!::Function = (s::Set{Int}, us::Vector{Int}, skip::Function) -> begin
+    for u::Int in us
+      u > nSA && continue
+      haskey(loopCol, u) && (push!(s, loopCol[u]); continue)
+      local q::Int = producer[u]
+      (q == 0 || skip(q) || !isassigned(reads, q)) && continue
+      union!(s, reads[q])
+    end
+    return s
+  end
+  local own!::Function = (s::Set{Int}, r::Int) -> begin
+    foreach(k::Int -> (haskey(stateCol, k) && push!(s, stateCol[k])), el.sid[el.sptr[r]:(el.sptr[r + 1] - 1)])
+    el.class[r] > 0 || return s
+    local c::EqClass = g.classes[el.class[r]]
+    for a::Ref in accesses!(accesses!(Ref[], c.lhs), c.rhs)
+      a.name in free || continue
+      local info::VarInfo = g.vars[a.name]
+      local idx::Vector{Int} = Int[_evalInt(g, x, c.domain, el.col[r]) for x in a.subs]
+      local key::Tuple{String, Int} = (a.name, isempty(info.dims) ? 1 : LinearIndices(Tuple(info.dims))[idx...])
+      haskey(paramCol, key) && push!(s, paramCol[key])
+    end
+    return s
+  end
+  for ((ci::Int, _), batch::Vector{Int}) in batches
+    if ci == 0
+      for b::Int in batch
+        local rs::Vector{Int} = loops.blocks[b]
+        reached[rs[1]] || continue
+        if large[b]
+          #= the iteration variables, and what the block reads from outside =#
+          local s::Set{Int} = Set{Int}(loopCol[u] for u in torn[b].tears)
+          for r::Int in rs
+            own!(s, r)
+            readsOf!(s, el.uid[el.uptr[r]:(el.uptr[r + 1] - 1)], (q::Int) -> loops.blockOf[q] == b)
+          end
+          local d::Vector{Int} = sort!(collect(s))
+          foreach(r::Int -> (reads[r] = d), rs)
+          total += length(d) * length(rs)
+        else
+          for r::Int in rs
+            reads[r] = sort!(collect(readsOf!(own!(Set{Int}(), r), el.uid[el.uptr[r]:(el.uptr[r + 1] - 1)],
+                                              (q::Int) -> loops.blockOf[q] == b)))
+            total += length(reads[r])
+          end
+        end
+        total > 20_000_000 && return InitialSystem(blockBase, rowBase, nLoop, nothing)
+      end
+      continue
+    end
+    for r::Int in batch
+      reached[r] || continue
+      reads[r] = sort!(collect(readsOf!(own!(Set{Int}(), r), el.uid[el.uptr[r]:(el.uptr[r + 1] - 1)],
+                                        (q::Int) -> q == r)))
+      total += length(reads[r])
+      total > 20_000_000 && return InitialSystem(blockBase, rowBase, nLoop, nothing)
+    end
+  end
+  local rows::Vector{Vector{Int}} = Vector{Int}[]
+  for (states::Vector{Int}, us::Vector{Int}, params::Vector{Tuple{String, Int}}) in initReads
+    local s::Set{Int} = Set{Int}(stateCol[k] for k in states if haskey(stateCol, k))
+    foreach(key -> (haskey(paramCol, key) && push!(s, paramCol[key])), params)
+    push!(rows, sort!(collect(readsOf!(s, us, (_::Int) -> false))))
+  end
+  append!(rows, Vector{Int}[reads[r] for r in residualRows])
+  return InitialSystem(blockBase, rowBase, nLoop, rows)
 end

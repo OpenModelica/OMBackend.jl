@@ -52,11 +52,14 @@ replaced by the call's arguments, an omitted one by its default (a reference to 
 element of an input, `R_rel.T`, `e[3]`, by that field or element of the argument). `nothing` for
 another body: a loop, an assignment to an
 element or a field, a local read before it has a value, an output some path leaves unassigned, a
-value over `INLINED_BODY_NODE_LIMIT` nodes.
+value over `INLINED_BODY_NODE_LIMIT` nodes; and for a function with a function as an input.
 """
 function inlineBody(f::IR.ModelicaFunction, call::IR.CALL)::Union{Nothing, IR.Expression}
   (f.external === nothing && length(f.outputs) == 1) || return nothing
   length(call.arguments) <= length(f.inputs) || return nothing
+  #= a function that takes a function (`twice(f, u)`) calls it by its name, which no argument replaces: "function f"
+     in the equation the body was put into =#
+  any((v::IR.FunctionVariable) -> v.ty isa IR.T_FUNCTION, f.inputs) && return nothing
   local output = f.outputs[1].name
   local assignable = Set{Symbol}(v.name for v in f.locals if !(v.ty isa Union{IR.T_ARRAY, IR.T_RECORD}))
   push!(assignable, output)
@@ -106,7 +109,7 @@ input's field the argument does not have.
 """
 function substituteBody(e::IR.Expression, inputs::Dict{Symbol, IR.Expression}, env::Dict{Symbol, IR.Expression},
                         own::Set{Symbol}, unknown::Ref{Bool})::IR.Expression
-  return IR.mapExpTopDown(e) do x
+  return IR.mapExpTopDown(e) do @nospecialize(x::IR.Expression)
     x isa IR.CREF || return (x, true)
     local parts = x.cref.parts
     if parts[1].name in own

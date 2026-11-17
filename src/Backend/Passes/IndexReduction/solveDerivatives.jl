@@ -191,7 +191,8 @@ function derivativeEdges(model::IR.Model, partition::IR.Partition, unknowns::Set
       end
       isPiecewise(c) && continue
       if !isempty(simValues)
-        local withValues = IR.mapExp(x -> (x isa IR.CREF && haskey(simValues, x.cref.name)) ? first(simValues[x.cref.name]) : x, c)
+        local withValues = IR.mapExp((@nospecialize(x::IR.Expression)) ->
+          (x isa IR.CREF && haskey(simValues, x.cref.name)) ? first(simValues[x.cref.name]) : x, c)
         local byValues = readsNoUnknown(withValues, model.variables) ? evaluate(withValues, known) : nothing
         (byValues !== nothing && (byValues == 0 || !isfinite(byValues))) && continue
       end
@@ -213,7 +214,11 @@ coefficient that reads unknowns only for an unknown no constant one can determin
 equation whose other derivative unknowns the first matching determined (not a block of
 derivatives coupled through such coefficients: a quaternion's `w = angularVelocity2(Q, der(Q))`
 divided one equation at a time by components that pass 0; such a block stays the solver's);
-those tried by their magnitude at the start values, the largest first (pivoting).
+those tried by their magnitude at the start values, the largest first (pivoting). An unknown
+with such a coefficient in more than one equation is not solved through any of them
+(`pivotsMove`): which one is not 0 changes during the simulation (a mass that slides along a
+turning axis, `T[2, i] * der(der(s))` in the three force equations, `T[2, :]` a row of a
+rotation: every component passes 0); it stays an unknown of the solver's linear system.
 """
 function matchDerivatives(edges::Dict{Symbol, Vector{DerivativeEdge}})::Dict{Symbol, DerivativeEdge}
   local unknownOf = Dict{Int, Symbol}()
@@ -221,22 +226,27 @@ function matchDerivatives(edges::Dict{Symbol, Vector{DerivativeEdge}})::Dict{Sym
   local determined = Set{Symbol}()
   foreach(list -> sort!(list; by = e -> -e.pivot), values(edges))
   local order = sort(collect(keys(edges)))
-  foreach(d -> augmentDerivative!(d, edges, unknownOf, matched, determined, true), order)
+  local pivotsMove = Set{Symbol}(d for (d, list) in edges if count(e -> !e.constant, list) > 1)
+  foreach(d -> augmentDerivative!(d, edges, unknownOf, matched, determined, pivotsMove, true), order)
   union!(determined, keys(matched))
-  foreach(d -> haskey(matched, d) || augmentDerivative!(d, edges, unknownOf, matched, determined, false), order)
+  foreach(d -> haskey(matched, d) || augmentDerivative!(d, edges, unknownOf, matched, determined, pivotsMove, false),
+          order)
   return matched
 end
 
 """
-    augmentDerivative!(d, edges, unknownOf, matched, determined, constantOnly) -> Bool
+    augmentDerivative!(d, edges, unknownOf, matched, determined, pivotsMove, constantOnly) -> Bool
 
 An augmenting path from the unknown `d` (depth first, with an explicit stack: alias chains can be
-long), over constant edges only or over the edges `matchDerivatives` allows; the matching
+long), over constant edges only or over the edges `matchDerivatives` allows (of an unknown in
+`pivotsMove` the constant ones); the matching
 (`unknownOf`, `matched`) flipped along it. Whether one was found.
 """
 function augmentDerivative!(d::Symbol, edges::Dict{Symbol, Vector{DerivativeEdge}}, unknownOf::Dict{Int, Symbol},
-                            matched::Dict{Symbol, DerivativeEdge}, determined::Set{Symbol}, constantOnly::Bool)::Bool
-  local allowed = e::DerivativeEdge -> (!constantOnly || e.constant) && (e.constant || all(in(determined), e.others))
+                            matched::Dict{Symbol, DerivativeEdge}, determined::Set{Symbol}, pivotsMove::Set{Symbol},
+                            constantOnly::Bool)::Bool
+  local allowed = (u::Symbol, e::DerivativeEdge) ->
+    e.constant || (!constantOnly && !(u in pivotsMove) && all(in(determined), e.others))
   local visited = Set{Int}()
   local stack = Tuple{Symbol, Int}[(d, 1)]
   local path = Tuple{Symbol, DerivativeEdge}[]
@@ -247,7 +257,7 @@ function augmentDerivative!(d::Symbol, edges::Dict{Symbol, Vector{DerivativeEdge
     while k <= length(list)
       local e = list[k]
       k += 1
-      (allowed(e) && !(e.equation in visited)) || continue
+      (allowed(u, e) && !(e.equation in visited)) || continue
       push!(visited, e.equation)
       stack[end] = (u, k)
       push!(path, (u, e))
@@ -341,17 +351,21 @@ from a free equation. MSL Media's lumped volumes with p and h the states (StateS
 specific internal energy reads der(p), der(p) from the density's derivative (`rho_ph_der`, linear in its derivative
 inputs: `derivativeFunctionCall`) reads der(h); left the solver's, der(p) of R134a2's volumes jumped at the dew line
 (rho_ph_der's two branches) and the steps fell to 1e-16. Not where a branch of the coefficient is 0
-(`isPiecewise`), nor where it is 0 or does not evaluate at the start.
+(`isPiecewise`), nor where it is 0 or does not evaluate at the start. Returns the unknowns so solved, each with
+the unknowns whose values were put into its equation (their values as matched, `solved` at that time).
 """
 function solveThroughSolved!(solved::Dict{Symbol, IR.Expression}, equationOf::Dict{Symbol, Int},
                              edges::Dict{Symbol, Vector{DerivativeEdge}}, partition::IR.Partition, unknowns::Set{Symbol},
-                             functions::Dict{Symbol, IR.ModelicaFunction}, variables::IR.VariableSet, start::StartValues)::Nothing
+                             functions::Dict{Symbol, IR.ModelicaFunction}, variables::IR.VariableSet,
+                             start::StartValues)::Dict{Symbol, Set{Symbol}}
+  local through::Dict{Symbol, Set{Symbol}} = Dict{Symbol, Set{Symbol}}()
   local readsOf = v -> (local r = Set{Symbol}(); IR.foreachExp(x -> (x isa IR.CREF && x.cref.name in unknowns && push!(r, x.cref.name); nothing), v); r)
   #= `d` from equation `i` with the values of `others` put in: its value, or nothing =#
   local solveFrom = (d, i, others) -> begin
     local eq = partition.equations[i]
     eq isa IR.SCALAR_EQUATION || return nothing
-    local insert = x -> (x isa IR.CREF && x.cref.name in others) ? solved[x.cref.name] : x
+    local insert = (@nospecialize(x::IR.Expression)) ->
+                     (x isa IR.CREF && x.cref.name in others) ? solved[x.cref.name] : x
     local substituted = IR.SCALAR_EQUATION(IR.mapExp(insert, eq.lhs), IR.mapExp(insert, eq.rhs), eq.ty, eq.source, eq.attributes)
     local reads = readsOf(substituted)
     (d in reads && !any(o -> o in reads, others)) || return nothing
@@ -372,6 +386,7 @@ function solveThroughSolved!(solved::Dict{Symbol, IR.Expression}, equationOf::Di
       local value = solveFrom(a, equationOf[a], Set([b]))
       value === nothing && continue
       solved[a] = value
+      through[a] = Set{Symbol}([b])
       break
     end
   end
@@ -383,12 +398,13 @@ function solveThroughSolved!(solved::Dict{Symbol, IR.Expression}, equationOf::Di
       local value = solveFrom(d, e.equation, Set(e.others))
       value === nothing && continue
       solved[d] = value
+      through[d] = Set{Symbol}(e.others)
       equationOf[d] = e.equation
       push!(used, e.equation)
       break
     end
   end
-  return nothing
+  return through
 end
 
 """
@@ -467,16 +483,16 @@ function readsFreeParameter(e::IR.Expression, variables::IR.VariableSet, seen::S
 end
 
 """
-    DerivativeSolution(resolved, equationOf, throughSolved)
+    DerivativeSolution(resolved, equationOf, through)
 
 What `solveDerivatives!` substitutes: each solved derivative unknown's value (`resolvedValues`), the equation it is
 solved from (its index in the partition), and the unknowns `solveThroughSolved!` solved, or solved again, from an
-equation with the values of others put in.
+equation with the values of others put in, each with those others.
 """
 struct DerivativeSolution
   resolved::Dict{Symbol, IR.Expression}
   equationOf::Dict{Symbol, Int}
-  throughSolved::Set{Symbol}
+  through::Dict{Symbol, Set{Symbol}}
 end
 
 """
@@ -505,13 +521,12 @@ function derivativeSolution(model::IR.Model, partition::IR.Partition;
     solved[d] = solvedValue(partition.equations[e.equation]::IR.SCALAR_EQUATION, d, coefficient(e.coefficient))
     equationOf[d] = e.equation
   end
-  local matchedValues::Dict{Symbol, IR.Expression} = copy(solved)
-  solveThroughSolved!(solved, equationOf, edges, partition, unknowns, functions, model.variables, start)
+  local through::Dict{Symbol, Set{Symbol}} =
+    solveThroughSolved!(solved, equationOf, edges, partition, unknowns, functions, model.variables, start)
   isempty(solved) && return nothing
   local resolved = resolvedValues(solved)
   isempty(resolved) && return nothing
-  local throughSolved::Set{Symbol} = Set{Symbol}(d for (d, value) in solved if get(matchedValues, d, nothing) !== value)
-  return DerivativeSolution(resolved, equationOf, throughSolved)
+  return DerivativeSolution(resolved, equationOf, through)
 end
 
 """
@@ -523,7 +538,8 @@ reference in `variables`), its value in the other equations; the unknowns so sol
 function substituteDerivatives!(partition::IR.Partition, solution::DerivativeSolution, variables::IR.VariableSet)::Vector{Symbol}
   local resolved::Dict{Symbol, IR.Expression} = solution.resolved
   local definitions::Dict{Int, Symbol} = Dict{Int, Symbol}(solution.equationOf[d] => d for d in keys(resolved))
-  local substitute = x -> (x isa IR.CREF && haskey(resolved, x.cref.name)) ? substitutable(x, resolved[x.cref.name]) : x
+  local substitute = (@nospecialize(x::IR.Expression)) ->
+                       (x isa IR.CREF && haskey(resolved, x.cref.name)) ? substitutable(x, resolved[x.cref.name]) : x
   for (i, eq) in enumerate(partition.equations)
     local d = get(definitions, i, nothing)
     partition.equations[i] = d === nothing ? IR.mapEquation!(substitute, eq) :

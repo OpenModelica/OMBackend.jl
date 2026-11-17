@@ -259,7 +259,7 @@ function derivedStateCrefs(simCode::SIM_CODE)::OrderedSet{SimCref}
     x isa DER && push!(derived, x.cref)
     (isBuiltin(x, :der) && first(x.args) isa EXP_CREF) && push!(derived, first(x.args).cref)
   end
-  foreachEquationExp((_::Tuple{Symbol, Int}, e::Exp) -> visit(e), simCode; eliminated = true,
+  foreachEquationExp((_::Tuple{Symbol, Int}, @nospecialize(e::Exp)) -> visit(e), simCode; eliminated = true,
                      statement = (_::Tuple{Symbol, Int}, s::Statement) -> (s isa REINIT && push!(derived, s.stateVar); nothing))
   return derived
 end
@@ -285,7 +285,7 @@ The references of statements: their expressions' (an assert's level too), a rein
 of the nested statements.
 """
 function statementCrefNames!(names::OrderedSet{String}, body::Vector{Statement}; dynamic::Union{Nothing, Set{Symbol}} = nothing)::OrderedSet{String}
-  foreachStatementExp((e::Exp) -> crefNames!(names, e; dynamic), body,
+  foreachStatementExp((@nospecialize(e::Exp)) -> crefNames!(names, e; dynamic), body,
                       (s::Statement) -> (s isa REINIT && push!(names, crefName(s.stateVar)); nothing))
   return names
 end

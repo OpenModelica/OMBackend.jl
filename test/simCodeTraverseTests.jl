@@ -5,7 +5,7 @@
 
 using Test
 
-isdefined(@__MODULE__, :BackendTestMocks) || include(joinpath(@__DIR__, "backendTestMocks.jl"))
+isdefined(@__MODULE__, :BackendTestMocks) || include(joinpath(@__DIR__, "BackendTestMocks.jl"))
 
 @testset "Inner Component Tests" begin
   local SC = OMBackend.SimCode

@@ -92,6 +92,20 @@ Runtime-toggleable perf logging switch. Default is taken from
 const BACKEND_PERFLOG = Ref{Bool}(get(ENV, "ENABLE_BACKEND_PERFLOG", "false") == "true")
 
 """
+    readLoggingSwitches!()
+
+`BACKEND_LOGGING`, `VSS_DEBUG` and `BACKEND_PERFLOG` from the environment of the process that loads the package (its
+`__init__`). A `const` Ref's value is the precompile cache's: a package precompiled with ENABLE_BACKEND_LOGGING=true
+(a test's subprocess, a debugging session) logged in every later session, its printed models with the dump code.
+"""
+function readLoggingSwitches!()::Nothing
+  BACKEND_LOGGING[] = get(ENV, "ENABLE_BACKEND_LOGGING", "false") == "true"
+  VSS_DEBUG[] = get(ENV, "ENABLE_VSS_DEBUG", "false") == "true"
+  BACKEND_PERFLOG[] = get(ENV, "ENABLE_BACKEND_PERFLOG", "false") == "true"
+  return nothing
+end
+
+"""
     @BACKEND_PERFLOG "label" expr
 
 Wraps `expr` in `@time` when `BACKEND_PERFLOG[]` is true, then prints the

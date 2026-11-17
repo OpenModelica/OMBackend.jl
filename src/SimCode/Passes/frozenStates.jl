@@ -106,7 +106,7 @@ end
 and negations only): `+ - * /` of two literals (not by zero) to a Real, `0 * x` to `0.0`,
 `1 * x`, `x + 0`, `x - 0`, `x / 1` to `x`.
 """
-function foldNumeric(e::Exp)::Exp
+function foldNumeric(@nospecialize(e::Exp))::Exp
   if e isa BINARY
     local (f1, f2) = (foldNumeric(e.exp1), foldNumeric(e.exp2))
     local (v1, v2) = (literalValue(f1), literalValue(f2))
@@ -139,7 +139,7 @@ function foldNumeric(e::Exp)::Exp
 end
 
 "The value of a numeric literal (under unary minuses); `nothing` for another expression."
-function literalValue(e::Exp)::Union{Nothing, Float64}
+function literalValue(@nospecialize(e::Exp))::Union{Nothing, Float64}
   e isa RCONST && return e.value
   e isa ICONST && return Float64(e.value)
   if e isa UNARY && e.op === OP_UMINUS

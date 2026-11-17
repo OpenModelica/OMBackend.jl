@@ -233,9 +233,10 @@ function checkReferences(simCode::SIM_CODE)::Vector{CheckViolation}
   end
   local missing::Function = (place::Tuple{Symbol, Int}, c::SimCref) -> c.ref === nothing &&
     push!(out, CheckViolation(:references, :error, "$(place[1])[$(place[2])]", "reference `$(crefName(c))` without its IR reference"))
-  foreachEquationExp(simCode; statement = (place::Tuple{Symbol, Int}, s::Statement) ->
-                       foreach(c::SimCref -> missing(place, c), statementTargets!(SimCref[], s))) do place::Tuple{Symbol, Int}, e::Exp
-    foreachExp(x::Exp -> (x isa Union{EXP_CREF, DER, PRE} && missing(place, x.cref); nothing), e)
+  local statementRefs::Function = (place::Tuple{Symbol, Int}, s::Statement) ->
+    foreach(c::SimCref -> missing(place, c), statementTargets!(SimCref[], s))
+  foreachEquationExp(simCode; statement = statementRefs) do place::Tuple{Symbol, Int}, @nospecialize(e::Exp)
+    foreachExp((@nospecialize(x::Exp)) -> (x isa Union{EXP_CREF, DER, PRE} && missing(place, x.cref); nothing), e)
   end
   return out
 end

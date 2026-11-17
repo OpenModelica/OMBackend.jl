@@ -53,11 +53,13 @@ import OMBackend
 import MetaModelica
 import OMFrontend
 import OMBackend: OMJLIR, Passes, SimCode, IMTKGen, DEFAULT_BACKEND_MODE, IMTK_MODE, WARN_MISSING_START_VALUES,
-  MODEL_RUN_DIRS, ARRAY_ODE_MODELS, ARRAY_REDUCED_MODELS, ARRAY_PATH_REASONS, COMPILED_MODELS_MTK, canonicalName,
+  MODEL_RUN_DIRS, ARRAY_ODE_MODELS, ARRAY_REDUCED_MODELS, ARRAY_PATH_REASONS, BACKEND_SCALARIZED_MODELS,
+  COMPILED_MODELS_MTK, canonicalName,
   createLogRunId, resetFallbacks!, withLogRunDir, debugWrite, logPath, envSwitch, isFatal, declineArrayPath!,
   generateTargetCode, scalarizedReducedModel, generateReducedArrayODETargetCode, simulateModel,
   defaultSolver, daeFallbackSolver, @BACKEND_PERFLOG, @BACKEND_LOGGING
 import OMBackend: translate, explainIndexReduction, omjlirModel, arrayReducedModel, reducedArrayModel,
+  backendScalarizedModel,
   translateReducedArrays, lowerFlatModel, resolveModelicaURI
 
 const F = OMFrontend.Frontend
@@ -65,7 +67,7 @@ const F = OMFrontend.Frontend
 include("LowerFlatModel.jl")
 import .LowerFlatModel: FunctionList
 include("translate.jl")
-include("recompilation.jl")
+include("Recompilation.jl")
 
 "The file of a `modelica://` URI, where OMFrontend loaded the library from (OMFrontend.resolveModelicaURI)."
 resolveModelicaURI(uri::String)::String = OMFrontend.resolveModelicaURI(uri)

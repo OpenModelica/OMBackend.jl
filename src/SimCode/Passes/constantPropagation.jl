@@ -44,7 +44,7 @@ before an event is its value. `propagateConstants` then sees `x - pre(p)` as `x 
 function inlinePreOfConstantParameters(simCode::SIM_CODE)::SIM_CODE
   (hasStructuralTransitions(simCode) || hasSubModels(simCode)) && return simCode
   local ht = simCode.stringToSimVarHT
-  local inline = e::Exp -> begin
+  local inline = (@nospecialize(e::Exp)) -> begin
     e isa PRE && isParameter(ht, e.cref) && return EXP_CREF(e.cref, e.ty)
     (e isa CALL && e.name in (:pre, :previous) && length(e.args) == 1 && e.args[1] isa EXP_CREF &&
       isParameter(ht, e.args[1].cref)) && return e.args[1]

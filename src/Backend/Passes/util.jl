@@ -134,6 +134,10 @@ unsubscriptedName(cref::IR.ComponentRef)::Symbol =
   !IR.hasSubscripts(cref) ? cref.name :
     (length(cref.parts) == 1 && !(cref.parts[1].ty isa IR.T_SLICE)) ? IR.arrayName(cref.parts[1]) : IR.withoutSubscripts(cref).name
 
+"The variable a reference is to or into: its own name, else (an element) its array's."
+variableNameOf(c::IR.ComponentRef, variables::IR.VariableSet)::Symbol =
+  (IR.hasSubscripts(c) && !haskey(variables, c.name)) ? unsubscriptedName(c) : c.name
+
 "The subscripts of all parts of `cref`, in order (`c[2].v[3]`: 2, 3; `IR.partSubscripts`): those of the element of an array variable it names."
 allSubscripts(cref::IR.ComponentRef)::Vector{IR.Subscript} = IR.Subscript[s for p in cref.parts for s in IR.partSubscripts(p)]
 
@@ -141,10 +145,16 @@ allSubscripts(cref::IR.ComponentRef)::Vector{IR.Subscript} = IR.Subscript[s for 
     foldInteger(e)
 
 The value of an Integer expression of literals, `+`, `-` and `*` (`2 - 1` after a loop's
-iterator was replaced); `nothing` for another.
+iterator was replaced) and of an element of a range of them (`(1:2 - 1)[1]`, the frontend's
+element of a slice); `nothing` for another.
 """
 function foldInteger(e::IR.Expression)::Union{Nothing, Int}
   e isa IR.INTEGER && return e.value
+  if e isa IR.SUBSCRIPTED && e.exp isa IR.RANGE && length(e.subscripts) == 1 && e.subscripts[1] isa IR.INDEX
+    local values::Union{Nothing, Vector{Int}} = rangeValues(e.exp)
+    local k::Union{Nothing, Int} = foldInteger(e.subscripts[1].exp)
+    return (values === nothing || k === nothing || !(1 <= k <= length(values))) ? nothing : values[k]
+  end
   if e isa IR.UNARY && e.op === IR.UMINUS
     local v = foldInteger(e.exp)
     return v === nothing ? nothing : -v
@@ -166,7 +176,7 @@ end
 """
 function substituteIterators(e::IR.Expression, values::Dict{Symbol, Int})::IR.Expression
   isempty(values) && return e
-  local replace = x -> begin
+  local replace = (@nospecialize(x::IR.Expression)) -> begin
     (x isa IR.CREF && length(x.cref.parts) == 1 && !IR.hasSubscripts(x.cref) && haskey(values, x.cref.name)) || return x
     return IR.INTEGER(values[x.cref.name])
   end
@@ -186,8 +196,8 @@ function foldSubscripts(cref::IR.ComponentRef)::IR.ComponentRef
 end
 
 "`e` with `initial()` replaced by `value`."
-replaceInitial(e::IR.Expression, value::Bool)::IR.Expression =
-  IR.mapExp(x -> isInitialCall(x) ? IR.BOOLEAN(value) : x, e)
+replaceInitial(@nospecialize(e::IR.Expression), value::Bool)::IR.Expression =
+  IR.mapExp((@nospecialize(x::IR.Expression)) -> isInitialCall(x) ? IR.BOOLEAN(value) : x, e)
 
 """
     rangeValues(range)
@@ -219,10 +229,10 @@ end
 namesReadOutsidePre(e::IR.Expression)::Vector{Symbol} = Symbol[c.name for c in crefsReadOutsidePre(e)]
 
 "The relations in `e`, each once (structurally), in a bottom-up order."
-function relationsIn(e::IR.Expression)::Vector{IR.RELATION}
+function relationsIn(@nospecialize(e::IR.Expression))::Vector{IR.RELATION}
   local out = IR.RELATION[]
   local visit
-  visit = x -> begin
+  visit = (@nospecialize(x::IR.Expression)) -> begin
     foreach(visit, IR.children(x))
     x isa IR.RELATION && !(x in out) && push!(out, x)
   end

@@ -36,8 +36,8 @@
 #= Symbolic differentiation of OMJLIR expressions and equations: d/dt for the equations
    Pantelides' algorithm differentiates, partial derivatives for the Jacobians of state
    selection. One set of rules, a seed telling what a variable reference and time become. The
-   derivatives are built with Evaluation's simplifying constructors (Evaluation/Algebra.jl), a
-   call without derivative annotation inlined (Evaluation/Inline.jl). =#
+   derivatives are built with Evaluation's simplifying constructors (Evaluation/algebra.jl), a
+   call without derivative annotation inlined (Evaluation/inline.jl). =#
 
 """
     Seeds
@@ -108,7 +108,7 @@ The derivative of `e` by the rules of calculus, the leaves by `seeds` (see `Seed
 NotHandled for an expression without rules here (a call without a derivative annotation and a
 body to inline, an array expression, ...).
 """
-function differentiate(e::IR.Expression, seeds::Seeds)::IR.Expression
+function differentiate(@nospecialize(e::IR.Expression), seeds::Seeds)::IR.Expression
   isPiecewiseConstant(e) && return ZERO
   return derivativeOf(e, seeds)
 end
@@ -354,7 +354,7 @@ derivativeOf(e::IR.RECORD, seeds::Seeds)::IR.Expression =
 """
 A field of a record expression: of a record constructor, its element; of a call, the field of
 the call's derivative (its body inlined where it runs into one expression, `inlineBody`, as
-MSL's Frames.planarRotation).
+MSL's Frames.planarRotation); of an if-expression, the derivative of the if-expression of its branches' fields.
 """
 function derivativeOf(e::IR.RECORD_ELEMENT, seeds::Seeds)::IR.Expression
   local inner = e.exp
@@ -369,6 +369,12 @@ function derivativeOf(e::IR.RECORD_ELEMENT, seeds::Seeds)::IR.Expression
   end
   inner isa IR.CREF &&
     return differentiate(IR.CREF(IR.withField(inner.cref, e.field, e.ty), e.ty), seeds)
+  #= of an if-expression of records the if-expression of its branches' fields (`(if n == 2 then
+     ThermodynamicState(p, T, X) else ...).p`, a pipe's state at a port chosen by a size in MSL Fluid: the preferred
+     states of a volume beside it were given up, and its mass and energy, of start 0, were the states) =#
+  inner isa IR.IF_EXPRESSION &&
+    return differentiate(IR.IF_EXPRESSION(inner.condition, IR.RECORD_ELEMENT(inner.thenExp, e.index, e.field, e.ty),
+                                          IR.RECORD_ELEMENT(inner.elseExp, e.index, e.field, e.ty), e.ty), seeds)
   throw(NotHandled("the derivative of a field of a $(nameof(typeof(inner)))"))
 end
 
@@ -481,7 +487,7 @@ function derivativeFunctionCall(call::IR.CALL, seeds::Seeds)::Union{Nothing, IR.
   end
   (n === nothing || n >= length(call.arguments)) && return nothing
   local leading = call.arguments[1:n]
-  any(a -> readsSeeded(a, seeds), leading) && return nothing
+  any((@nospecialize(a::IR.Expression)) -> readsSeeded(a, seeds), leading) && return nothing
   return IR.CALL(call.name, IR.Expression[leading..., (differentiate(a, seeds) for a in call.arguments[(n + 1):end])...],
                  call.ty, call.attributes)
 end

@@ -218,7 +218,7 @@ end
 `e` with the parameters of `values` replaced by their literals, top-down: a reference by the
 literal of its type, an array element by literal subscripts by a Real.
 """
-function substituteValues(e::Exp, values::OrderedDict{String, ParameterValue})::Exp
+function substituteValues(@nospecialize(e::Exp), values::OrderedDict{String, ParameterValue})::Exp
   isempty(values) && return e
   return first(traverseExpTopDown(e, valueVisitor, values))
 end
@@ -327,7 +327,7 @@ function eliminateConstantParameters(simCode::SIM_CODE)::SIM_CODE
     end
   end
   isempty(values) && return simCode
-  local x = e::Exp -> substituteValues(e, values)
+  local x = (@nospecialize(e::Exp)) -> substituteValues(e, values)
   local residuals = RESIDUAL_EQUATION[RESIDUAL_EQUATION(x(eq.exp), eq.source, eq.attr) for eq in simCode.residualEquations]
   local initialEquations = Equation[initialWithValues(eq, values) for eq in simCode.initialEquations]
   local ifEquations = IF_EQUATION[IF_EQUATION(BRANCH[BRANCH(x(b.condition), RESIDUAL_EQUATION[RESIDUAL_EQUATION(x(eq.exp), eq.source, eq.attr)

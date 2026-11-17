@@ -66,6 +66,7 @@ lowering's transformations), then clock partitioning and the clocked lowering, t
 Causalize passes (the derivative variables in the place of its detection of the states).
 """
 const PIPELINE = Pair{String, Base.Function}[
+  "removeEmptyEquations" => removeEmptyEquations!,
   "removeSmooth" => removeSmooth!,
   "decomposeRecordEquations" => decomposeRecordEquations!,
   "liftAlgorithms" => liftAlgorithms!,
@@ -117,6 +118,8 @@ before `expandEquations`, which splits the others), its for-equations' if-equati
 the values taking each branch (`IndexReduction.splitStaticIfs!`): what the array form of index reduction takes.
 """
 function runPassesKeepingArrays!(model::IR.Model)::IR.Model
+  #= a parameter bound to one with fixed = false: computed by the initialization too =#
+  model = freeDependentParameters!(model)
   for (name, pass) in PIPELINE
     #= every parameter of the array code can be overridden (its parameterValues): a binding that references another
        parameter keeps the reference, as a tunable one's does (an override of the referenced one reached nothing) =#
@@ -124,8 +127,12 @@ function runPassesKeepingArrays!(model::IR.Model)::IR.Model
     #= the array code makes the events of integer(), floor() etc. itself =#
     name == "liftEventFunctions" && continue
     name == "expandEquations" && (model = IndexReduction.rollArrayEquations!(model))
+    #= actualStream without events, as OpenModelica: the array code's flows are computed from the states =#
+    name == "removeSmooth" && (model = streamsWithoutEvents!(model))
     model = pass(model)
   end
+  #= the array form has Real values only: what is left of Complex ones is their projections =#
+  model = lowerComplexProjections!(model)
   return IndexReduction.splitStaticIfs!(model)
 end
 

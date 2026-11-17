@@ -1,4 +1,4 @@
-#= The keyword arguments a model's solve adds to the caller's (MTK_CodeGeneration.jl
+#= The keyword arguments a model's solve adds to the caller's (mtkCodeGeneration.jl
    `defaultInitializeKwargs`, `defaultToleranceKwargs`). A caller's abstol per
    unknown reached NonlinearSolve's termination check through BrownFullBasicInit,
    which takes a scalar: a MethodError (2026-10-02). =#

@@ -40,3 +40,18 @@ end
   local b::SC.BINARY = SC.BINARY(SC.ICONST(1), SC.OP_ADD, SC.ICONST(2))
   @test hash(b, h) == hash(SC.ICONST(2), hash(Integer(SC.OP_ADD), hash(SC.ICONST(1), hash(:BINARY, h))))
 end
+
+#= A generated function and its wrapper hash by their contents, not their types: an RGF's type has
+   this module's tag (`_RGF_TAG`), so its own hash changed with every build, and with it the order
+   of the terms and of CSE in the right-hand side, and its rounding (MSL BatchPlant_StandardWater:
+   Success, Unstable or InitialFailure by OMBackend build, the model code the same, 2026-11-11). =#
+@testset "Generated functions hash by their contents" begin
+  local CG = OMBackend.CodeGeneration
+  local h::UInt = UInt(7)
+  local f = CG.RuntimeGeneratedFunctions.RuntimeGeneratedFunction(CG, CG, :((a, b) -> a + 2b))
+  local (argnames, id) = typeof(f).parameters[[1, 4]]
+  @test hash(f, h) == hash(id, hash(argnames, hash(:RuntimeGeneratedFunction, h)))
+  local w = CG.ModelicaFunctionWrapper{2}(:omjlHashTest, f)
+  @test hash(w, h) == hash(2, hash(:omjlHashTest, hash(:ModelicaFunctionWrapper, h)))
+  @test hash(CG.ModelicaFunctionWrapper{2}(:omjlHashTest, f)) == hash(CG.ModelicaFunctionWrapper{2}(:omjlHashTest, sin))
+end

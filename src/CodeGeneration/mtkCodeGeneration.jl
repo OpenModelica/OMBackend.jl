@@ -77,7 +77,7 @@ function evalGeneratedFunctions!(modelName::String, functions::Vector{Expr}, sim
      compilation"). Skip the eval + registration here: the codegen that PRODUCED `functions`
      has already run (so its method instances are warmed for the bake), and a real runtime
      translate registers them normally — the guard is precompile-only. Mirrors the
-     guard in generateIMTKCode (iMTKGen.jl). =#
+     guard in generateIMTKCode (IMTKGen.jl). =#
   if OMBackend.evaluationRejected(@__MODULE__)
     return nothing
   end
@@ -294,7 +294,7 @@ function substituteRelayAliasesInWhens(simCode::SC.SIM_CODE, relayAliases::Dict{
   local wanted = OrderedSet{String}(string(k) for k in keys(relayAliases))
   #= The type of each name the whens read, for its representative's reference. =#
   local tyOf = Dict{String, SC.SType}()
-  local collectTy = e::SC.Exp -> SC.foreachExp(e) do x
+  local collectTy = (@nospecialize(e::SC.Exp)) -> SC.foreachExp(e) do @nospecialize(x::SC.Exp)
     x isa SC.EXP_CREF || return
     local nm = SC.crefName(x.cref)
     (nm in wanted && !haskey(tyOf, nm)) && (tyOf[nm] = x.ty)
@@ -1152,7 +1152,7 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SC.SIM_CODE, modelName::String, 
      `planDemotions` detects those cases (plus cyclic-SCC discretes and a
      bounded heuristic for any remaining excess) and `applyDemotionPlan!`
      drops the corresponding dummies, reclassifying the names as algebraic.
-     See OMBackend/src/CodeGeneration/DiscreteDummyDemotion.jl for the
+     See OMBackend/src/CodeGeneration/discreteDummyDemotion.jl for the
      full pattern catalogue and the when-equation safety rule. =#
   local discreteVariablesSym = Symbol[:($(Symbol(v))) for v in discreteVariables]
   local DISCRETE_DUMMY_EQUATIONS = [:(der($(Symbol(dv))) ~ 0) for dv in discreteVariables]
@@ -1446,7 +1446,7 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SC.SIM_CODE, modelName::String, 
         push!(_batchBlock.args, :($sym = SymbolicUtils.setmetadata($sym, ModelingToolkit.VariableStatePriority, $priority)))
       end
       #= Dump the resolved variable-binding batch before `eval`. See
-         CodeGeneration/mtkDump.jl. The dump runs at simulate time inside
+         CodeGeneration/MTKDump.jl. The dump runs at simulate time inside
          the model module, so it must reference MTKDump by its absolute
          module path (the model module does not import MTKDump). =#
       OMBackend.CodeGeneration.MTKDump.dumpBatchBlock(vars, irreducibleSyms, _statePriorityPairs, _batchBlock)
@@ -1735,7 +1735,7 @@ function _hoistInvokelatest!(@nospecialize(e), locals::Set{Symbol}, parts::Vecto
       local same::Union{Nothing, Int} = findfirst(p -> p[2] == reads && _sameCode(p[1], body), named)
       local name::Symbol = same === nothing ? Symbol(prefix, length(parts) + 1) : named[same][3]
       if same === nothing
-        push!(parts, :(function $(name)($(reads...)) $(body) end))
+        push!(parts, :(function $(name)($(reads...)) $(_splitClosureList!(deepcopy(body), reads, parts, name)) end))
         push!(named, (body, reads, name))
       end
       e.args[i] = :(Base.invokelatest($(name), $(reads...)))
@@ -1745,6 +1745,39 @@ function _hoistInvokelatest!(@nospecialize(e), locals::Set{Symbol}, parts::Vecto
   end
   return nothing
 end
+
+"How many closures a hoisted list may hold in one function (`_splitClosureList!`)."
+const _MAX_CLOSURES_PER_FUNCTION = 8
+
+"The closures (`->`) in `e`, nested ones included."
+function _closureCount(@nospecialize(e))::Int
+  e isa Expr || return 0
+  return (e.head === :-> ? 1 : 0) + sum(_closureCount, e.args; init = 0)
+end
+
+"""
+A hoisted body `body` (the list of a build function's callbacks: `[cb, ...]`, `T[cb, ...]`) with more than
+`_MAX_CLOSURES_PER_FUNCTION` closures: each element that holds a closure as a call of a function of its own in `parts`,
+`<name>_<j>(x...)`, `x` the part's arguments `reads` the element reads. Julia's lowering of a function is quadratic
+in its closures: MSL BatchPlant's if-equation callbacks, 43 closures in one function, took 0.18 s. Other bodies as
+they are.
+"""
+function _splitClosureList!(body::Expr, reads::Vector{Symbol}, parts::Vector{Expr}, name::Symbol)::Expr
+  local list::Expr = body.head === :block && count(a -> !(a isa LineNumberNode), body.args) == 1 ?
+    body.args[findfirst(a -> !(a isa LineNumberNode), body.args)] : body
+  (list.head in (:vect, :ref) && _closureCount(list) > _MAX_CLOSURES_PER_FUNCTION) || return body
+  local readSet::Set{Symbol} = Set{Symbol}(reads)
+  for j in (list.head === :ref ? 2 : 1):length(list.args)
+    local el::Any = list.args[j]
+    _closureCount(el) == 0 && continue
+    local elReads::Vector{Symbol} = sort!(collect(intersect(_readNames!(Set{Symbol}(), el), readSet)))
+    local elName::Symbol = Symbol(name, "_", j)
+    push!(parts, :(function $(elName)($(elReads...)) $(el) end))
+    list.args[j] = :($(elName)($(elReads...)))
+  end
+  return body
+end
+_splitClosureList!(@nospecialize(body), reads::Vector{Symbol}, parts::Vector{Expr}, name::Symbol) = body
 
 """
 The names `e` reads (its symbols but quoted code, keyword names, macro names), into `out`; an over-approximation

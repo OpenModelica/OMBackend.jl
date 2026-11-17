@@ -49,7 +49,7 @@
   Author: John Tinnerholm
 =#
 
-# MTK-stage dump helpers (see CodeGeneration/mtkDump.jl).
+# MTK-stage dump helpers (see CodeGeneration/MTKDump.jl).
 import .MTKDump: dumpBuildDirectRHSInputs, dumpRHSExpression
 
 #= A Modelica function's error in the right-hand side (an assert, Streams.error, a domain
@@ -531,13 +531,15 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, @
       name === nothing || get!(declared, name, k)
     end
     local stateOrder::Vector{Int} = Int[get(declared, variableName(st), typemax(Int)) for st in states]
-    local solveFree = (u, pv) -> _solveDAEInitializationFree!(u, initRhs, pv, mm, freeIdx, follow!; t0 = t0, sparsity = jacProto,
-                                                              stateOrder = stateOrder,
-                                                              pinned=pinnedIdx,
-                                                              derivative_targets=derivativeInitTargets,
-                                                              eqLabels=eqLabels,
-                                                              extra_residuals=extraResiduals,
-                                                              discrete_pinned=discretePinnedIdx)
+    #= The arguments every initialization solve below shares. The states each row of the initialization's right-hand
+       side reads group the solve's finite differences (_fdInitResidualJacobian); not with initialization-defined
+       parameters (assignParams!), which read states too. =#
+    local initKw = (; t0 = t0, sparsity = jacProto, stateOrder = stateOrder, pinned = pinnedIdx, eqLabels = eqLabels,
+                    discrete_pinned = discretePinnedIdx,
+                    jacobianStructure = assignParams! === nothing ? _readStructure(rhs_init, states) : nothing)
+    local solveFree = (u, pv) -> _solveDAEInitializationFree!(u, initRhs, pv, mm, freeIdx, follow!; initKw...,
+                                                              derivative_targets = derivativeInitTargets,
+                                                              extra_residuals = extraResiduals)
     #= A model with homotopy(): from its simplified expressions to the actual ones. =#
     local refreshRelations! = initRels === nothing ? nothing :
       (uh, pvh) -> initRels.eval!(pvh, uh, t0; finiteOnly = true)
@@ -576,13 +578,10 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, @
     local targetsNow = Ref(derivativeInitTargets)
     local resolveWith = (u, pv, ok) -> begin
       local kept = u[keptIdx]
-      local un = _solveDAEInitializationFree!(u, initRhs, pv, mm, freeIdx, follow!; t0 = t0, sparsity = jacProto,
-                                              stateOrder=stateOrder, pinned=pinnedIdx,
-                                              derivative_targets=targetsNow[],
-                                              eqLabels=eqLabels,
-                                              extra_residuals=useExtra ? residualsAt(pv) : nothing,
-                                              discrete_pinned=discretePinnedIdx,
-                                              converged=ok)
+      local un = _solveDAEInitializationFree!(u, initRhs, pv, mm, freeIdx, follow!; initKw...,
+                                              derivative_targets = targetsNow[],
+                                              extra_residuals = useExtra ? residualsAt(pv) : nothing,
+                                              converged = ok)
       #= A solve that relaxed the fixed starts is not a settled initialization. =#
       isapprox(un[keptIdx], kept; rtol = 1e-8, atol = 1e-10) || (ok[] = false)
       assignParams! === nothing || assignParams!(pv, un, t0)
@@ -670,13 +669,10 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, @
       end
       targetsNow[] = targets
       try
-        local solveRun = (uu, pp) -> _solveDAEInitializationFree!(uu, initRhs, pp, mm, freeIdx, follow!; t0 = t0, sparsity = jacProto,
-                                         stateOrder=stateOrder, pinned=pinnedIdx,
-                                         derivative_targets=targets,
-                                         eqLabels=eqLabels,
-                                         extra_residuals=useExtra ? residualsAt(pp) : nothing,
-                                         discrete_pinned=discretePinnedIdx,
-                                         warm=homotopyIdx === nothing)
+        local solveRun = (uu, pp) -> _solveDAEInitializationFree!(uu, initRhs, pp, mm, freeIdx, follow!; initKw...,
+                                         derivative_targets = targets,
+                                         extra_residuals = useExtra ? residualsAt(pp) : nothing,
+                                         warm = homotopyIdx === nothing)
         #= A model with homotopy(): the continuation from the run's entry, as
            OpenModelica's `-override` run does; warm from this solution it kept
            the compiled run's root (x = 1.879 for s = -2, OpenModelica -1.532). =#
@@ -1645,11 +1641,14 @@ The DAE init solve with the free parameters p[freeIdx] as unknowns: they
 are appended to u as algebraic unknowns (zero mass-matrix rows whose
 residuals are identically zero), so each phase may move them like a free
 algebraic variable; `follow!(p)` updates the parameters bound to them.
-Returns the states; p[freeIdx] keeps the solved values.
+Returns the states; p[freeIdx] keeps the solved values. The right-hand
+side's structures (`sparsity`, `jacobianStructure`) are the states' alone:
+not passed on with free parameters.
 """
 function _solveDAEInitializationFree!(u0, rhs, pv, mm, freeIdx::Vector{Int}, follow!;
-                                      extra_residuals=nothing, sparsity=nothing, kwargs...)
-  isempty(freeIdx) && return _solveDAEInitialization!(u0, rhs, pv, mm; extra_residuals=extra_residuals, sparsity=sparsity, kwargs...)
+                                      extra_residuals=nothing, sparsity=nothing, jacobianStructure=nothing, kwargs...)
+  isempty(freeIdx) && return _solveDAEInitialization!(u0, rhs, pv, mm; extra_residuals=extra_residuals, sparsity=sparsity,
+                                                      jacobianStructure=jacobianStructure, kwargs...)
   local n = length(u0)
   local nq = length(freeIdx)
   local setFree! = (p, u) -> begin
@@ -1816,6 +1815,53 @@ end
 struct _NoDagDerivative <: Exception
   what::String
   retry::Bool
+end
+
+"""
+    _readStructure(rows, states) -> Union{Nothing, SparseMatrixCSC{Float64, Int}}
+
+Which `states` each expression of `rows` reads, as a sparse matrix (an entry for each row and state it reads):
+every read, through conditions and function arguments too, each shared subexpression visited once. `nothing`
+where a row uses a scalarized state's whole array.
+"""
+function _readStructure(rows::AbstractVector, states::AbstractVector)::Union{Nothing, SA.SparseMatrixCSC{Float64, Int}}
+  local stateIdx::Dict{Any, Int} = Dict{Any, Int}(Symbolics.unwrap(s) => j for (j, s) in enumerate(states))
+  local arrParents::Set{Any} = Set{Any}(SymbolicUtils.arguments(u)[1] for u in keys(stateIdx)
+                                        if SymbolicUtils.iscall(u) && SymbolicUtils.operation(u) === getindex)
+  local memo::IdDict{Any, BitSet} = IdDict{Any, BitSet}()
+  local rowIdx::Vector{Int} = Int[]
+  local colIdx::Vector{Int} = Int[]
+  for (i, r) in enumerate(rows)
+    local reads::Union{Nothing, BitSet} = _stateReads!(memo, Symbolics.unwrap(r), stateIdx, arrParents)
+    reads === nothing && return nothing
+    for j in reads
+      push!(rowIdx, i)
+      push!(colIdx, j)
+    end
+  end
+  return SA.sparse(rowIdx, colIdx, ones(length(rowIdx)), length(rows), length(states))
+end
+
+"The states `x` reads (_readStructure), `memo` by node; `nothing` for a scalarized state's whole array."
+function _stateReads!(memo::IdDict{Any, BitSet}, @nospecialize(x), stateIdx::Dict{Any, Int},
+                      arrParents::Set{Any})::Union{Nothing, BitSet}
+  local hit::Union{Nothing, BitSet} = get(memo, x, nothing)
+  hit === nothing || return hit
+  local reads::BitSet = BitSet()
+  local j::Int = get(stateIdx, x, 0)
+  if j > 0
+    push!(reads, j)
+  elseif x in arrParents
+    return nothing
+  elseif SymbolicUtils.iscall(x)
+    for a in SymbolicUtils.arguments(x)
+      local r::Union{Nothing, BitSet} = _stateReads!(memo, a, stateIdx, arrParents)
+      r === nothing && return nothing
+      union!(reads, r)
+    end
+  end
+  memo[x] = reads
+  return reads
 end
 
 """
@@ -2807,6 +2853,67 @@ _appendCallbacks!(continuous::Vector{Any}, ::Vector{Any}, @nospecialize(cb::Mode
   (push!(continuous, cb); nothing)
 _appendCallbacks!(::Vector{Any}, discrete::Vector{Any}, @nospecialize(cb::ModelingToolkit.SciMLBase.AbstractDiscreteCallback))::Nothing =
   (push!(discrete, cb); nothing)
+
+"""
+    _ErasedCall{R}(f)
+
+A function of a model's callback in an untyped field: called with any arguments, it calls `f` with them (a dispatch
+at run time; the model's function is compiled for the arguments it gets), its value converted to `R` (`Nothing`:
+ignored). Its type is the same for every model (`_erasedCallback`). Not a FunctionWrapper: one of those compiles a C
+function for each wrapped function's type when it is made (at the translation), and its constructor specialized on it.
+"""
+struct _ErasedCall{R} <: Function
+  f::Any
+  _ErasedCall{R}(@nospecialize(f)) where {R} = new{R}(f)
+end
+
+(c::_ErasedCall{Nothing})(args...)::Nothing = (c.f(args...); nothing)
+(c::_ErasedCall{Bool})(args...)::Bool = convert(Bool, c.f(args...))
+
+"""
+    _erasedHook(f)
+
+`f` as an `_ErasedCall{Nothing}`; SciMLBase's default hooks as they are (one type for every model already, and
+`save_final_discretes!` compares a finalize hook with its default).
+"""
+_erasedHook(f::typeof(ModelingToolkit.SciMLBase.INITIALIZE_DEFAULT))::typeof(ModelingToolkit.SciMLBase.INITIALIZE_DEFAULT) = f
+_erasedHook(f::typeof(ModelingToolkit.SciMLBase.FINALIZE_DEFAULT))::typeof(ModelingToolkit.SciMLBase.FINALIZE_DEFAULT) = f
+_erasedHook(@nospecialize(f))::_ErasedCall{Nothing} = _ErasedCall{Nothing}(f)
+
+"""
+    _erasedCallback(cb)
+
+`cb` with its condition and affect! as `_ErasedCall`s and its hooks through `_erasedHook`, its other fields as they are
+(`_erasedCallbacks`); not specialized on the callback's type (one per model).
+"""
+function _erasedCallback(@nospecialize(cb::ModelingToolkit.SciMLBase.DiscreteCallback))::ModelingToolkit.SciMLBase.DiscreteCallback
+  return ModelingToolkit.SciMLBase.DiscreteCallback(
+    _ErasedCall{Bool}(cb.condition), _ErasedCall{Nothing}(cb.affect!),
+    _erasedHook(cb.initialize), _erasedHook(cb.finalize), cb.save_positions, cb.initializealg,
+    cb.saved_clock_partitions, cb.initialize_save_discretes)
+end
+
+function _erasedCallback(@nospecialize(cb::ModelingToolkit.SciMLBase.VectorContinuousCallback))::ModelingToolkit.SciMLBase.VectorContinuousCallback
+  #= the condition writes into `out` (a view of the root finder's buffer): passed as it is =#
+  return ModelingToolkit.SciMLBase.VectorContinuousCallback(
+    _ErasedCall{Nothing}(cb.condition), _ErasedCall{Nothing}(cb.affect!), cb.len,
+    _erasedHook(cb.initialize), _erasedHook(cb.finalize), cb.idxs, cb.rootfind, cb.interp_points, cb.save_positions,
+    cb.dtrelax, cb.abstol, cb.reltol, cb.repeat_nudge, cb.initializealg, cb.saved_clock_partitions,
+    cb.maybe_discontinuity, cb.initialize_save_discretes)
+end
+
+"""
+    _erasedCallbacks(cbs) -> CallbackSet
+
+The array code's callbacks `cbs` (each a DiscreteCallback or a VectorContinuousCallback) in one set (`_joinCallbacks`),
+each erased (`_erasedCallback`): one callback type for every model. The solver's callback functions take a callback as
+an argument (`find_callback_time`, `apply_discrete_callback!`, the root finder's zero function) and were compiled
+again for each model's own function types: 0.3-0.8 s of a model's first simulate (MSL CoupledClutches 0.76 s,
+DCPM_Start 0.56 s), 5.3 s of EngineV6's with its event code. OrdinaryDiffEqCore wraps the functions of a callback
+itself only where its hooks are the defaults (`_despecialize_callbacks!`); the array code's callbacks have their own
+(`_startHysteresis!`, `_restoreStart!`, `_finiteFirstStep!`, ...).
+"""
+_erasedCallbacks(cbs::Vector{Any})::DiffEqBase.CallbackSet = _joinCallbacks(Any[_erasedCallback(cb) for cb in cbs]...)
 
 """
     _eraseCallbackSet(cbset)

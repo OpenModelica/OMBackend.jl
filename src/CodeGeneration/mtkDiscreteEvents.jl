@@ -136,7 +136,7 @@ Whether an expression reads a constant table by a subscript (an ASUB). Such clus
 Newton-hostile: equation-form affects compile to an implicit solve whose residuals are
 piecewise constant.
 """
-function _expHasTableLookup(e::SC.Exp)::Bool
+function _expHasTableLookup(@nospecialize(e::SC.Exp))::Bool
   e isa SC.ASUB && return true
   e isa Union{SC.BINARY, SC.LBINARY, SC.RELATION, SC.UNARY, SC.LUNARY, SC.CAST, SC.IFEXP, SC.CALL} || return false
   return any(_expHasTableLookup, SC.children(e))
@@ -297,7 +297,8 @@ const _AFFECT_UNSUPPORTED_BUILTINS = (:sample, :terminal, :delay, :der, :reinit,
 The pinned value of a relation inside an affect body (a Bool, or an expression that reads
 it, a discrete cluster's buffer), or nothing.
 """
-_relPinValue(e::SC.Exp, relPins::AbstractDict{SC.Exp}) = (!isempty(relPins) && e isa SC.RELATION) ? get(relPins, e, nothing) : nothing
+_relPinValue(@nospecialize(e::SC.Exp), relPins::AbstractDict{SC.Exp}) =
+  (!isempty(relPins) && e isa SC.RELATION) ? get(relPins, e, nothing) : nothing
 
 """
 For edge()/change() of a relation, or of a Boolean defined by one, whose values `relPins`
@@ -324,11 +325,11 @@ inlines `b = x > 0.2` into edge(x > 0.2): in an event iteration a relation chang
 own crossing, i.e. when this callback pins it, and only in the first pass (later passes see
 pre = the same value).
 """
-function _affectBool(e::SC.Exp, obsAcc::Dict{Symbol, Symbol}, simCode::SC.SIM_CODE;
+function _affectBool(@nospecialize(e::SC.Exp), obsAcc::Dict{Symbol, Symbol}, simCode::SC.SIM_CODE;
                      initVal::Union{Bool, Symbol} = false, subst::Dict{Symbol, Any} = _EMPTY_MEM_SUBST,
                      relPins::AbstractDict{SC.Exp} = _EMPTY_REL_PINS, preSubst::Union{Nothing, Dict{Symbol, Any}} = nothing,
                      relPre::Union{Nothing, AbstractDict{SC.Exp}} = nothing)
-  local recb = x::SC.Exp -> _affectBool(x, obsAcc, simCode; initVal, subst, relPins, preSubst, relPre)
+  local recb = (@nospecialize(x::SC.Exp)) -> _affectBool(x, obsAcc, simCode; initVal, subst, relPins, preSubst, relPre)
   local pin = _relPinValue(e, relPins)
   pin === nothing || return pin
   e isa SC.BCONST && return e.value
@@ -373,12 +374,12 @@ variable or a parameter as `observed.<name>` (collected into `obsAcc`); relation
 not and arithmetic as Julia's. `initVal`: what `initial()` lowers to (see _affectBool).
 Relations are replaced through `relPins`; `relPre`: see _affectBool.
 """
-function _affectValue(e::SC.Exp, obsAcc::Dict{Symbol, Symbol}, simCode::SC.SIM_CODE;
+function _affectValue(@nospecialize(e::SC.Exp), obsAcc::Dict{Symbol, Symbol}, simCode::SC.SIM_CODE;
                       initVal::Union{Bool, Symbol} = false, subst::Dict{Symbol, Any} = _EMPTY_MEM_SUBST,
                       relPins::AbstractDict{SC.Exp} = _EMPTY_REL_PINS, preSubst::Union{Nothing, Dict{Symbol, Any}} = nothing,
                       relPre::Union{Nothing, AbstractDict{SC.Exp}} = nothing)
-  local rec = x::SC.Exp -> _affectValue(x, obsAcc, simCode; initVal, subst, relPins, preSubst, relPre)
-  local recb = x::SC.Exp -> _affectBool(x, obsAcc, simCode; initVal, subst, relPins, preSubst, relPre)
+  local rec = (@nospecialize(x::SC.Exp)) -> _affectValue(x, obsAcc, simCode; initVal, subst, relPins, preSubst, relPre)
+  local recb = (@nospecialize(x::SC.Exp)) -> _affectBool(x, obsAcc, simCode; initVal, subst, relPins, preSubst, relPre)
   local pin = _relPinValue(e, relPins)
   pin === nothing || return pin
   e isa Union{SC.ICONST, SC.RCONST} && return Float64(e.value)
@@ -1108,7 +1109,7 @@ function assertEntries(simCode::SC.SIM_CODE)::Vector{AssertCode}
                                                              (observed, integrator) -> $(msg),
                                                              $(AlgorithmicCodeGeneration.isWarningAssertionLevel(a.level)), $(timeVarying),
                                                              $(string(a.condition)),
-                                                             $(Expr(:tuple, (:((observed, integrator) -> $(c)) for c in crossings)...)))),
+                                                             $(Expr(:ref, :Function, (:((observed, integrator) -> $(c)) for c in crossings)...)))),
                               timeVarying, crossings))
   end
   return entries
@@ -1195,11 +1196,12 @@ short-circuit does not reach its relation (`x <= 0 or sqrt(x) < 2`: sqrt(x) of a
 threw). Not under noEvent(), nor inside another expression (a call's argument, a
 reduction).
 """
-function _assertCrossingExprs(cond::SC.Exp, obsAcc::Dict{Symbol, Symbol}, simCode::SC.SIM_CODE)::Vector{Any}
+function _assertCrossingExprs(@nospecialize(cond::SC.Exp), obsAcc::Dict{Symbol, Symbol},
+                              simCode::SC.SIM_CODE)::Vector{Any}
   local out = Any[]
   local both = (r, c) -> r === true ? c : :($(r) && $(c))
   local walk = nothing
-  walk = function (e::SC.Exp, reached)
+  walk = function (@nospecialize(e::SC.Exp), reached)
     if e isa SC.LBINARY
       walk(e.exp1, reached)
       local lhs = _affectBool(e.exp1, obsAcc, simCode)
@@ -1226,7 +1228,7 @@ end
 An assert's condition; a call equation for its effects runs and holds, one in an
 if-equation's branch, `if guard then call else true`, where the guard holds.
 """
-function _assertConditionExpr(cond::SC.Exp, obsAcc::Dict{Symbol, Symbol}, simCode::SC.SIM_CODE)
+function _assertConditionExpr(@nospecialize(cond::SC.Exp), obsAcc::Dict{Symbol, Symbol}, simCode::SC.SIM_CODE)
   _isEffectCall(cond) && return :($(_effectCallExpr(cond, obsAcc, simCode)); true)
   if cond isa SC.IFEXP && _isEffectCall(cond.thenExp)
     return :((if $(_affectBool(cond.cond, obsAcc, simCode))
@@ -1260,7 +1262,7 @@ binding (createStringParameterAssignments), not a variable of the simulation (re
 """
 function _assertMessageExpr(msg::SC.Exp, obsAcc::Dict{Symbol, Symbol}, simCode::SC.SIM_CODE)
   local part = nothing
-  part = e::SC.Exp -> begin
+  part = (@nospecialize(e::SC.Exp)) -> begin
     e isa SC.SCONST && return e.value
     (e isa SC.BINARY && e.op === SC.OP_ADD) && return :(string($(part(e.exp1)), $(part(e.exp2))))
     (e isa SC.EXP_CREF && _isStringBinding(SC.crefName(e.cref), simCode)) &&
@@ -1790,13 +1792,13 @@ The calls of the model's pure functions in `e` whose outputs it reads (`f(x)[k]`
 one), counted into `counts`: the places MTK_CodeGenerationUtil reads from a body's local function
 (WHEN_BODY_CALLS). A call's arguments go with it: not counted apart.
 """
-function _countModelCalls!(counts::OrderedDict{SC.CALL, Int}, e::SC.Exp, simCode::SC.SIM_CODE)::Nothing
+function _countModelCalls!(counts::OrderedDict{SC.CALL, Int}, @nospecialize(e::SC.Exp), simCode::SC.SIM_CODE)::Nothing
   local call::Union{Nothing, SC.Exp} = (e isa SC.TSUB || e isa SC.ASUB) ? e.exp : nothing
   if call isa SC.CALL && call.kind === SC.CALL_FUNCTION && MTK_CodeGenerationUtil._isModelFunctionCall(call, simCode)
     counts[call] = get(counts, call, 0) + 1
-    e isa SC.ASUB && foreach(s -> _countModelCalls!(counts, s, simCode), e.subs)
+    e isa SC.ASUB && foreach((@nospecialize(s::SC.Exp)) -> _countModelCalls!(counts, s, simCode), e.subs)
   else
-    foreach(c -> _countModelCalls!(counts, c, simCode), SC.children(e))
+    foreach((@nospecialize(c::SC.Exp)) -> _countModelCalls!(counts, c, simCode), SC.children(e))
   end
   return nothing
 end
@@ -1899,7 +1901,7 @@ A condition in a when body as a Julia Bool: and, or and not by short circuit (th
 operands: `not (d < 0) and sqrt(d) > 0` took the square root of a negative d), another by its value, a number being true
 where it is not zero.
 """
-function _whenConditionMTK(c::SC.Exp, simCode::SC.SIM_CODE)::Expr
+function _whenConditionMTK(@nospecialize(c::SC.Exp), simCode::SC.SIM_CODE)::Expr
   if c isa SC.LBINARY
     local a::Expr = _whenConditionMTK(c.exp1, simCode)
     local b::Expr = _whenConditionMTK(c.exp2, simCode)
@@ -1915,7 +1917,7 @@ end
 both branches: `if d > 0 then y := sqrt(d)` of a negative d threw, each `v := if c then e else v` an algorithm's when
 lowers to), another `e` by its value.
 """
-function _whenAssignmentMTK(var::SC.SIMVAR, e::SC.Exp, simCode::SC.SIM_CODE)::Expr
+function _whenAssignmentMTK(var::SC.SIMVAR, @nospecialize(e::SC.Exp), simCode::SC.SIM_CODE)::Expr
   e isa SC.IFEXP || return _stateAssignment(var, expToJuliaExpMTK(e, simCode))
   return Expr(:if, _whenConditionMTK(e.cond, simCode), _whenAssignmentMTK(var, e.thenExp, simCode),
               _whenAssignmentMTK(var, e.elseExp, simCode))

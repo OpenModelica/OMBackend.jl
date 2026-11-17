@@ -65,6 +65,7 @@ function liftAlgorithms!(variables::IR.VariableSet, partition::IR.Partition)::No
   local algorithms = IR.ALGORITHM[eq for eq in partition.equations if eq isa IR.ALGORITHM]
   local initialAlgorithms = IR.ALGORITHM[eq for eq in partition.initialEquations if eq isa IR.ALGORITHM]
   (isempty(algorithms) && isempty(initialAlgorithms)) && return nothing
+  algorithms = whenLoopSections(algorithms)
   local equations = IR.Equation[eq for eq in partition.equations if !(eq isa IR.ALGORITHM)]
   partition.initialEquations = IR.Equation[eq for eq in partition.initialEquations if !(eq isa IR.ALGORITHM)]
   append!(equations, initialWhensOfAlgorithms(algorithms, variables))
@@ -82,6 +83,65 @@ function liftAlgorithms!(variables::IR.VariableSet, partition::IR.Partition)::No
   end
   partition.equations = equations
   return nothing
+end
+
+"""
+    whenLoopSections(algorithms) -> Vector{IR.ALGORITHM}
+
+The algorithm sections with each one that is a for-statement over a literal range around a when-statement as its
+iterations, a section each, the iterator its value: the algorithm of an array of components with the arrays kept
+(`for i in 1:n loop when ... then c[i].y := ...; end when; end for`: the n components' sections, MSL Digital's
+InertialDelaySensitive), which the lowerings below take as written sections (their when-statements at the top
+level). Another section as it is. Left as one section its when-statements were lowered by none of them and its
+variables stayed without an equation. A when-statement in another loop is not supported.
+"""
+function whenLoopSections(algorithms::Vector{IR.ALGORITHM})::Vector{IR.ALGORITHM}
+  any(alg::IR.ALGORITHM -> any(loopsOverWhen, alg.statements), algorithms) || return algorithms
+  local out::Vector{IR.ALGORITHM} = IR.ALGORITHM[]
+  for alg in algorithms
+    if !any(loopsOverWhen, alg.statements)
+      push!(out, alg)
+      continue
+    end
+    local loop::IR.Statement = alg.statements[1]
+    local range::Union{Nothing, StepRange{Int, Int}} =
+      (length(alg.statements) == 1 && loop isa IR.FOR_STATEMENT) ? literalIteratorRange(loop.iterator.range) : nothing
+    range === nothing && unsupported("a when-statement in a loop of an algorithm", IR.toString(alg))
+    for value::Int in range
+      local values::Dict{Symbol, Int} = Dict{Symbol, Int}((loop::IR.FOR_STATEMENT).iterator.name => value)
+      local at = (@nospecialize(e::IR.Expression)) -> substituteIterators(e, values)
+      local outputs::Vector{IR.ComponentRef} = IR.ComponentRef[foldSubscripts(IR.mapCref(at, c)) for c in alg.outputs]
+      local section::IR.ALGORITHM =
+        IR.ALGORITHM(IR.mapStatements(at, (loop::IR.FOR_STATEMENT).body), outputs, alg.source, alg.attributes)
+      #= a loop in a loop: the inner one's iterations in turn =#
+      append!(out, whenLoopSections(IR.ALGORITHM[section]))
+    end
+  end
+  return out
+end
+
+"Whether a for- or while-statement has a when-statement in its body (in a loop or a branch there too)."
+function loopsOverWhen(s::IR.Statement)::Bool
+  s isa Union{IR.FOR_STATEMENT, IR.WHILE_STATEMENT} || return false
+  return any(holdsWhen, s.body)
+end
+
+"Whether the statement is a when-statement or holds one (in a loop's body, an if-statement's branches)."
+function holdsWhen(s::IR.Statement)::Bool
+  s isa IR.WHEN_STATEMENT && return true
+  s isa Union{IR.FOR_STATEMENT, IR.WHILE_STATEMENT} && return any(holdsWhen, s.body)
+  s isa IR.IF_STATEMENT && return any(b -> any(holdsWhen, b.body), s.branches) || any(holdsWhen, s.elseBody)
+  return false
+end
+
+"The values of a for-statement's range of Integer literals (`1:2`, `1:2:5`); `nothing` for another range."
+function literalIteratorRange(e::IR.Expression)::Union{Nothing, StepRange{Int, Int}}
+  e isa IR.RANGE || return nothing
+  local start::Union{Nothing, Int} = foldInteger(e.start)
+  local stop::Union{Nothing, Int} = foldInteger(e.stop)
+  local step::Union{Nothing, Int} = e.step === nothing ? 1 : foldInteger(e.step)
+  (start === nothing || stop === nothing || step === nothing || step == 0) && return nothing
+  return start:step:stop
 end
 
 """
@@ -1440,10 +1500,10 @@ function elementValues(chain::IR.Expression, read::IR.Expression, run::Algorithm
 end
 
 "Whether `e` has more than `cap` nodes, counted as a tree."
-function expressionLargerThan(e::IR.Expression, cap::Int)::Bool
+function expressionLargerThan(@nospecialize(e::IR.Expression), cap::Int)::Bool
   local n = Ref(0)
   local visit
-  visit = x -> (n[] += 1; n[] > cap && return; foreach(visit, IR.children(x)))
+  visit = (@nospecialize(x::IR.Expression)) -> (n[] += 1; n[] > cap && return; foreach(visit, IR.children(x)))
   visit(e)
   return n[] > cap
 end

@@ -459,6 +459,23 @@ package IndexReduction "Models for OMBackend's index reduction step by step (Pas
     Q[3] = 0;
   end QuaternionAttitude;
 
+  model QuaternionFreeRotation "a torque-free rigid rotation, the attitude a quaternion: w from Q and der(Q) as an array equation (MSL FreeMotion's angularVelocity2), the body's wb = w the state; Euler's equations need der(wb), so the relation is differentiated and der(der(Q)) stays the solver's (energy and angular momentum constant)"
+    parameter Real J[3] = {1, 2, 3};
+    Real Q[4](start = {0, 0, 0, 1});
+    Real w[3];
+    Real wb[3](each stateSelect = StateSelect.always);
+  initial equation
+    Q[1] = 0;
+    Q[2] = 0;
+    Q[3] = 0;
+    wb = {1, 0.5, 0.2};
+  equation
+    w = 2 * ([Q[4], Q[3], -Q[2], -Q[1]; -Q[3], Q[4], Q[1], -Q[2]; Q[2], -Q[1], Q[4], -Q[3]] * der(Q));
+    0 = Q * Q - 1;
+    wb = w;
+    {J[1] * der(wb[1]), J[2] * der(wb[2]), J[3] * der(wb[3])} = -cross(wb, {J[1] * wb[1], J[2] * wb[2], J[3] * wb[3]});
+  end QuaternionFreeRotation;
+
   model AlgebraicNever "s only index reduction differentiates (no StateSelect): with the dynamic state sets' ranking StateSelect.never, so x (avoid) stays the state; otherwise s (default)"
     Real x(stateSelect = StateSelect.avoid, start = 0.5, fixed = true);
     Real z(stateSelect = StateSelect.never);
@@ -500,6 +517,34 @@ package IndexReduction "Models for OMBackend's index reduction step by step (Pas
     end for;
   end PendulumArray;
 
+  model PendulumVector "a Cartesian pendulum with its position one array (index 3): the dynamic state set's candidates are r[1], r[2], elements of one array at different subscripts; arrays kept: a scalar set that reads the arrays"
+    parameter Real L = 1;
+    parameter Real g = 9.81;
+    Real r[2](start = {0.8, -0.6}, fixed = {true, false});
+    Real v[2](start = {0, 0}, fixed = {true, false});
+    Real F;
+  equation
+    der(r) = v;
+    der(v) = -r / L * F + {0, -g};
+    r[1] ^ 2 + r[2] ^ 2 = L ^ 2;
+  end PendulumVector;
+
+  model StartOnAlias "a mass whose position r (avoid, a fixed start) a damper reads through the alias ra (no start), along its distance s to the origin: at the declared starts ra = 0 and the distance's gradient vanishes; at the starts carried through ra = r it is (-1, 0), so r[1] is the dummy of the set (MSL SpringDamperSystem's body1.frame_a.r_0)"
+    Real r[2](start = {-0.5, 0}, each fixed = true, each stateSelect = StateSelect.avoid);
+    Real v[2](each start = 0, each fixed = true);
+    Real ra[2];
+    Real length;
+    Real s;
+    Real f;
+  equation
+    ra = r;
+    length = sqrt(ra * ra);
+    s = if noEvent(length > 1e-10) then length else 1e-10;
+    f = 20 * der(s) + 100 * (s - 1);
+    der(r) = v;
+    der(v) = -f * ra / s + {0, -9.81};
+  end StartOnAlias;
+
   model InertiaArray "N rigidly coupled pairs of inertias as array equations (index 3 as written); arrays kept: phi1 and w1 the states as arrays"
     parameter Integer N = 4;
     Real phi1[N](each start = 0, each fixed = true);
@@ -514,6 +559,23 @@ package IndexReduction "Models for OMBackend's index reduction step by step (Pas
     2 * der(w2) = tau;
     phi1 = phi2;
   end InertiaArray;
+
+  model DampedArray "rigidly coupled pairs in a for-equation, each damped above its own threshold (w1[i] > 0.2 i): an if-expression that reads the iterator stays inline with the arrays kept (the array code reads it there); where the reduced model is scalarized it is lifted per element (ifEq_tmp<k>)"
+    parameter Integer N = 3;
+    Real phi1[N](each start = 0, each fixed = true);
+    Real w1[N](each start = 0, each fixed = true);
+    Real phi2[N];
+    Real w2[N];
+    Real tau[N];
+  equation
+    for i in 1:N loop
+      der(phi1[i]) = w1[i];
+      der(phi2[i]) = w2[i];
+      der(w1[i]) = i * sin(time) - tau[i] - 2 * (if w1[i] > 0.2 * i then 0.1 * (w1[i] - 0.2 * i) else 0);
+      2 * der(w2[i]) = tau[i];
+      phi1[i] = phi2[i];
+    end for;
+  end DampedArray;
 
   model BoundaryArray "the first two elements of x tied: their kinds differ from the third's, which the array form does not take (slicing); the frontend scalarizes"
     parameter Integer N = 3;

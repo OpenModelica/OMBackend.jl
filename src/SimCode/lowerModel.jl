@@ -126,7 +126,9 @@ function lowerSystem(model::IR.Model, variables::IR.VariableSet, partition::IR.P
   local residuals = RESIDUAL_EQUATION[residual(names, eq) for eq in eqs.residuals]
   local (asserts, initialAssertAlgorithms) = lowerAsserts(names, ht, eqs.asserts, partition.initialEquations)
   append!(initialAlgorithms, initialAssertAlgorithms)
-  initialAlgorithms = INITIAL_ALGORITHM[INITIAL_ALGORITHM(mapStatements(e -> inlineParameters(e, ht, names), a.statements), a.section)
+  initialAlgorithms = INITIAL_ALGORITHM[INITIAL_ALGORITHM(mapStatements((@nospecialize(e::Exp)) ->
+                                                                          inlineParameters(e, ht, names),
+                                                                                    a.statements), a.section)
                                         for a in initialAlgorithms]
   local whenEquations = WHEN_EQUATION[lowerWhen(names, w) for w in runtimeWhens]
   local irreducibles = irreducibleVariables(names, eqs.ifs, whenEquations, vars, ht)
@@ -457,7 +459,8 @@ function lowerAsserts(names::Names, ht::OrderedDict{String, Tuple{Int, SIMVAR}},
       push!(initial, INITIAL_ALGORITHM(Statement[ASSERT(a.condition, a.message, a.level, a.source)], false))
     end
   end
-  local inline::Function = (e::Exp) -> inlineParameters(e, ht, names; keepTunable = true, keepCalls = true)
+  local inline::Function = (@nospecialize(e::Exp)) ->
+                             inlineParameters(e, ht, names; keepTunable = true, keepCalls = true)
   out = ASSERT_EQUATION[ASSERT_EQUATION(inline(a.condition), inline(a.message), a.level, a.source) for a in out]
   return (out, initial)
 end
@@ -479,8 +482,8 @@ algorithm (it would keep its compiled value), a reference with `keepTunable`. Wi
 once: inlined, a time-varying assert's crossing called it at every evaluation (Buildings'
 weather data, `getTimeSpanTMY3(filNam, "tab1")` reading the weather file, 40 ms a call).
 """
-function inlineParameters(e::Exp, ht::OrderedDict{String, Tuple{Int, SIMVAR}}, names::Names; keepTunable::Bool = false,
-                          keepCalls::Bool = false)::Exp
+function inlineParameters(@nospecialize(e::Exp), ht::OrderedDict{String, Tuple{Int, SIMVAR}}, names::Names;
+                          keepTunable::Bool = false, keepCalls::Bool = false)::Exp
   local visit = x -> begin
     local name = x isa EXP_CREF ? crefName(x.cref) : nothing
     name === nothing && return x
@@ -501,7 +504,8 @@ function inlineParameters(e::Exp, ht::OrderedDict{String, Tuple{Int, SIMVAR}}, n
     end
     return something(scalarizedArrayParameter(x, ht), Some(x))
   end
-  local visitElements::Function = (x::Exp) -> x isa ASUB ? something(elementsBySubscript(x, ht, names), Some(x)) : visit(x)
+  local visitElements::Function = (@nospecialize(x::Exp)) ->
+                                    x isa ASUB ? something(elementsBySubscript(x, ht, names), Some(x)) : visit(x)
   local current = e
   for _ in 1:100
     local next = mapExp(visitElements, current)

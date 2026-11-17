@@ -79,7 +79,8 @@ function knownRational(e::IR.Expression, values::StartValues)::Union{Nothing, Ra
 end
 
 "Whether `e` reads a continuous variable (`continuousReads!` through `resolve`)."
-readsContinuous(e::IR.Expression, resolve::Resolver)::Bool = !isempty(continuousReads!(Symbol[], e, resolve))
+readsContinuous(@nospecialize(e::IR.Expression), resolve::Resolver)::Bool =
+  !isempty(continuousReads!(Symbol[], e, resolve))
 
 """
     linearTerms!(row, e, scale, index, resolve, values) -> Bool
@@ -89,7 +90,7 @@ readsContinuous(e::IR.Expression, resolve::Resolver)::Bool = !isempty(continuous
 a term that reads no continuous variable is a known term. `false` for another expression (the row is then
 incomplete and not used).
 """
-function linearTerms!(row::LinearRow, e::IR.Expression, scale::Rational{Int}, index::Dict{Symbol, Int},
+function linearTerms!(row::LinearRow, @nospecialize(e::IR.Expression), scale::Rational{Int}, index::Dict{Symbol, Int},
                       resolve::Resolver, values::StartValues)::Bool
   if e isa IR.CREF && haskey(index, e.cref.name)
     local v = index[e.cref.name]
@@ -113,6 +114,10 @@ function linearTerms!(row::LinearRow, e::IR.Expression, scale::Rational{Int}, in
     local b = readsContinuous(e.exp2, resolve) ? nothing : knownRational(e.exp2, values)
     (b === nothing || iszero(b)) && return false
     return linearTerms!(row, e.exp1, scale / b, index, resolve, values)
+  elseif e isa IR.CALL && e.name === :sum && e.attributes.builtin && length(e.arguments) == 1 &&
+         e.arguments[1] isa IR.ARRAY
+    #= the sum of an array's elements, as the element view writes `sum(i)` (MSL ZeroInductor: `m * i0 = sum(i)`) =#
+    return all(x::IR.Expression -> linearTerms!(row, x, scale, index, resolve, values), e.arguments[1].elements)
   end
   return false
 end

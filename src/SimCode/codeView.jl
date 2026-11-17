@@ -105,7 +105,7 @@ function renamed(rn::Renaming, c::SimCref)::SimCref
 end
 
 "An expression with its references renamed (`mapExp`)."
-renamed(rn::Renaming, e::Exp)::Exp = mapExp(x::Exp -> _renamedNode(rn, x), e)
+renamed(rn::Renaming, e::Exp)::Exp = mapExp((@nospecialize(x::Exp)) -> _renamedNode(rn, x), e)
 _renamedNode(rn::Renaming, e::EXP_CREF)::Exp = EXP_CREF(renamed(rn, e.cref), e.ty)
 _renamedNode(rn::Renaming, e::DER)::Exp = DER(renamed(rn, e.cref))
 _renamedNode(rn::Renaming, e::PRE)::Exp = PRE(renamed(rn, e.cref), e.ty)
@@ -128,7 +128,7 @@ end
 function renamed(rn::Renaming, v::SIMVAR)::SIMVAR
   local name::Function = (k::String) -> get(rn.names, k, k)
   local a::SimVarAttributes = v.attributes
-  local e::Function = (x::Union{Nothing, Exp}) -> x === nothing ? nothing : renamed(rn, x)
+  local e::Function = (@nospecialize(x::Union{Nothing, Exp})) -> x === nothing ? nothing : renamed(rn, x)
   local attributes::SimVarAttributes = SimVarAttributes(e(a.start), e(a.fixed), e(a.nominal), e(a.min), e(a.max), e(a.unit),
                                                         e(a.displayUnit), e(a.quantity), a.stateSelect, a.isProtected)
   local irKind::Union{Nothing, IR.VariableKind} = v.irKind === nothing ? nothing : IR.mapKindNames((x::Symbol) -> Symbol(name(String(x))), v.irKind)

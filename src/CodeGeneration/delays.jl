@@ -64,15 +64,19 @@ end
 DelayHistory() = DelayHistory(Float64[], Float64[], Float64[])
 
 """
-    DelayState(histories, rightLimit)
+    DelayState(n)
 
-A solve's delay histories of one model (a structural mode's own), one per delay() call, and
-whether they are read as right limits (during a delayed jump's event).
+A solve's delay histories of one model (a structural mode's own), one per delay() call (the array code: per
+instance of a call), whether they are read as right limits (during a delayed jump's event), and the present values
+of the calls' arguments and delay times, which the recorders fill before they record (`now`, `times`).
 """
 mutable struct DelayState
   histories::Vector{DelayHistory}
   rightLimit::Bool
+  now::Vector{Float64}
+  times::Vector{Float64}
 end
+DelayState(n::Integer) = DelayState([DelayHistory() for _ in 1:n], false, zeros(n), zeros(n))
 
 "The key of the delay states in a task's local storage."
 const DELAY_STATE_KEY = :omjl_delay_states
@@ -94,8 +98,7 @@ delayStates()::Dict{Symbol, DelayState} =
 delayState(model::Symbol)::Union{Nothing, DelayState} = get(delayStates(), model, nothing)
 
 "A new delay state of `model` with `n` empty histories, the current task's."
-delayHistories!(model::Symbol, n::Integer)::DelayState =
-  delayStates()[model] = DelayState([DelayHistory() for _ in 1:n], false)
+delayHistories!(model::Symbol, n::Integer)::DelayState = delayStates()[model] = DelayState(n)
 
 """
     clearDelayHistories!()
@@ -131,6 +134,87 @@ function _delayedValue(h::DelayHistory, s::Float64, right::Bool, t::Float64, x::
   return h.v[k] + (s - t1) / (t2 - t1) * (h.v[k + 1] - h.v[k])
 end
 
+#= The histories' use and upkeep, shared by the scalarized path's callbacks (below) and the array code's
+   (ArrayODEGen.jl): each reads and fills a `DelayState`; they differ in where the state is kept and in how
+   the present values of the arguments are computed. =#
+
+"""
+    delayedValue(s, k, t, delayTime, x) -> Float64
+
+`delay(x, delayTime)` at the time `t` from the history `k` of `s`: the argument's value `delayTime` ago
+(`_delayedValue`); `x`, its present value, before the history has a point (the initialization).
+"""
+function delayedValue(s::DelayState, k::Int, t::Float64, delayTime::Float64, x::Float64)::Float64
+  (k > length(s.histories) || isempty(s.histories[k].t)) && return x
+  return _delayedValue(s.histories[k], t - delayTime, s.rightLimit, t, x)
+end
+
+"The histories of `s` emptied: before a solve's start, so its initialization reads the arguments themselves."
+function emptyDelayHistories!(s::DelayState)::Nothing
+  for h in s.histories
+    empty!(h.t); empty!(h.v); empty!(h.due)
+  end
+  s.rightLimit = false
+  return nothing
+end
+
+"The first point of each history of `s`: the present values (`s.now`) at the start `t`."
+function startDelayHistories!(s::DelayState, t::Float64)::Nothing
+  emptyDelayHistories!(s)
+  for (k, h) in enumerate(s.histories)
+    push!(h.t, t); push!(h.v, s.now[k])
+  end
+  return nothing
+end
+
+"A step's end (or an event's left limit) at `t`: the present values (`s.now`), where `t` is past the last point."
+function recordDelayStepEnd!(s::DelayState, t::Float64)::Nothing
+  for (k, h) in enumerate(s.histories)
+    (!isempty(h.t) && t > h.t[end]) && (push!(h.t, t); push!(h.v, s.now[k]))
+  end
+  return nothing
+end
+
+"""
+    recordDelayJumps!(times!, s, t, integrator)
+
+After the events at `t`: a present value (`s.now`) that differs from the last point at `t` is a jump, recorded as the
+right limit and due again its delay time later (`s.times`, filled by `times!()` when the first jump is found): a
+stop time of the solve within its time span (`delayJumpsDue!`). Round-off from an event's algebraic re-solve is no
+jump. The histories are read as left limits again.
+"""
+function recordDelayJumps!(times!::F, s::DelayState, t::Float64, integrator)::Nothing where {F}
+  local filled::Bool = false
+  for (k, h) in enumerate(s.histories)
+    isempty(h.t) && continue
+    local x::Float64 = s.now[k]
+    (t == h.t[end] && abs(x - h.v[end]) <= 1e-6 * max(1.0, abs(x))) && continue
+    push!(h.t, t); push!(h.v, x)
+    filled || (times!(); filled = true)
+    local tDue::Float64 = t + s.times[k]
+    #= The solve's end, not the build's: a cached build is made for a short span and solved for the
+       model's (MSL Digital FullAdder: jumps due after the build's end were dropped, its gates fell
+       back to 'U'). =#
+    (tDue > t && integrator.tdir * (last(integrator.sol.prob.tspan) - tDue) >= 0) || continue
+    push!(h.due, tDue)
+    ModelingToolkit.SciMLBase.add_tstop!(integrator, tDue)
+  end
+  s.rightLimit = false
+  return nothing
+end
+
+"Whether a delayed jump of `s` is due at `t`; the due times at or before `t` are dropped."
+function delayJumpsDue!(s::DelayState, t::Float64)::Bool
+  local tol::Float64 = 1e-12 * max(1.0, abs(t))
+  local hit::Bool = false
+  for h in s.histories, k in length(h.due):-1:1
+    local d::Float64 = h.due[k]
+    abs(d - t) <= tol && (hit = true)
+    d <= t + tol && deleteat!(h.due, k)
+  end
+  return hit
+end
+
 #= Named functor (not a closure): ModelingToolkit rebuilds terms and re-infers their type, as for
    ConstTableLookupFn. Arguments: time, the delay time, the argument's present value. =#
 struct DelayedValueFn
@@ -143,8 +227,7 @@ SymbolicUtils.promote_shape(::DelayedValueFn, szs::SymbolicUtils.ShapeT...) = Sy
 function (f::DelayedValueFn)(t, delayTime, x)
   local s = delayState(f.model)
   (s === nothing || f.k > length(s.histories) || isempty(s.histories[f.k].t)) && return x
-  local tt = Float64(_primalValue(t))
-  return _delayedValue(s.histories[f.k], tt - Float64(_primalValue(delayTime)), s.rightLimit, tt, Float64(_primalValue(x)))
+  return delayedValue(s, f.k, Float64(_primalValue(t)), Float64(_primalValue(delayTime)), Float64(_primalValue(x)))
 end
 
 """
@@ -164,15 +247,7 @@ event, the delayed values are right limits. Due times already passed are dropped
 function withDelayEvents(callbacks, model::Symbol)
   local due = function (u, t, integrator)
     local s = delayState(model)
-    s === nothing && return false
-    local tol = 1e-12 * max(1.0, abs(t))
-    local hit = false
-    for h in s.histories, k in length(h.due):-1:1
-      local d = h.due[k]
-      abs(d - t) <= tol && (hit = true)
-      d <= t + tol && deleteat!(h.due, k)
-    end
-    return hit
+    return s !== nothing && delayJumpsDue!(s, Float64(t))
   end
   local affect! = function (integrator)
     local s = delayState(model)
@@ -205,17 +280,14 @@ function withDelayRecords(callbacks, problem, model::Symbol, args::Vector, delay
   local stepEnd = function (u, t, integrator)
     local s = delayState(model)
     s === nothing && return false
-    local v = now(integrator)
-    for (k, h) in enumerate(s.histories)
-      t > h.t[end] && (push!(h.t, t); push!(h.v, Float64(v[k])))
-    end
+    s.now .= now(integrator)
+    recordDelayStepEnd!(s, Float64(t))
     return false
   end
   local start! = function (c, u, t, integrator)
-    local v = Base.invokelatest(argumentValues, u, integrator.p, t)
-    for (k, h) in enumerate(delayHistories!(model, n).histories)
-      push!(h.t, t); push!(h.v, Float64(v[k]))
-    end
+    local s = delayHistories!(model, n)
+    s.now .= Base.invokelatest(argumentValues, u, integrator.p, t)
+    startDelayHistories!(s, Float64(t))
     #= The left limits at a branch event, before its affect (eventInstant.jl beginInstant!). =#
     atInstantStart!(integrator, i -> (stepEnd(i.u, i.t, i); nothing))
     return nothing
@@ -223,23 +295,9 @@ function withDelayRecords(callbacks, problem, model::Symbol, args::Vector, delay
   local afterEvents = function (u, t, integrator)
     local s = delayState(model)
     s === nothing && return false
-    local v = now(integrator)
-    local T = nothing
-    for (k, h) in enumerate(s.histories)
-      local x = Float64(v[k])
-      #= Round-off from an event's algebraic re-solve is no jump. =#
-      (t == h.t[end] && abs(x - h.v[end]) <= 1e-6 * max(1.0, abs(x))) && continue
-      push!(h.t, t); push!(h.v, x)
-      T === nothing && (T = Base.invokelatest(delayTimeValues, u, integrator.p, t))
-      local tDue = t + Float64(T[k])
-      #= The solve's end, not the build's: a cached build is made for a short span and solved for the
-         model's (MSL Digital FullAdder: jumps due after the build's end were dropped, its gates fell
-         back to 'U'). =#
-      (tDue > t && integrator.tdir * (last(integrator.sol.prob.tspan) - tDue) >= 0) || continue
-      push!(h.due, tDue)
-      ModelingToolkit.SciMLBase.add_tstop!(integrator, tDue)
-    end
-    s.rightLimit = false
+    s.now .= now(integrator)
+    recordDelayJumps!(() -> (s.times .= Base.invokelatest(delayTimeValues, u, integrator.p, t); nothing), s, Float64(t),
+                      integrator)
     return false
   end
   local never! = integrator -> nothing

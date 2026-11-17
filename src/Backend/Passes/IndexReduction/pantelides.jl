@@ -273,6 +273,65 @@ function pantelides!(s::Structure; maxOrder::Int = 10)::PantelidesMatching
   return m
 end
 
+"""
+    initialDerivatives!(s, m, names) -> Set{Int}
+
+The derivatives of the variables `names` that initial equations read (`initialDerivativeReads`) where they have none:
+of an algebraic variable (MSL FundamentalWave IMC_Initialize's steady state `der(aimc.airGap.V_mrr.re) = 0`; Rotational
+InitializeFlange's `der(flange.phi) = w_start` on a flange whose angle is an alias of a state). Each is given a
+derivative and the row matched to it (`m`) differentiated; the variables that row reads without a derivative the same,
+down to the variables with one (the states, those index reduction differentiated). The new derivative variables: dummy
+derivatives of the plan (their variables stay algebraic, their derivatives computed from the differentiated rows).
+"""
+function initialDerivatives!(s::Structure, m::PantelidesMatching, names::Vector{Symbol})::Set{Int}
+  local added = Set{Int}()
+  local rows = Int[]
+  for name in names
+    local v::Int = get(s.index, name, 0)
+    v == 0 || demandDerivative!(s, m, added, rows, v)
+  end
+  while !isempty(rows)
+    local r::Int = pop!(rows)
+    for v in s.incidence[r]
+      demandDerivative!(s, m, added, rows, v)
+    end
+    addDerivativeRow!(s, r)
+  end
+  return added
+end
+
+"""
+The derivative of variable `v` for `initialDerivatives!` where it has none: added (to `added`), the row matched to `v`
+to be differentiated (to `rows`). NotHandled where no row is matched to `v`.
+"""
+function demandDerivative!(s::Structure, m::PantelidesMatching, added::Set{Int}, rows::Vector{Int}, v::Int)::Nothing
+  s.derivative[v] == 0 || return nothing
+  local r::Int = v <= length(m.variableRow) ? m.variableRow[v] : 0
+  local name::Symbol = s.variables[v]
+  r == 0 && throw(NotHandled("der($(name)) in an initial equation: no equation is matched to $(name)"))
+  push!(added, addDerivative!(s, v))
+  push!(rows, r)
+  return nothing
+end
+
+"The names of the variables `equations` read der() of (`der(x)` of a reference: the initial equations' derivatives)."
+function initialDerivativeReads(equations::Vector{IR.Equation})::Vector{Symbol}
+  local names = Symbol[]
+  for eq in equations
+    IR.foreachRootExp(eq) do @nospecialize(e::IR.Expression)
+      IR.foreachExp(e) do @nospecialize(x::IR.Expression)
+        if IR.isBuiltinCall(x, :der)
+          local a::IR.Expression = only((x::IR.CALL).arguments)
+          a isa IR.CREF && push!(names, a.cref.name)
+        end
+        nothing
+      end
+      nothing
+    end
+  end
+  return unique!(names)
+end
+
 "The message for a structurally singular subset: its equations and the variables they read."
 function singularMessage(s::Structure, rows::Vector{Int})::String
   local names = unique(Symbol[s.variables[v] for r in rows for v in s.incidence[r]])
@@ -281,17 +340,20 @@ function singularMessage(s::Structure, rows::Vector{Int})::String
 end
 
 """
-    derivativeSeeds(s, functions) -> Seeds
+    derivativeSeeds(s, functions; constants) -> Seeds
 
 The seeds of d/dt in the structure: a variable's derivative is its derivative variable (a
 reference of type Real); a name outside the structure (a parameter, a constant, a discrete
-variable) has none (0).
+variable) has none (0); one of `constants` (the variables the plan's structure read as constants,
+`Plan.constants`) the derivative 0.
 """
-function derivativeSeeds(s::Structure, functions::Vector{IR.ModelicaFunction})::Seeds
+function derivativeSeeds(s::Structure, functions::Vector{IR.ModelicaFunction};
+                         constants::Set{Symbol} = Set{Symbol}())::Seeds
   local variable = name -> begin
     local v = get(s.index, name, 0)
     v == 0 && return nothing
     local d = s.derivative[v]
+    (d == 0 && name in constants) && return ZERO
     d == 0 && throw(NotHandled("the derivative of $(name), which Pantelides' algorithm gave none"))
     return IR.CREF(s.crefs[d], IR.T_REAL())
   end

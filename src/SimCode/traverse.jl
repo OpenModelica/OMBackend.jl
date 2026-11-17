@@ -55,28 +55,27 @@ Traversal.traverseField(xss::Vector{<:Vector{<:Union{TraversalChild, TraversalCo
 
 The direct subexpressions of `e`, in field order (a reduction's iterator ranges after its body).
 """
-children(e::Exp)::Vector{Exp} = last(traverseFields(e, _pushChild, Exp[]))
+children(@nospecialize(e::Exp))::Vector{Exp} = last(traverseFields(e, _pushChild, Exp[]))
 
 _pushChild(x::Exp, out::Vector{Exp})::Tuple{Exp, Vector{Exp}} = (push!(out, x); (x, out))
+
+#= The traversals below hold the caller's function untyped, in a mutable wrapper, as OMJLIR's (IR/OMJLIR.jl,
+   Traversal): one copy of `traverseFields` per wrapper and node type, the function called by dynamic dispatch. The
+   traversals with an accumulator (`traverseExpTopDown`, `traverseExpBottomUp`) keep their visitor typed: the passes
+   give them named functions, a few. =#
 
 """
     mapChildren(g, e)
 
 `e` with `g` applied to each of its direct subexpressions, one level; `e` itself if none changed.
 """
-mapChildren(g::G, e::Exp) where {G} = first(traverseFields(e, _Apply(g), nothing))
+mapChildren(@nospecialize(g), @nospecialize(e::Exp))::Exp = first(traverseFields(e, _Apply(g), nothing))
 
 "`g` as a traversal's `recur`: a child replaced by `g(child)`."
-struct _Apply{G}
-  g::G
+mutable struct _Apply
+  const g::Any
 end
-(m::_Apply)(x::Exp, a::Nothing) = (m.g(x), a)
-
-"`mapExp` of `f` as a callable, for `mapChildren`."
-struct _BottomUp{F}
-  f::F
-end
-(m::_BottomUp)(e::Exp) = mapExp(m.f, e)
+(m::_Apply)(x::Exp, a::Nothing) = (m.g(x)::Exp, a)
 
 """
     mapExp(f, e)
@@ -84,36 +83,52 @@ end
 `e` with every subexpression `s` replaced by `f(s)`, bottom-up: `f` sees a node whose children
 are already mapped.
 """
-mapExp(f::F, e::Exp) where {F} = f(mapChildren(_BottomUp(f), e))
+mapExp(@nospecialize(f), @nospecialize(e::Exp))::Exp = _mapExp(_MapExp(f), e)
+
+"`mapExp` of `f` as a traversal's `recur`; as a function of an expression, for `mapStatementExps`."
+mutable struct _MapExp
+  const f::Any
+end
+(m::_MapExp)(x::Exp, a::Nothing) = (_mapExp(m, x), a)
+(m::_MapExp)(x::Exp)::Exp = _mapExp(m, x)
+
+"`mapExp` by its wrapper: the children of `e` mapped, then `m.f` of the result."
+_mapExp(m::_MapExp, e::Exp)::Exp = m.f(first(traverseFields(e, m, nothing)))::Exp
 
 """
     foreachExp(f, e)
 
 Call `f` on `e` and on every subexpression, top-down.
 """
-function foreachExp(f::F, e::Exp)::Nothing where {F}
-  f(e)
-  traverseFields(e, _Visit(f), nothing)
+foreachExp(@nospecialize(f), @nospecialize(e::Exp))::Nothing = _foreachExp(_Visit(f), e)
+
+"`foreachExp` of `f` as a traversal's `recur`."
+mutable struct _Visit
+  const f::Any
+end
+(v::_Visit)(x::Exp, a::Nothing) = (_foreachExp(v, x); (x, a))
+
+"`foreachExp` by its wrapper."
+function _foreachExp(v::_Visit, e::Exp)::Nothing
+  v.f(e)
+  traverseFields(e, v, nothing)
   return nothing
 end
 
-"`foreachExp` of `f` as a traversal's `recur`."
-struct _Visit{F}
-  f::F
-end
-(v::_Visit)(x::Exp, a::Nothing) = (foreachExp(v.f, x); (x, a))
-
 "Whether `p` holds for `e` or one of its subexpressions."
-function anyExp(p::F, e::Exp)::Bool where {F}
-  p(e) && return true
-  return last(traverseFields(e, _Any(p), false))
-end
+anyExp(@nospecialize(p), @nospecialize(e::Exp))::Bool = _anyExp(_Any(p), e)
 
 "`anyExp` of `p` as a traversal's `recur`: the children after the first that holds are not visited."
-struct _Any{F}
-  p::F
+mutable struct _Any
+  const p::Any
 end
-(s::_Any)(x::Exp, found::Bool) = (x, found || anyExp(s.p, x))
+(s::_Any)(x::Exp, found::Bool) = (x, found || _anyExp(s, x))
+
+"`anyExp` by its wrapper."
+function _anyExp(s::_Any, e::Exp)::Bool
+  (s.p(e)::Bool) && return true
+  return last(traverseFields(e, s, false))
+end
 
 """
     mapStatementExps(g, s)
@@ -121,21 +136,35 @@ end
 `s` with each of its expressions `e` (of nested statements too) replaced by `g(e)`, whole;
 the targets of `reinit` and of OMJL's structural changes (references, not expressions) kept.
 """
-mapStatementExps(g::G, s::Statement) where {G} = first(traverseFields(s, _StatementExps(g), nothing))
+mapStatementExps(@nospecialize(g), @nospecialize(s::Statement))::Statement = _mapStatementExps(_StatementExps(g), s)
 
-mapStatementExps(g::G, body::Vector{Statement}) where {G} = Statement[mapStatementExps(g, s) for s in body]
+function mapStatementExps(@nospecialize(g), body::Vector{Statement})::Vector{Statement}
+  local m::_StatementExps = _StatementExps(g)
+  return Statement[_mapStatementExps(m, s) for s in body]
+end
 
 "`g` as a traversal's `recur` over a statement: an expression replaced by `g` of it, a nested statement mapped in turn."
-struct _StatementExps{G}
-  g::G
+mutable struct _StatementExps
+  const g::Any
 end
-(m::_StatementExps)(e::Exp, a::Nothing) = (m.g(e), a)
-(m::_StatementExps)(s::Statement, a::Nothing) = (mapStatementExps(m.g, s), a)
+(m::_StatementExps)(e::Exp, a::Nothing) = (m.g(e)::Exp, a)
+(m::_StatementExps)(s::Statement, a::Nothing) = (_mapStatementExps(m, s), a)
+
+"`mapStatementExps` by its wrapper."
+_mapStatementExps(m::_StatementExps, s::Statement)::Statement = first(traverseFields(s, m, nothing))
 
 "`s` with `f` mapped (as by `mapExp`) over its expressions; the targets of `reinit` and of OMJL's structural changes kept."
-mapStatement(f::F, s::Statement) where {F} = mapStatementExps(e -> mapExp(f, e), s)
+mapStatement(@nospecialize(f),
+             @nospecialize(s::Statement))::Statement = _mapStatementExps(_StatementExps(_MapExp(f)), s)
 
-mapStatements(f::F, body::Vector{Statement}) where {F} = Statement[mapStatement(f, s) for s in body]
+function mapStatements(@nospecialize(f), body::Vector{Statement})::Vector{Statement}
+  local m::_StatementExps = _StatementExps(_MapExp(f))
+  return Statement[_mapStatementExps(m, s) for s in body]
+end
+
+"An equation with `f` mapped (as by `mapExp`) over its expressions and its statements' (`mapStatement`)."
+mapEquation(@nospecialize(f),
+            @nospecialize(eq::Equation))::Equation = first(traverseFields(eq, _StatementExps(_MapExp(f)), nothing))
 
 """
     crefNames!(names, e; dynamic, element = elementKey)
@@ -146,7 +175,7 @@ an array read by literal subscripts also as its element, `element(c, index)` (`e
 name). An array read by a subscript that reads a variable is the array's read only; with
 `dynamic`, that array (its `arrayBase`) recorded there.
 """
-function crefNames!(names::OrderedSet{String}, e::Exp; dynamic::Union{Nothing, Set{Symbol}} = nothing,
+function crefNames!(names::OrderedSet{String}, @nospecialize(e::Exp); dynamic::Union{Nothing, Set{Symbol}} = nothing,
                     element::K = elementKey)::OrderedSet{String} where {K}
   foreachRead(e) do c::SimCref, index::Union{Nothing, Vector{Int}}, isDynamic::Bool
     if isDynamic
@@ -165,7 +194,8 @@ end
 literal subscripts by its array's identifier and the subscripts (`crefName(c, index)`: `a_b[1][2]`), as the
 generated code indexes it.
 """
-identifierNames!(names::OrderedSet{String}, e::Exp)::OrderedSet{String} = crefNames!(names, e; element = crefName)
+identifierNames!(names::OrderedSet{String}, @nospecialize(e::Exp))::OrderedSet{String} = crefNames!(names,
+                 e; element = crefName)
 
 """
     foreachRead(f, e)
@@ -175,25 +205,28 @@ identifierNames!(names::OrderedSet{String}, e::Exp)::OrderedSet{String} = crefNa
 subscripts, `c` the array and `index` the subscripts (its element's name `crefName(c, index)`, its reference
 `elementRead(c, index)`, made only where asked); by a subscript that reads a variable, the array, `dynamic`.
 """
-function foreachRead(f::F, e::Exp)::Nothing where {F}
-  if e isa Union{EXP_CREF, DER, PRE}
-    f(e.cref, nothing, false)
-  elseif e isa ASUB && e.exp isa EXP_CREF
-    if all(s::Exp -> s isa ICONST, e.subs)
-      f(e.exp.cref, Int[(s::ICONST).value for s in e.subs], false)
-    elseif any(s::Exp -> anyExp(x::Exp -> x isa Union{EXP_CREF, DER, PRE}, s), e.subs)
-      f(e.exp.cref, nothing, true)
-    end
-  end
-  traverseFields(e, _VisitReads(f), nothing)
-  return nothing
-end
+foreachRead(@nospecialize(f), @nospecialize(e::Exp))::Nothing = _foreachRead(_VisitReads(f), e)
 
 "`foreachRead` of `f` as a traversal's `recur`."
-struct _VisitReads{F}
-  f::F
+mutable struct _VisitReads
+  const f::Any
 end
-(v::_VisitReads)(x::Exp, a::Nothing) = (foreachRead(v.f, x); (x, a))
+(v::_VisitReads)(x::Exp, a::Nothing) = (_foreachRead(v, x); (x, a))
+
+"`foreachRead` by its wrapper."
+function _foreachRead(v::_VisitReads, e::Exp)::Nothing
+  if e isa Union{EXP_CREF, DER, PRE}
+    v.f(e.cref, nothing, false)
+  elseif e isa ASUB && e.exp isa EXP_CREF
+    if all(s::Exp -> s isa ICONST, e.subs)
+      v.f(e.exp.cref, Int[(s::ICONST).value for s in e.subs], false)
+    elseif any(s::Exp -> anyExp(x::Exp -> x isa Union{EXP_CREF, DER, PRE}, s), e.subs)
+      v.f(e.exp.cref, nothing, true)
+    end
+  end
+  traverseFields(e, v, nothing)
+  return nothing
+end
 
 """
     Read(cref, dynamic)
@@ -261,9 +294,11 @@ end
 before its body, a loop's range before its body); `statement(s)` on each statement before its expressions. The
 targets of `reinit` and of OMJL's structural changes are references, not expressions (`statementTargets!`).
 """
-function foreachStatementExp(f::F, body::Vector{Statement}, statement::G = noStatement)::Nothing where {F, G}
-  local visit::_StatementVisit{F, G} = _StatementVisit(f, statement)
-  foreach(s::Statement -> visit(s, nothing), body)
+function foreachStatementExp(@nospecialize(f), body::Vector{Statement}, @nospecialize(statement = noStatement))::Nothing
+  local visit::_StatementVisit = _StatementVisit(f, statement)
+  for s::Statement in body
+    visit(s, nothing)
+  end
   return nothing
 end
 
@@ -271,9 +306,9 @@ end
 noStatement(::Statement)::Nothing = nothing
 
 "`foreachStatementExp` as a traversal's `recur`: an expression visited, a statement visited and traversed in turn."
-struct _StatementVisit{F, G}
-  f::F
-  statement::G
+mutable struct _StatementVisit
+  const f::Any
+  const statement::Any
 end
 (v::_StatementVisit)(e::Exp, a::Nothing) = (v.f(e); (e, a))
 (v::_StatementVisit)(s::Statement, a::Nothing) = (v.statement(s); traverseFields(s, v, nothing); (s, a))
@@ -296,7 +331,8 @@ expressions.
 function foreachEquationExp(f::F, simCode::SIM_CODE; eliminated::Bool = false, statement::G = noPlacedStatement)::Nothing where {F, G}
   foreach(((i, eq),) -> f((:residualEquations, i), eq.exp), enumerate(simCode.residualEquations))
   eliminated && foreach(((i, eq),) -> f((:eliminatedEquations, i), eq.exp), enumerate(simCode.eliminatedEquations))
-  foreach(((i, eq),) -> foreach(e::Exp -> f((:initialEquations, i), e), equationExps(eq)), enumerate(simCode.initialEquations))
+  foreach(((i, eq),) -> foreach((@nospecialize(e::Exp)) ->
+                                  f((:initialEquations, i), e), equationExps(eq)), enumerate(simCode.initialEquations))
   for (i, ifEq) in enumerate(simCode.ifEquations), b in ifEq.branches
     f((:ifEquations, i), b.condition)
     foreach(eq -> f((:ifEquations, i), eq.exp), b.residualEquations)
@@ -305,12 +341,14 @@ function foreachEquationExp(f::F, simCode::SIM_CODE; eliminated::Bool = false, s
     local stmts::Union{Nothing, WHEN_STMTS} = w.whenEquation
     while stmts !== nothing
       f((:whenEquations, i), stmts.condition)
-      foreachStatementExp(e::Exp -> f((:whenEquations, i), e), stmts.body, s::Statement -> statement((:whenEquations, i), s))
+      foreachStatementExp((@nospecialize(e::Exp)) -> f((:whenEquations, i), e), stmts.body,
+                          s::Statement -> statement((:whenEquations, i), s))
       stmts = stmts.elsewhenPart
     end
   end
   for (i, a) in enumerate(simCode.initialAlgorithms)
-    foreachStatementExp(e::Exp -> f((:initialAlgorithms, i), e), a.statements, s::Statement -> statement((:initialAlgorithms, i), s))
+    foreachStatementExp((@nospecialize(e::Exp)) -> f((:initialAlgorithms, i), e), a.statements,
+                        s::Statement -> statement((:initialAlgorithms, i), s))
   end
   foreach(((i, a),) -> (f((:asserts, i), a.condition); f((:asserts, i), a.message)), enumerate(simCode.asserts))
   return nothing

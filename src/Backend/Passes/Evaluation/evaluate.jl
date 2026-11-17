@@ -79,6 +79,11 @@ genericValues(values::StartValues)::StartValues =
   StartValues(values.variables, values.functions, Dict{Symbol, Union{Nothing, Float64}}(), values.parametersOnly, true,
               values.defined, values.calls)
 
+"`values` with a cache of its own (the pure calls' shared): a point whose values a caller sets (`propagatedValues`)."
+ownValues(values::StartValues)::StartValues =
+  StartValues(values.variables, values.functions, Dict{Symbol, Union{Nothing, Float64}}(), values.parametersOnly,
+              values.generic, values.defined, values.calls)
+
 """
     definedValue(values, name) -> Union{Nothing, Float64}
 
@@ -181,8 +186,20 @@ SimCode's interpretation finds constant, which this folding cannot evaluate, MSL
 `(cc, m_dCap) = diodeNoBypassCode(...)` without a junction capacitance; not the values SimCode infers
 from the unreduced, singular system), kept in that equation. The equations are copies, the indices the partition's.
 """
-function withKnownValues(model::IR.Model, partition::IR.Partition;
-                         known::Dict{Symbol, IR.Expression} = Dict{Symbol, IR.Expression}())::IR.Partition
+withKnownValues(model::IR.Model, partition::IR.Partition;
+                known::Dict{Symbol, IR.Expression} = Dict{Symbol, IR.Expression}())::IR.Partition =
+  first(withKnownValuesAndConstants(model, partition; known))
+
+"""
+    withKnownValuesAndConstants(model, partition; known) -> Tuple{Partition, Set{Symbol}}
+
+`withKnownValues` and the variables it took as constant (each substituted in the equations but its own): their time
+derivatives are zero, as the folded equations read them (an index reduction made on them gives them no derivative
+variable; MSL SMPM_CurrentSource's `dqToThreePhase.rotator.u[1]`, a gain of the constant d-current reference).
+"""
+function withKnownValuesAndConstants(model::IR.Model, partition::IR.Partition;
+                                     known::Dict{Symbol, IR.Expression} = Dict{Symbol, IR.Expression}()
+                                     )::Tuple{IR.Partition, Set{Symbol}}
   local values = StartValues(model.variables, model.functions; parametersOnly = true)
   #= the values known from elsewhere (SimCode's folding: `knownValues`) of variables a function call defines (what
      this folding cannot evaluate: a record function's output), each kept in its defining equation =#
@@ -198,9 +215,11 @@ function withKnownValues(model::IR.Model, partition::IR.Partition;
   local equations = IR.Equation[deepcopy(eq) for eq in partition.equations]
   local readers = Dict{Symbol, Vector{Int}}()
   for (i, eq) in enumerate(equations)
-    IR.mapEquation!(e -> substitute(e, i), eq)
+    IR.mapEquation!((@nospecialize(e::IR.Expression)) -> substitute(e, i), eq)
     IR.foreachRootExp(eq) do root
-      IR.foreachExp(x -> (x isa IR.CREF && push!(get!(Vector{Int}, readers, x.cref.name), i); nothing), root)
+      IR.foreachExp((@nospecialize(x::IR.Expression)) ->
+                      (x isa IR.CREF && push!(get!(Vector{Int}, readers, x.cref.name), i); nothing),
+                   root)
     end
   end
   local queue = collect(eachindex(equations))
@@ -211,11 +230,13 @@ function withKnownValues(model::IR.Model, partition::IR.Partition;
     constants[first(set)] = (last(set), i)
     for j in get(readers, first(set), Int[])
       j == i && continue
-      IR.mapEquation!(e -> substitute(e, j), equations[j])
+      IR.mapEquation!((@nospecialize(e::IR.Expression)) -> substitute(e, j), equations[j])
       push!(queue, j)
     end
   end
-  return IR.Partition(partition.index, partition.association, partition.unknowns, equations, partition.initialEquations)
+  local folded::IR.Partition =
+    IR.Partition(partition.index, partition.association, partition.unknowns, equations, partition.initialEquations)
+  return (folded, Set{Symbol}(keys(constants)))
 end
 
 """
@@ -286,7 +307,7 @@ end
 The value of the scalar expression `e`, its references by `values(name)` (`time` is 0);
 `nothing` where it does not evaluate here (an array, an unknown function, an unknown value).
 """
-function evaluate(e::IR.Expression, values::StartValues)::Union{Nothing, Float64}
+function evaluate(@nospecialize(e::IR.Expression), values::StartValues)::Union{Nothing, Float64}
   e isa IR.REAL && return e.value
   e isa IR.INTEGER && return Float64(e.value)
   e isa IR.BOOLEAN && return e.value ? 1.0 : 0.0
@@ -386,7 +407,7 @@ function evaluateCall(e::IR.CALL, values::StartValues)::Union{Nothing, Float64}
 end
 
 "The value of a Boolean condition at the start; `nothing` where it does not evaluate."
-function evaluateCondition(e::IR.Expression, values::StartValues)::Union{Nothing, Bool}
+function evaluateCondition(@nospecialize(e::IR.Expression), values::StartValues)::Union{Nothing, Bool}
   e isa IR.BOOLEAN && return e.value
   if e isa IR.RELATION
     local (a, b) = (evaluate(e.exp1, values), evaluate(e.exp2, values))
