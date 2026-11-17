@@ -808,6 +808,24 @@ end
     local (sb, ab, _) = _bothWays("ArrayPath.BilinearStart", ["x", "R"])
     @test isapprox(ab[1], sin(1) / 10; rtol = 1e-4)
     @test maximum(abs.(sb .- ab)) < 1e-6
+    #= a loop that divides by one of its unknowns is torn (`_dividesByBlockUnknowns`): the generated Newton started vt
+       at 0 (no start value), exp(v / vt) was NaN (MSL HeatingRectifier's diode, heated by its own losses) =#
+    local heated = Modelica"""
+model DivideInLoop
+  parameter Real R = 10, Gth = 0.1;
+  Real T(start = 300, fixed = true);
+  Real Tp, vt, i, v, Q;
+equation
+  der(T) = Q - 0.1 * (T - 300);
+  Tp = T + Q / Gth;
+  Q = v * i;
+  vt = 8.617e-5 * Tp;
+  i = 1e-9 * (exp(v / vt) - 1);
+  1 = v + R * i;
+end DivideInLoop;
+"""
+    local (sd, ad, _) = _bothWaysOf(heated, "DivideInLoop", ["v", "vt", "T"])
+    @test all(isfinite, ad) && maximum(abs.(sd .- ad)) < 1e-8
   end
 
   @testset "A parameter known as zero: its terms out of the equations, a state whose derivative they held is none" begin
@@ -3550,5 +3568,177 @@ end
     local (s, a, _) = _bothWaysOf(program, "RecordData.Mixture", ["cp"])
     @test a ≈ [1003.4 + 1.6 * 301] rtol = 1e-9
     @test s ≈ a rtol = 1e-9
+  end
+
+  @testset "A call returning an array of records as an argument: all its fields" begin
+    #= rotateAll returns its records' fields' arrays (y_a, y_b); as dot's argument the array code passed y_a only, a
+       MethodError at the first right-hand side (OM.jl's ComplexLoweringTests.ArrayRecordOutputs) =#
+    local program = Modelica"""
+      package RecordArrayCall
+        record R
+          Real a;
+          Real b;
+        end R;
+        function rotateAll
+          input R u[:];
+          input Real phi;
+          output R y[size(u, 1)];
+        algorithm
+          for i in 1:size(u, 1) loop
+            y[i] := R(u[i].a * cos(phi) - u[i].b * sin(phi), u[i].a * sin(phi) + u[i].b * cos(phi));
+          end for;
+        end rotateAll;
+        function dot
+          input R x[:];
+          input R y[:];
+          output Real s = 0;
+        algorithm
+          for i in 1:size(x, 1) loop
+            s := s + x[i].a * y[i].a + x[i].b * y[i].b;
+          end for;
+        end dot;
+        model M
+          R u[2] = {R(1, 0), R(0, 2)};
+          Real d = dot(u, rotateAll(u, time));
+          Real x(start = 0, fixed = true);
+        equation
+          der(x) = d;
+        end M;
+      end RecordArrayCall;
+      """
+    #= d = |u|^2 cos(t) = 5 cos(t), x(1) = 5 sin(1) =#
+    local (s, a, _) = _bothWaysOf(program, "RecordArrayCall.M", ["d", "x"]; reltol = 1e-8, abstol = 1e-10)
+    @test a ≈ [5 * cos(1.0), 5 * sin(1.0)] rtol = 1e-6
+    @test s ≈ a rtol = 1e-6
+  end
+
+  @testset "Initial arms of lifted clusters before the equations that read them" begin
+    #= b and a are lifted clusters, initialized by their initial arms; the equations ran before them and read
+       andT[0, 0] with b's and a's starts (a ModelicaSubscriptError: OM.jl's EventSemantics.TwoTablesSameIndices) =#
+    local program = Modelica"""
+      model TwoTables
+        constant Integer andT[4, 4] = [1, 1, 3, 1; 1, 2, 3, 2; 3, 3, 3, 3; 1, 2, 3, 4];
+        constant Integer xorT[4, 4] = [1, 1, 1, 1; 1, 2, 2, 2; 1, 2, 3, 4; 1, 2, 4, 3];
+        Integer b = if time < 0.5 then 3 else 4;
+        Integer a = if time < 0.25 then 1 else 4;
+        Integer yAnd;
+        Integer yXor;
+      equation
+        yAnd = andT[b, a];
+        yXor = xorT[b, a];
+      end TwoTables;
+      """
+    local (s, a, sol) = _bothWaysOf(program, "TwoTables", ["yAnd", "yXor"])
+    @test a == [4.0, 3.0] && s == a
+    @test [OMBackend.getVariableValues(sol, "yXor")[1]] == [1.0]
+  end
+
+  @testset "Events: a short window, an event function at its interval's end, a DAE solver" begin
+    local program = Modelica"""
+      package SmallEvents
+        model ShortWindow
+          Real x(start = 0, fixed = true);
+          Integer n(start = 0, fixed = true);
+        equation
+          der(x) = 1;
+          when 81 * sin(time) > 80 then
+            n = pre(n) + 1;
+          end when;
+        end ShortWindow;
+        model ModDay
+          Real DNTime;
+          Real awake;
+        equation
+          if DNTime > 24 then
+            DNTime = 0;
+          else
+            DNTime = mod(time, 24);
+          end if;
+          awake = if DNTime < 24 and DNTime > 8 then 1.0 else 0.0;
+        end ModDay;
+        model DAEIfReinit
+          Real x(start = 0, fixed = true);
+          Real v(start = 0);
+          Real y;
+          Real z(start = 0, fixed = true);
+        equation
+          der(x) = 1;
+          when x > 1 then
+            reinit(x, 0);
+          end when;
+          v + v ^ 3 = x;
+          y = if v > 0.5 then 1 else 0;
+          der(z) = y;
+        end DAEIfReinit;
+      end SmallEvents;
+      """
+    local fd = OMBackend.CodeGeneration.ADTypes.AutoFiniteDiff()
+    #= 81 sin(t) > 80 only on (1.4135, 1.7281) and 2 pi later: der(x) = 1 took 9 s steps and the relation's checks
+       within them missed the first window; the largest step keeps 10 checks per 1/500 of the span, omc's output
+       intervals (`_stepKwargs`) =#
+    local name::String = _translateProgram(program, "SmallEvents.ShortWindow"; scalarized = false)
+    @test _arrayPathTaken(name)
+    @test OMBackend.getVariableValues(OMBackend.simulateModel(name; tspan = (0.0, 10.0)), "n")[end] == 2
+    #= mod(time, 24) reaches 24 just after the crossing of DNTime > 24 (2e-6 earlier, at the hysteresis): its value
+       kept within the band was stale at that event, and the relations switched back and forth (OM.jl's
+       PersonalityAspects); at an event it is literal, as omc's _event_floor =#
+    name = _translateProgram(program, "SmallEvents.ModDay"; scalarized = false)
+    local day = OMBackend.simulateModel(name; tspan = (0.0, 60.0), abstol = 1e-2, reltol = 1e-2,
+                                        solver = OMBackend.OrdinaryDiffEqBDF.FBDF(autodiff = fd))
+    @test day.retcode == ReturnCode.Success
+    @test [day(t; idxs = :DNTime) for t in (30.0, 36.0)] ≈ [6.0, 12.0] atol = 1e-6
+    #= a DAE solver on the array code: its ODE in residual form (`ode_to_dae`), initialized by Brown's method after a
+       reinit (the default check failed with the residual of the reinit's jump) =#
+    name = _translateProgram(program, "SmallEvents.DAEIfReinit"; scalarized = false)
+    local dae = OMBackend.simulateModel(name; tspan = (0.0, 3.5), reltol = 1e-8, abstol = 1e-10,
+                                        solver = OMBackend.OrdinaryDiffEqBDF.DFBDF(autodiff = fd))
+    @test dae.retcode == ReturnCode.Success
+    @test [dae(1.4; idxs = :z), dae(3.2; idxs = :v), dae(3.5; idxs = :z)] ≈ [0.375, 0.19282993096291295, 1.125] atol = 1e-6
+  end
+
+  @testset "A row of a parameter matrix by a discrete index; an enumeration's String in a when body" begin
+    local program = Modelica"""
+      package ByIndex
+        model TableRow
+          parameter Real table[3, 2] = {{1, 4}, {2, 2}, {3, 7}};
+          final parameter Integer val[3, 2] = integer(table + fill(1, 3, 2) * 1e-37);
+          Integer idx(start = 1, fixed = true);
+          discrete Integer y[2];
+        initial equation
+          y[:] = val[idx, :];
+        equation
+          when sample(0.3, 0.3) then
+            idx = if pre(idx) < 3 then pre(idx) + 1 else 1;
+            y[:] = val[idx, :];
+          end when;
+        end TableRow;
+        model EnumerationString
+          type E = enumeration(one, two, three);
+          parameter E e = E.three;
+          Real x(start = 0, fixed = true);
+          Integer n(start = 0, fixed = true);
+        algorithm
+          when x > 0.5 then
+            n := pre(n) + 1;
+            assert(n < 1, "e=" + String(e, minimumLength = 7, leftJustified = false) + "|", AssertionLevel.warning);
+          end when;
+        equation
+          der(x) = 1;
+        end EnumerationString;
+      end ByIndex;
+      """
+    #= `val[idx, :]`: the array index reduction declines a subscript that is not constant; the backend
+       scalarization selects its elements by the discrete idx (`selectElement`), it read val as a whole
+       (UndefVarError). idx: 1, 2 at 0.3, 3 at 0.6, 1 at 0.9 (CDL's Integer TimeTable) =#
+    for scalarized in (true, false)
+      local rows::String = _translateProgram(program, "ByIndex.TableRow"; scalarized)
+      local sol = OMBackend.simulateModel(rows; tspan = (0.0, 1.0))
+      @test sol.retcode == ReturnCode.Success
+      @test [OMBackend.getVariableValues(sol, "y[2]")[1]; _values(sol, ["y[1]", "y[2]"])] == [4.0, 1.0, 4.0]
+    end
+    #= the literals of an enumeration are a tuple of names, indexed by its value (`_checkedIndex(::Tuple, i)`) =#
+    local name::String = _translateProgram(program, "ByIndex.EnumerationString"; scalarized = false)
+    @test _arrayPathTaken(name)
+    @test_logs (:warn, r"e=  three\|$") match_mode = :any OMBackend.simulateModel(name; tspan = (0.0, 1.0))
   end
 end

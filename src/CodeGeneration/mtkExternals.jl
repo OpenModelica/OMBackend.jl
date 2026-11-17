@@ -3530,21 +3530,24 @@ Handles both pure ODEs (UniformScaling mass matrix) and semi-explicit DAEs
 function ode_to_dae(prob::ODEProblem)
   local M = prob.f.mass_matrix
   local ode_f! = prob.f.f
-  local n = length(prob.u0)
-  local M_mat = M isa UniformScaling ? Matrix{Float64}(M, n, n) : M
-  function residual!(resid, du, u, p, t)
-    ode_f!(resid, u, p, t)
-    resid .= M_mat * du .- resid
-  end
-  local du0 = zeros(n)
-  local tmp = zeros(n)
-  ode_f!(tmp, prob.u0, prob.p, prob.tspan[1])
-  for i in 1:n
-    if M_mat[i, i] != 0.0
-      du0[i] = tmp[i] / M_mat[i, i]
+  local n::Int = length(prob.u0)
+  local du0::Vector{Float64} = zeros(n)
+  ode_f!(du0, prob.u0, prob.p, prob.tspan[1])
+  local diff_vars::Vector{Bool}
+  local residual!::Function
+  if M isa UniformScaling
+    #= an ODE (the array path's: its algebraic loops are solved in f): du - f(u), without an n-by-n matrix =#
+    local λ::Float64 = Float64(M.λ)
+    residual! = (resid, du, u, p, t) -> (ode_f!(resid, u, p, t); resid .= λ .* du .- resid; nothing)
+    du0 ./= λ
+    diff_vars = fill(λ != 0.0, n)
+  else
+    residual! = (resid, du, u, p, t) -> (ode_f!(resid, u, p, t); resid .= M * du .- resid; nothing)
+    for i in 1:n
+      du0[i] = M[i, i] != 0.0 ? du0[i] / M[i, i] : 0.0
     end
+    diff_vars = Bool[M[i, i] != 0.0 for i in 1:n]
   end
-  local diff_vars = [M_mat[i, i] != 0.0 for i in 1:n]
   # Explicitly clear initialization_data — MTK's ODE init metadata triggers
   # CheckInit on the DAE residual form and rejects perfectly fine guesses.
   local daefunc = ModelingToolkit.SciMLBase.DAEFunction(residual!; sys = prob.f.sys, initialization_data = nothing)

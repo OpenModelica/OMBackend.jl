@@ -91,6 +91,13 @@ end
 "No iterator values: an expression outside a for-equation."
 const NO_ITERATORS = Dict{Symbol, Int}()
 
+"No names bound by for-statements (`scalarExpression`'s `bound`); never changed."
+const NO_BOUND_NAMES = Set{Symbol}()
+
+"Whether `x` is a reference to the iterator of an enclosing for-statement, one of `bound` (one part, no subscripts)."
+isBoundIterator(x::IR.CREF, bound::Set{Symbol})::Bool =
+  !isempty(bound) && length(x.cref.parts) == 1 && isempty(x.cref.parts[1].subscripts) && x.cref.parts[1].name in bound
+
 "The dimensions of an array type; NotHandled for a dimension of a size not known (`what` names it)."
 function knownSizes(@nospecialize(ty::IR.ModelicaType), what::String)::Vector{Int}
   local sizes = Int[]
@@ -426,14 +433,19 @@ end
 """
     constructorElement(e, k) -> Union{Nothing, Expression}
 
-The `k`-th element of an array constructor of one iterator over a literal range (`{f(i) for i in 1:n}`): its
-body at the iterator's `k`-th value; `nothing` for another constructor.
+The `k`-th element of an array constructor whose last iterator is over a literal range (`{f(i) for i in 1:n}`): its
+body at that iterator's `k`-th value; of several iterators, the constructor of the others over that body (the last
+iterator is the first dimension, MLS 10.4.1.2: `{f(i, j) for j in 1:2, i in 1:3}[1]` is `{f(1, j) for j in 1:2}`, a
+row of a parameter matrix's binding, CDL's TimeTable). `nothing` for another constructor.
 """
 function constructorElement(e::IR.ARRAY_CONSTRUCTOR, k::Int)::Union{Nothing, IR.Expression}
-  length(e.iterators) == 1 || return nothing
-  local values = literalRange(e.iterators[1].range)
+  isempty(e.iterators) && return nothing
+  local values::Union{Nothing, StepRange{Int, Int}} = literalRange(e.iterators[end].range)
   (values === nothing || !(1 <= k <= length(values))) && return nothing
-  return withIterator(e.body, e.iterators[1].name, values[k])
+  local body::IR.Expression = withIterator(e.body, e.iterators[end].name, values[k])
+  length(e.iterators) == 1 && return body
+  length(e.ty.dimensions) == length(e.iterators) || return nothing
+  return IR.ARRAY_CONSTRUCTOR(body, e.iterators[1:end - 1], IR.T_ARRAY(e.ty.elementType, e.ty.dimensions[2:end]))
 end
 
 """
@@ -555,12 +567,14 @@ end
 
 `e` in the scalarized model: the iterators of `values` replaced by their values (`withIterators`), references to
 arrays by their element variables (`elementReference`), an element picked out of an array value where its
-subscripts are literals (`pickElement`). What literals select is taken first (`selectedParts`).
+subscripts are literals (`pickElement`). What literals select is taken first (`selectedParts`). A name in `bound` is
+the iterator of a for-statement around `e`, which shadows a variable of that name (MLS 11.2.2.1): it stays.
 """
-function scalarExpression(e::IR.Expression, values::Dict{Symbol, Int}, E::Elements)::IR.Expression
+function scalarExpression(e::IR.Expression, values::Dict{Symbol, Int}, E::Elements;
+                          bound::Set{Symbol} = NO_BOUND_NAMES)::IR.Expression
   local pruned::IR.Expression = selectedParts(withIterators(e, values))
   return IR.mapExp(pruned) do x
-    x isa IR.CREF && return elementReference(x, E)
+    x isa IR.CREF && return isBoundIterator(x, bound) ? x : elementReference(x, E)
     (x isa IR.SUBSCRIPTED && IR.literalIndices(x.subscripts) !== nothing) && return pickElement(x.exp, x.subscripts, x.ty, E)
     (x isa IR.BINARY && x.op == IR.SCALAR_PRODUCT) && return expandedScalarProduct(x, E)
     x isa IR.ARRAY_CONSTRUCTOR && return expandedConstructor(x, E)
@@ -952,8 +966,10 @@ end
 
 function scalarEquations!(out::Vector{IR.Equation}, origins::Vector{EquationOrigin}, eq::IR.WHEN_EQUATION,
                           origin::EquationOrigin, values::Dict{Symbol, Int}, E::Elements)::Nothing
-  local branches = IR.WhenBranch[IR.WhenBranch(IR.Expression[equationExpression(t, values, E) for t in b.triggers], b.atInitial,
-                                               b.atTerminal, elementAssignments(scalarStatements(b.body, values, E), E))
+  local branches = IR.WhenBranch[IR.WhenBranch(elementTriggers(IR.Expression[equationExpression(t, values, E)
+                                                                             for t in b.triggers]),
+                                               b.atInitial, b.atTerminal,
+                                               elementAssignments(scalarStatements(b.body, values, E), E))
                                  for b in eq.branches]
   push!(out, IR.WHEN_EQUATION(branches, eq.kind, eq.source, unlinked(eq.attributes)))
   push!(origins, origin)
@@ -1107,13 +1123,59 @@ withIteratorCref(cref::IR.ComponentRef, values::Dict{Symbol, Int})::IR.Component
     scalarStatements(body, values, E) -> Vector{Statement}
 
 Statements with their root expressions scalarized (`scalarExpression`; a loop's `x[i]` kept), a `reinit`'s state
-by its element variable.
+by its element variable. In a for-statement's body its iterator is bound (`bound`): `for i in 1:3 loop s := s + i`
+in a model with an array `i` read the array (`s := s + {i[1], i[2], i[3]}`, the model refused).
 """
 function scalarStatements(body::Vector{IR.Statement}, values::Dict{Symbol, Int}, E::Elements)::Vector{IR.Statement}
-  #= a tuple as a root expression is the targets of an assignment =#
-  local g = e::IR.Expression -> withoutEmptyTargets(scalarExpression(e, values, E))
-  return IR.Statement[scalarReinit(mapRoots(g, s), values, E) for s in body]
+  return IR.Statement[elementTriggers(scalarReinit(s, values, E)) for s in rootsScalarized(body, values, E, NO_BOUND_NAMES)]
 end
+
+"""
+`body` with the root expressions of its statements scalarized (`scalarExpression`, as `mapRoots` applies it), also in
+nested statements; in a for-statement's body with its iterator among the names `bound`.
+"""
+function rootsScalarized(body::Vector{IR.Statement}, values::Dict{Symbol, Int}, E::Elements,
+                         bound::Set{Symbol})::Vector{IR.Statement}
+  #= a tuple as a root expression is the targets of an assignment =#
+  local g::Function = (e::IR.Expression) -> withoutEmptyTargets(scalarExpression(e, values, E; bound))
+  return IR.Statement[rootsScalarized(g, s, values, E, bound) for s in body]
+end
+rootsScalarized(g::Function, s::IR.FOR_STATEMENT, values::Dict{Symbol, Int}, E::Elements, bound::Set{Symbol})::IR.Statement =
+  IR.FOR_STATEMENT(IR.Iterator(s.iterator.name, g(s.iterator.range)),
+                   rootsScalarized(s.body, values, E, union(bound, (s.iterator.name,))), s.source)
+rootsScalarized(g::Function, s::IR.IF_STATEMENT, values::Dict{Symbol, Int}, E::Elements, bound::Set{Symbol})::IR.Statement =
+  IR.IF_STATEMENT(IR.StatementBranch[IR.StatementBranch(g(b.condition), rootsScalarized(b.body, values, E, bound))
+                                     for b in s.branches],
+                  rootsScalarized(s.elseBody, values, E, bound), s.source)
+rootsScalarized(g::Function, s::IR.WHILE_STATEMENT, values::Dict{Symbol, Int}, E::Elements, bound::Set{Symbol})::IR.Statement =
+  IR.WHILE_STATEMENT(g(s.condition), rootsScalarized(s.body, values, E, bound), s.source)
+rootsScalarized(g::Function, s::IR.WHEN_STATEMENT, values::Dict{Symbol, Int}, E::Elements, bound::Set{Symbol})::IR.Statement =
+  IR.WHEN_STATEMENT(IR.WhenBranch[IR.WhenBranch(IR.Expression[g(t) for t in b.triggers], b.atInitial, b.atTerminal,
+                                                rootsScalarized(b.body, values, E, bound)) for b in s.branches],
+                    s.source)
+rootsScalarized(g::Function, s::IR.Statement, ::Dict{Symbol, Int}, ::Elements, ::Set{Symbol})::IR.Statement = mapRoots(g, s)
+
+"""
+    elementTriggers(triggers) -> Vector{Expression}
+
+The triggers of a scalarized when-branch with each trigger that is an array (`when b`, `b` a Boolean array: `{b[1],
+b[2]}` scalarized) as its elements, each a trigger: the when fires at each element's rising edge (MLS 8.3.5.1), as the
+lowering splits a vector condition (`whenBranch`) and the frontend's scalarization writes it. Kept as one trigger, a
+one-element array `{pre_reset[1]}` (MSL RadioButtonSource's `when pre_reset`) was no Boolean the MTK route's events
+read: the event iteration did not settle at the initialization.
+"""
+function elementTriggers(triggers::Vector{IR.Expression})::Vector{IR.Expression}
+  local out::Vector{IR.Expression} = IR.Expression[]
+  foreach(t -> elementTriggers!(out, t), triggers)
+  return out
+end
+elementTriggers!(out::Vector{IR.Expression}, t::IR.ARRAY)::Nothing = (foreach(e -> elementTriggers!(out, e), t.elements); nothing)
+elementTriggers!(out::Vector{IR.Expression}, @nospecialize(t::IR.Expression))::Nothing = (push!(out, t); nothing)
+"A when-statement with its branches' triggers as `elementTriggers`; another statement as it is."
+elementTriggers(s::IR.WHEN_STATEMENT)::IR.Statement =
+  IR.WHEN_STATEMENT(IR.WhenBranch[IR.WhenBranch(elementTriggers(b.triggers), b.atInitial, b.atTerminal, b.body)
+                                  for b in s.branches], s.source)
+elementTriggers(s::IR.Statement)::IR.Statement = s
 
 """
     elementAssignments(body, E) -> Vector{Statement}
