@@ -451,6 +451,6 @@ function _resolveAlgebraics!(integrator, alg = nothing)
     (mm isa LinearAlgebra.UniformScaling || all(!iszero, LinearAlgebra.diag(mm))) && return true
   end
   alg === nothing ? DiffEqBase.initialize_dae!(integrator, EventReinit()) : _eventReinit!(integrator, alg)
-  _derivativeDiscontinuity!(integrator, true)
+  SciMLBase.derivative_discontinuity!(integrator, true)
   return integrator.sol.retcode != ModelingToolkit.SciMLBase.ReturnCode.InitialFailure
 end

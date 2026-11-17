@@ -46,6 +46,12 @@
   the top-level OMJL test suite at /test/runtests.jl.
 =#
 
+#= OMBACKEND_TEST_GROUP: "all" (the default) or "platform". CI runs "platform" on macOS and Windows: everything but
+   the array path's models (arrayPathTests.jl, about 80% of the suite's time), generated Julia code that runs the
+   same on every platform; Linux runs all of it. =#
+const TEST_GROUP = get(ENV, "OMBACKEND_TEST_GROUP", "all")
+TEST_GROUP in ("all", "platform") || error("Unknown OMBACKEND_TEST_GROUP: $(TEST_GROUP)")
+
 # On Windows, a failed DLL load or a segfault in external Modelica C functions
 # opens a modal Windows Error Reporting dialog. On a headless CI runner nothing
 # clicks it away, so the test process hangs until the job timeout (a silent
@@ -382,7 +388,7 @@ import .ExampleModels
   include("solveKwargsTests.jl")
 
   #= ── 19. Array-preserving code generation (no-scalarize models) ─ =#
-  include("arrayPathTests.jl")
+  TEST_GROUP == "all" && include("arrayPathTests.jl")
   include("simCodeArraysTests.jl")
 
   #= ── 20. The initialization's one-unknown rows ──────────────────── =#

@@ -269,7 +269,7 @@ function withAssertCallback(callbacks, problem, asserts::Vector; discrete::Vecto
   local crossingAffect! = function (integrator, which)
     local fired = which isa Integer ? [which] : [j for (j, d) in enumerate(which) if d != 0]
     foreach(i -> checkOne!(integrator, i, false, true), unique(first(crossing[j]) for j in fired))
-    DiffEqBase.u_modified!(integrator, false)
+    SciMLBase.derivative_discontinuity!(integrator, false)
   end
   local zc = DiffEqBase.VectorContinuousCallback(crossingCondition, crossingAffect!, length(crossing);
                                                  rootfind = ModelingToolkit.SciMLBase.RightRootFind,

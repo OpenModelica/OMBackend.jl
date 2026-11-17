@@ -27,9 +27,33 @@ end
 _arrayPathTaken(name) = name in OMBackend.ARRAY_ODE_MODELS
 _values(sol, names) = [OMBackend.getVariableValues(sol, n)[end] for n in names]
 
+include("arrayPathReferences.jl")
+
+"The key of a comparison in `SCALARIZED_REFERENCES`: the model, the names, the interval and the solver options."
+function _referenceKey(model::String, names::Vector{String}, tspan::Tuple{Float64, Float64}, kwargs)::String
+  return string(model, " | ", join(names, ", "), " | ", tspan, " | ", join(sort!(["$k = $v" for (k, v) in kwargs]), ", "))
+end
+
+"""
+The scalarizing path's values of `names` at the end of `tspan`, as recorded in `SCALARIZED_REFERENCES`
+(arrayPathReferences.jl), so that each model is built once, on the array path. A comparison not recorded builds the
+scalarizing path (`build()`), fails, and prints the entry to add.
+"""
+function _scalarizedReference(build::F, model::String, names::Vector{String}, tspan, kwargs)::Vector{Float64} where {F <: Function}
+  local key::String = _referenceKey(model, names, (Float64(tspan[1]), Float64(tspan[2])), kwargs)
+  haskey(SCALARIZED_REFERENCES, key) && return SCALARIZED_REFERENCES[key]
+  local s::Vector{Float64} = build()
+  @error "No recorded scalarized values; add to arrayPathReferences.jl:\n  $(repr(key)) => $(repr(s)),"
+  @test haskey(SCALARIZED_REFERENCES, key)
+  return s
+end
+
 function _bothWays(model, names; tspan = (0.0, 1.0), kwargs...)
-  local name = _arrayPathTranslate(model; scalarized = true)
-  local s::Vector{Float64} = _values(OMBackend.simulateModel(name; tspan = tspan, kwargs...), names)
+  local name = OMBackend.canonicalName(model)
+  local s::Vector{Float64} = _scalarizedReference(model, names, tspan, kwargs) do
+    _arrayPathTranslate(model; scalarized = true)
+    return _values(OMBackend.simulateModel(name; tspan = tspan, kwargs...), names)
+  end
   _arrayPathTranslate(model; scalarized = false)
   @test _arrayPathTaken(name)
   local sol::OMBackend.DifferentialEquations.SciMLBase.AbstractODESolution = OMBackend.simulateModel(name; tspan = tspan, kwargs...)
@@ -42,8 +66,11 @@ end
 scalarizing path and on the array path (which the model must take), and the array path's solution.
 """
 function _bothWaysOf(program, model::String, names::Vector{String}; tspan = (0.0, 1.0), kwargs...)
-  local name::String = _translateProgram(program, model; scalarized = true)
-  local s::Vector{Float64} = _values(OMBackend.simulateModel(name; tspan = tspan, kwargs...), names)
+  local name::String = OMBackend.canonicalName(model)
+  local s::Vector{Float64} = _scalarizedReference(model, names, tspan, kwargs) do
+    _translateProgram(program, model; scalarized = true)
+    return _values(OMBackend.simulateModel(name; tspan = tspan, kwargs...), names)
+  end
   _translateProgram(program, model; scalarized = false)
   @test _arrayPathTaken(name)
   local sol = OMBackend.simulateModel(name; tspan = tspan, kwargs...)

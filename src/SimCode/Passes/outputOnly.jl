@@ -209,7 +209,7 @@ function occursLinearly(@nospecialize(e::Exp), name::String)::Tuple{Bool, Bool}
   return (occurs, !occurs)
 end
 
-"Whether `name` appears in the residual `e`, affinely: the observed equation solves it linearly (Symbolics.solve_for)."
+"Whether `name` appears in the residual `e`, affinely: the observed equation solves it linearly (Symbolics.symbolic_linear_solve)."
 isLinearlySolvableFor(e::Exp, name::String)::Bool = occursLinearly(e, name) == (true, true)
 
 #= ==================================================================================== =#

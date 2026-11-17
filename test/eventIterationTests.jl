@@ -6,9 +6,9 @@ becomes true in the first pass, and only the second pass (pre(stuck) = true)
 sets `locked`. A one-pass affect never locks the freewheel.
 =#
 module _EventIterationEval
-  #= The generated affect calls SciMLBase.u_modified!; record it instead. =#
+  #= The generated affect calls SciMLBase.derivative_discontinuity!; record it instead. =#
   module SciMLBase
-    u_modified!(integrator, flag) = (integrator.flagged[] = flag)
+    derivative_discontinuity!(integrator, flag) = (integrator.flagged[] = flag)
   end
 end
 

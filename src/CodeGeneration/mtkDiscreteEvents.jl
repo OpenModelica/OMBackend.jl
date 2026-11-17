@@ -573,7 +573,7 @@ function _eventIterAffectParts(assigns::Vector{Tuple{Symbol, SC.Exp, Bool}}, sim
                     $(passes)
                     #= The integrator must see the change (Rosenbrock and multistep
                        methods would otherwise keep the old discrete in their history). =#
-                    SciMLBase.u_modified!(integrator, true)
+                    SciMLBase.derivative_discontinuity!(integrator, true)
                     $(retNT)
                   end)
   local obsNT = Expr(:tuple, Expr(:parameters, [Expr(:kw, k, v) for (k, v) in obsAcc]...))
