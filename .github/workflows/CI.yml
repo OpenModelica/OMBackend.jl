@@ -102,6 +102,10 @@ jobs:
 
       - name: Run tests
         uses: julia-actions/julia-runtest@v1
+        env:
+          # the whole suite (and coverage) on Linux; macOS and Windows run the
+          # platform group: all but the array path's models (test/runtests.jl)
+          OMBACKEND_TEST_GROUP: ${{ runner.os == 'Linux' && 'all' || 'platform' }}
         with:
           project: OMBackend.jl
           # Coverage forces --pkgimages=no, which rejects the warm depot cache
