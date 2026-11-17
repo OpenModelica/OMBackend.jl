@@ -19,7 +19,9 @@ import OMBackend
   lookup = CG.ConstTableLookupFn([1.0, 2.0])
   print(join((hash(f), hash(w), hash(term), hash(lookup)), " "))
   """
-  local runOnce() = read(`$(Base.julia_cmd()) --startup-file=no --project=$(Base.active_project()) -e $script`, String)
+  #= the child loads this process's package images: their CPU target (JULIA_CPU_TARGET, as Julia's precompile
+     workers), not julia_cmd()'s default `-C native` =#
+  local runOnce() = read(`$(Base.julia_cmd(; cpu_target = get(ENV, "JULIA_CPU_TARGET", nothing))) --startup-file=no --project=$(Base.active_project()) -e $script`, String)
   local first, second = runOnce(), runOnce()
   @test length(split(first)) == 4
   @test first == second
