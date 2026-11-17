@@ -194,7 +194,7 @@ function _translateKept(fm::F.FlatModel, model::OMJLIR.Model, path::String, subj
     local result::Tuple{String, Expr} =
       translate(fm; functionList, BackendMode, warnMissingStartValues, eliminateNonDynamic, observedFilter,
                 checkSimCode, omjlir = model)
-    (BackendMode == IMTK_MODE && !haskey(IMTKGen.BUILT, name)) || return result
+    (BackendMode == IMTK_MODE && !haskey(IMTKGen.BUILT, name) && !(name in IMTKGen.BUILT_AT_SIMULATE)) || return result
     reason = "does not build"
   catch err
     isFatal(err) && rethrow()

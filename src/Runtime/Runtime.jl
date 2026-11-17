@@ -391,11 +391,11 @@ function solve(omProblem::OM_ProblemStructural, tspan, alg; kwargs...)
             local u0Dict = _buildTransferU0Dict(newSystem, oldSystem, integrator,
                                                 cb.name, activeModeName,
                                                 omProblem.topVariables)
+            #= MTK 10+: one operating point, the inherited unknowns and the new mode's parameter values =#
             local daeProb = ModelingToolkit.ODEProblem(
               newSystem.f.sys,
-              u0Dict,
-              (i.t, tspan[2]),
-              newSystem.p;
+              merge(u0Dict, _parameterValues(newSystem)),
+              (i.t, tspan[2]);
               build_initializeprob = true,
               warn_initialize_determined = false,
               callback = CallbackSet(cb.systemSpecificCallbacks, omProblem.callbackConditions...)
@@ -499,6 +499,17 @@ function _isDAETransferTarget(newSystem)::Bool
     OMBackend._fallback(err, :vssMassMatrix)
     return false
   end
+end
+
+"""
+    _parameterValues(problem::ODEProblem) -> Dict{Any, Any}
+
+The values of the parameters of the MTK system of `problem` in `problem.p` (symbolic indexing), for the operating
+point of a problem rebuilt from that system (`ODEProblem(sys, op, tspan)`).
+"""
+function _parameterValues(problem::ODEProblem)::Dict{Any, Any}
+  local sys = problem.f.sys
+  return Dict{Any, Any}(p => problem.ps[p] for p in ModelingToolkit.parameters(sys))
 end
 
 """
@@ -676,8 +687,9 @@ function _switchMode(change::AbstractStructuralChange, problem::ODEProblem, inte
   _fill_observed_u0!(newU0, oldSyms, newProblem, change.solutionAtChange)
   @VSS_DEBUG @info "[solve OM_ProblemRecompilation] new u0" newU0 anyNaN = any(isnan, newU0)
   #= In the latest world, as the steps: init runs the new mode's callbacks' initialization (a table's time events). =#
+  #= the solver options (`kwargs`: tolerances) go to init; reinit! takes none of them =#
   local newIntegrator::DEIntegrator = Base.invokelatest(init, newProblem, alg; force_dtmin = true, kwargs...)
-  Base.invokelatest(reinit!, newIntegrator, newU0; t0 = tChange, tf = last(tspan), reset_dt = true, kwargs...)
+  Base.invokelatest(reinit!, newIntegrator, newU0; t0 = tChange, tf = last(tspan), reset_dt = true)
   #= The structural event may trigger again in this step: reset after it. =#
   newIntegrator.dt = min(newIntegrator.dt, 1e-6)
   Base.invokelatest(step!, newIntegrator, newIntegrator.dt, true)

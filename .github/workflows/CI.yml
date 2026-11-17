@@ -71,14 +71,47 @@ jobs:
           version: ${{ matrix.version }}
           arch: ${{ matrix.arch }}
 
+      # Master (pushes, the nightly) restores and saves the depot cache: the
+      # artifact store, package store, registries and the compiled-modules
+      # directory. The compiled cache is the biggest warm-run win - without it
+      # precompile reruns from scratch.
       - name: Cache Julia depot
+        if: github.event_name != 'pull_request'
         uses: julia-actions/cache@v2
         with:
-          # Cache the artifact store, package store, registries and the
-          # compiled-modules directory. The compiled cache is the biggest
-          # warm-run win - without it precompile reruns from scratch.
           cache-name: ombackend
           include-matrix: true
+
+      # A pull request restores master's cache and saves none: each PR run
+      # saved 0.8-2.6 GB per OS, the repository went over its 10 GB and GitHub
+      # evicted master's caches. The paths and the key prefix are those of
+      # julia-actions/cache above (a cache is found only under the same paths).
+      - name: Depot cache paths (pull request)
+        if: github.event_name == 'pull_request'
+        id: depot
+        shell: bash
+        run: |
+          if [[ "$OSTYPE" == "msys" || "$OSTYPE" == "cygwin" ]]; then
+            depot="${USERPROFILE//\\//}/.julia"
+          else
+            depot="$HOME/.julia"
+          fi
+          {
+            echo "paths<<EOF"
+            printf "%s\n" "$depot/artifacts" "$depot/packages" "$depot/registries" "$depot/compiled" \
+                          "$depot/scratchspaces" "$depot/logs"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+          echo "key=ombackend;os=${{ runner.os }};os=${{ matrix.os }};arch=${{ matrix.arch }};version=${{ matrix.version }};" >> "$GITHUB_OUTPUT"
+
+      - name: Restore Julia depot from master (pull request)
+        if: github.event_name == 'pull_request'
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ steps.depot.outputs.paths }}
+          key: ${{ steps.depot.outputs.key }}
+          restore-keys: ${{ steps.depot.outputs.key }}
+          enableCrossOsArchive: false
 
       - name: Add OpenModelica Julia registry
         shell: julia --color=yes {0}
@@ -86,6 +119,8 @@ jobs:
           import Pkg
           Pkg.Registry.add("General")
           Pkg.Registry.add(Pkg.RegistrySpec(url = "https://github.com/OpenModelica/OpenModelicaRegistry.git"))
+          # a restored registry is as old as its cache (julia-actions/cache updates it on master; a PR's restore does not)
+          Pkg.Registry.update()
 
       - name: Develop the sibling checkouts
         shell: julia --color=yes --project=OMBackend.jl {0}
@@ -99,6 +134,22 @@ jobs:
         uses: julia-actions/julia-buildpkg@v1
         with:
           project: OMBackend.jl
+
+      # Which of our packages the restored depot has precompiled for the test
+      # run (its flags: coverage on Linux), and why a cache is rejected
+      # (JULIA_DEBUG=loading: "Rejecting ... because ..."). Unchanged siblings
+      # should come from the cache; OMBackend itself is rebuilt when it changed.
+      - name: Precompile cache report
+        shell: bash
+        env:
+          JULIA_DEBUG: loading
+          COVERAGE_FLAG: ${{ runner.os == 'Linux' && format('--code-coverage=@{0}/OMBackend.jl', github.workspace) || '' }}
+        run: |
+          julia --color=yes --project=OMBackend.jl --depwarn=yes $COVERAGE_FLAG -e '
+            for name in ("ImmutableList", "MetaModelica", "OMParser", "OMFrontend", "OMRuntimeExternalC", "OMBackend")
+              local id = Base.identify_package(name)
+              println(name, ": ", Base.isprecompiled(id; ignore_loaded = true) ? "cached" : "to precompile")
+            end'
 
       - name: Run tests
         uses: julia-actions/julia-runtest@v1
