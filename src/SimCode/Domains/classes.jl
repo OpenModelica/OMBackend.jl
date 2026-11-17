@@ -1804,17 +1804,45 @@ a loop of MSL's LightningSegmentedTransmissionLine, "relations in an algebraic l
 `blockSolve!` evaluates relations, the generated Newton of a family does not, and such a relation has one value
 while the loop is solved. Not one with a relation on the loop's variables: routed here, MSL OpAmps' SignalGenerator
 settled at the unstable root of its comparator (v_out = 0, no oscillation), DCPM_withLosses and PumpingSystem
-equalled the scalarized route.
+equalled the scalarized route. A smaller loop with an equation that divides by one of its unknowns
+(`_dividesByBlockUnknowns`) is torn too, as omc's strict tearing never solves by dividing by a loop variable: the
+generated Newton starts every unknown at its start value, 0 without one, and MSL HeatingRectifier's diode
+`exp(v / (N * vt_t))` was NaN at vt_t = 0 (torn, vt_t is computed from the temperature).
 """
 function _largeBlocks(g::Gen, loops::LoopBlocks, matchRow::Vector{Int}, el::InstanceTable)::BitVector
   local large::BitVector =
-    BitVector(length(b) > NEWTON_BLOCK_SIZE[] || _timeRelationsOnly(g, b, el) for b in loops.blocks)
+    BitVector(length(b) > NEWTON_BLOCK_SIZE[] || _timeRelationsOnly(g, b, el) || _dividesByBlockUnknowns(g, b, el, matchRow)
+              for b in loops.blocks)
   for (b, rs) in enumerate(loops.blocks)
     large[b] || continue
     local k::Union{Nothing, Int} = findfirst(r::Int -> matchRow[r] > g.nStates + g.nAlg, rs)
     k === nothing || ns("a discrete unknown in an algebraic loop: " * first(g.classes[el.class[rs[k]]].text, 120))
   end
   return large
+end
+
+"""
+Whether `x` divides by what reads an unknown of an algebraic loop (`reads(r)`: the access `r` may be one, as for
+`_piecewiseInUnknowns`). Relations and event-generating functions hold their values in the loop's solve: not
+searched.
+"""
+function _dividesByUnknowns(x::IR, reads::F)::Bool where {F <: Function}
+  x isa Op || return false
+  x.op == :/ && length(x.args) == 2 && any(reads, accesses!(Ref[], x.args[2])) && return true
+  return any(a::IR -> _dividesByUnknowns(a, reads), x.args)
+end
+
+"""
+Whether an equation of the block `rows` divides by one of the block's unknowns (`_dividesByUnknowns`). The unknowns
+(`_unknownVariables`, a walk over all variables) are found only for a block with a divisor that reads a variable.
+"""
+function _dividesByBlockUnknowns(g::Gen, rows::Vector{Int}, el::InstanceTable, matchRow::Vector{Int})::Bool
+  local classes::Vector{EqClass} = EqClass[g.classes[ci] for ci in Set{Int}(el.class[r] for r in rows if el.class[r] > 0)]
+  local anyVariable::Function = (r::Ref) -> !_parametersOnly(g, r)
+  any(c::EqClass -> _dividesByUnknowns(c.lhs, anyVariable) || _dividesByUnknowns(c.rhs, anyVariable), classes) || return false
+  local unknowns::Set{Tuple{String, Bool}} = _unknownVariables(g, Int[matchRow[r] for r in rows])
+  local reads::Function = (r::Ref) -> (r.name, r.der) in unknowns
+  return any(c::EqClass -> _dividesByUnknowns(c.lhs, reads) || _dividesByUnknowns(c.rhs, reads), classes)
 end
 
 """

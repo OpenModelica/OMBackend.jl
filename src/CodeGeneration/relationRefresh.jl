@@ -928,9 +928,9 @@ end
 
 At a solve's start (a callback's `initialize`, before OrdinaryDiffEq sizes the first step): the first step
 (`_finiteInitialStep`) where OrdinaryDiffEq's estimate is not finite, set as a given one; nothing otherwise, nor for
-a given step.
+a given step. Another solver's integrator (Sundials' IDA, which has no `opts.adaptive`) sizes its first step itself.
 """
-function _finiteFirstStep!(integrator)::Nothing
+function _finiteFirstStep!(integrator::OrdinaryDiffEq.OrdinaryDiffEqCore.ODEIntegrator)::Nothing
   (iszero(integrator.dt) && integrator.opts.adaptive && !isempty(integrator.opts.tstops)) || return nothing
   local estimate::Float64 = OrdinaryDiffEq.OrdinaryDiffEqCore._determine_initdt(integrator)
   isfinite(estimate) && return nothing
@@ -940,6 +940,7 @@ function _finiteFirstStep!(integrator)::Nothing
   integrator.dtpropose = dt
   return nothing
 end
+_finiteFirstStep!(::ModelingToolkit.SciMLBase.DEIntegrator)::Nothing = nothing
 
 """
 The length of an event's instant at `t`: crossings closer than this coincide (`_TIME_EVENT_AHEAD`).

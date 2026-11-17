@@ -827,10 +827,13 @@ end
 
 """
 An argument's values (onto `out`): a record literal's fields each (a generated function takes a record by its fields,
-`R_T`, `R_w`: `generateIOL`), an array's or a scalar's value (`_valueIRx`).
+`R_T`, `R_w`: `generateIOL`), a call returning an array of records its outputs, the fields' arrays, spread
+(`_recordArrayCallIRx`), an array's or a scalar's value (`_valueIRx`).
 """
 function _argumentsIRx!(out::Vector{IR}, g::Gen, a::SC.Exp, ctx::Ctx)::Nothing
-  if a isa SC.RECORD
+  if _isFunctionCall(g, a) && _recordArrayFieldCount(a.ty) > 0
+    push!(out, _recordArrayCallIRx(g, a::SC.CALL, ctx))
+  elseif a isa SC.RECORD
     for x in a.exps
       (x isa SC.RECORD || (x isa SC.EXP_CREF && x.ty isa SC.TYPE_COMPLEX)) && ns("a record argument with record fields: $(_str(a))")
       push!(out, _valueIRx(g, x, ctx))
@@ -884,20 +887,47 @@ function _partialApplicationIRx(g::Gen, e::SC.PARTEVALFUNCTION, ctx::Ctx)::IR
 end
 
 """
-A call of a Modelica function of the model (`_isFunctionCall`) as its value: its arguments' values
-(`_argumentsIRx!`); of a function of more outputs typed as its first, that output; of a record result the tuple of
-its fields (and the outputs after it).
+A call of a Modelica function of the model (`_isFunctionCall`) as its value (`_allOutputsCallIRx`); of a function of
+more outputs typed as its first, that output; of a record result the tuple of its fields (and the outputs after it).
 """
 function _functionCallIRx(g::Gen, e::SC.CALL, ctx::Ctx)::IR
-  local jn::String = String(e.name)
+  local call::IR = _allOutputsCallIRx(g, e, ctx)
+  #= the outputs counted as returned, a record by its fields (generateIOL): a record result is the tuple's first =#
+  g.functions[String(e.name)] > 1 && !(e.ty isa SC.TYPE_TUPLE || (e.ty isa SC.TYPE_COMPLEX && e.ty.isRecord)) &&
+    (call = Op(:index, IR[call, Lit(1)]))
+  return call
+end
+
+"A call of a Modelica function of the model (`_isFunctionCall`) with its arguments' values (`_argumentsIRx!`): all its outputs, as returned."
+function _allOutputsCallIRx(g::Gen, e::SC.CALL, ctx::Ctx)::IR
   local callArgs::Vector{IR} = IR[]
   for a in e.args
     _argumentsIRx!(callArgs, g, a, ctx)
   end
-  local call::IR = Op(:fcall, IR[Lit(Symbol(jn)), callArgs...])
-  #= the outputs counted as returned, a record by its fields (generateIOL): a record result is the tuple's first =#
-  g.functions[jn] > 1 && !(e.ty isa SC.TYPE_TUPLE || (e.ty isa SC.TYPE_COMPLEX && e.ty.isRecord)) && (call = Op(:index, IR[call, Lit(1)]))
-  return call
+  return Op(:fcall, IR[Lit(Symbol(String(e.name))), callArgs...])
+end
+
+"""
+The number of fields of the records of an array of records without record fields (`Complex[n]`); 0 for another type.
+"""
+function _recordArrayFieldCount(ty::SC.SType)::Int
+  (ty isa SC.TYPE_ARRAY && ty.elementType isa SC.TYPE_COMPLEX && ty.elementType.isRecord) || return 0
+  any((t::SC.SType) -> t isa SC.TYPE_COMPLEX, ty.elementType.fieldTypes) && return 0
+  return length(ty.elementType.fieldNames)
+end
+
+"""
+    _recordArrayCallIRx(g, e, ctx) -> IR
+
+A call returning an array of records as an argument of a function: the generated function returns the records' fields'
+arrays in place (generateIOL), one argument each of the callee (`flattenRecordInput`), spread (`Op(:splat)`): the call
+runs once. NotSupported where the function has outputs after the records.
+"""
+function _recordArrayCallIRx(g::Gen, e::SC.CALL, ctx::Ctx)::IR
+  local nFields::Int = _recordArrayFieldCount(e.ty)
+  g.functions[String(e.name)] == nFields ||
+    ns("a call of $(e.name) returning an array of records and further outputs as an argument")
+  return Op(:splat, IR[_allOutputsCallIRx(g, e, ctx)])
 end
 
 """

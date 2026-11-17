@@ -758,6 +758,18 @@ end
       local literal = _IRd.instantiated(template, whole, shifted)
       @test literal isa I.ARRAY && length(literal.elements) == 3
       @test string(literal.elements[2]) == string(I.BINARY(ref(:v, I.Subscript[I.INDEX(I.INTEGER(2))]), I.ADD, I.REAL(1.0), I.T_REAL()))
+      #= the scalarized model's when-triggers: `when b` on a Boolean vector is one trigger per element (MLS 8.3.5.1),
+         as the lowering splits them; the array was one trigger (MSL RadioButtonSource's `when reset`) =#
+      local bvec2 = I.T_ARRAY(I.T_BOOLEAN(), I.Dimension[I.DIM_SIZE(2)])
+      local bref = (k::Int) -> I.CREF(I.ComponentRef(I.CrefPart[I.CrefPart(:b, I.Subscript[I.INDEX(I.INTEGER(k))], I.T_BOOLEAN())]), I.T_BOOLEAN())
+      local whenStatement = I.WHEN_STATEMENT(I.WhenBranch[I.WhenBranch(I.Expression[I.ARRAY(I.Expression[bref(1), bref(2)], bvec2), bref(1)],
+                                                                    false, false, I.Statement[])], I.NO_SOURCE)
+      @test string.(_IRd.elementTriggers(whenStatement).branches[1].triggers) == string.([bref(1), bref(2), bref(1)])
+      #= a for-statement's iterator shadows a variable of its name (MLS 11.2.2.1): a reference to it, one part without
+         subscripts, stays the iterator's =#
+      local iref = I.CREF(I.ComponentRef(I.CrefPart[I.CrefPart(:i, I.Subscript[], I.T_INTEGER())]), I.T_INTEGER())
+      @test _IRd.isBoundIterator(iref, Set{Symbol}([:i])) && !_IRd.isBoundIterator(iref, _IRd.NO_BOUND_NAMES)
+      @test !_IRd.isBoundIterator(ref(:v, I.Subscript[I.INDEX(it)]), Set{Symbol}([:v]))
     end
     #= translated with the arrays kept: the results of the scalarized model =#
     withenv("OMBACKEND_ARRAY_INDEX_REDUCTION" => "true") do

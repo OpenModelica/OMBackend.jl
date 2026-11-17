@@ -80,7 +80,8 @@ What the front half does not (yet) handle it reports with the reason, and the ca
 module ArrayODEGen
 
 import ModelingToolkit
-import ..CodeGeneration: stripBeginBlocks, ModelicaAssertionError, solveStoppedAtStart, _autoDtReset!, _finiteFirstStep!
+import ..CodeGeneration: stripBeginBlocks, ModelicaAssertionError, solveStoppedAtStart, _autoDtReset!, _finiteFirstStep!,
+  ode_to_dae
 import ..CodeGeneration: DelayState, delayedValue, emptyDelayHistories!, startDelayHistories!, recordDelayStepEnd!,
   recordDelayJumps!, delayJumpsDue!
 import ...Passes
@@ -95,10 +96,52 @@ import ...SimCode.Domains: DomainSystem, InstanceTable, EqClass, EvFn, Gen, IR, 
   domainSystem, ns, Schedule, causalSchedule!, ParameterBinding, parameterBindings, _bindingDeps, InitialSystem
 
 const SII = ModelingToolkit.SymbolicIndexingInterface
-import ..CodeGeneration: NonlinearSolve, ADTypes
+import ..CodeGeneration: NonlinearSolve, ADTypes, DiffEqBase
 
 include("arrayBlockSolve.jl")
 include("arrayInitialBlocks.jl")
+
+"""
+The array model's ODE `prob` (mass matrix I: its algebraic loops are solved in the right-hand side) as the problem
+`solver` takes: for a DAE solver (DFBDF, Sundials' IDA) the residual form `du - f(u) = 0` (`ode_to_dae`, as the
+scalarized path's), for an ODE solver the ODE. A DAE solver got the ODE: "Incompatible problem+solver pairing".
+"""
+_problemFor(prob::ModelingToolkit.SciMLBase.ODEProblem,
+            ::ModelingToolkit.SciMLBase.AbstractDAEAlgorithm)::ModelingToolkit.SciMLBase.DAEProblem = ode_to_dae(prob)
+_problemFor(prob::ModelingToolkit.SciMLBase.ODEProblem, ::Any)::ModelingToolkit.SciMLBase.ODEProblem = prob
+
+"""
+The initialization a solve of `prob` (`_problemFor`) takes unless the caller gives one (`kwargs`): for the residual
+form Brown's, the derivatives solved again from the residual at the values the model's initialization or an event left
+(as the scalarized path's `defaultInitializeKwargs`); the DAE solvers' default only checks them, and failed after a
+reinit (residual 0.71). The ODE needs none.
+"""
+function _initializeKwargs(::ModelingToolkit.SciMLBase.DAEProblem, kwargs::Base.Pairs,
+                           abstol::Union{Real, AbstractVector{<:Real}})::NamedTuple
+  haskey(kwargs, :initializealg) && return (;)
+  return (; initializealg = DiffEqBase.BrownFullBasicInit(Float64(abstol isa Real ? abstol : minimum(abstol))))
+end
+_initializeKwargs(::ModelingToolkit.SciMLBase.ODEProblem, ::Base.Pairs, ::Union{Real, AbstractVector{<:Real}})::NamedTuple =
+  (;)
+
+"The points of a step at which the relations' crossing functions are checked (their callback's `interp_points`), its ends included."
+const RELATION_CHECKS = 10
+
+"OpenModelica's output intervals of a simulation (numberOfIntervals): it checks the crossing functions at each."
+const OUTPUT_INTERVALS = 500
+
+"""
+The largest step of a solve over `tspan` of a model with `nRelations` relations, unless the caller gives one (`kwargs`):
+the crossing functions checked (RELATION_CHECKS per step) at least as often as OpenModelica checks them, at each of its
+OUTPUT_INTERVALS output points (at least 56 steps a solve). The states of a clutch held stuck by a sine torque stay
+constant, and the steps grew to 9 s: the stuck torque's excesses over the breakaway limit (0.31 s each,
+FrictionEvents.Narrow) fell between the checks.
+"""
+function _stepKwargs(kwargs::Base.Pairs, tspan::Tuple{Real, Real}, nRelations::Int)::NamedTuple
+  local span::Float64 = abs(Float64(tspan[2]) - Float64(tspan[1]))
+  (nRelations == 0 || span == 0.0 || haskey(kwargs, :dtmax)) && return (;)
+  return (; dtmax = (RELATION_CHECKS - 1) * span / OUTPUT_INTERVALS)
+end
 
 #= The parameter argument of an array model's problem: the parameter values (one flat
    vector, laid out by the model's PARAMETER_LAYOUT; one type for every array model, so the
@@ -731,8 +774,9 @@ function _variableValues(sol, name::String)
 end
 
 #= The symbolic system of an array model's ODEFunction: names for solution indexing
-   (sol[:x], sol(t; idxs = Symbol("c[2].T"))), states as variables, algebraic and discrete
-   variables and parameters as observed. Names as Modelica writes them or canonical (c[2]_T). =#
+   (sol[:x], sol(t; idxs = Symbol("c[2].T")), sol.ps[:k]), states as variables, algebraic and discrete
+   variables as observed, parameters as parameters (their values in p.values). Names as Modelica writes them or
+   canonical (c[2]_T). =#
 struct ArraySystem
   states::Dict{Symbol, Int}
   stateSyms::Vector{Symbol}
@@ -784,12 +828,23 @@ SII.constant_structure(::ArraySystem) = true
 SII.is_variable(sys::ArraySystem, x) = (s = _sym(x); s !== nothing && haskey(_states(sys), s))
 SII.variable_index(sys::ArraySystem, x) = (s = _sym(x); s === nothing ? nothing : get(_states(sys), s, nothing))
 SII.variable_symbols(sys::ArraySystem) = getfield(sys, :stateSyms)
-SII.is_parameter(::ArraySystem, x) = false
-SII.parameter_index(::ArraySystem, x) = nothing
-SII.parameter_symbols(::ArraySystem) = Symbol[]
+#= the parameters by their position in p.values (`sol.ps[:k]`, as of the ModelingToolkit path's solution) =#
+SII.is_parameter(sys::ArraySystem, x) = _parameterPosition(sys, x) !== nothing
+SII.parameter_index(sys::ArraySystem, x) = _parameterPosition(sys, x)
+SII.parameter_symbols(sys::ArraySystem) = Symbol[s for (s, (kind, _)) in _observedIdx(sys) if kind === :param]
+SII.parameter_values(p::ArrayModelParameters, i::Int) = p.values[i]
 SII.is_independent_variable(::ArraySystem, x) = x === :t || x === :time
 SII.independent_variable_symbols(::ArraySystem) = [:t]
-SII.is_observed(sys::ArraySystem, x) = (s = _sym(x); s !== nothing && haskey(_observedIdx(sys), s))
+SII.is_observed(sys::ArraySystem, x) =
+  (s = _sym(x); s !== nothing && haskey(_observedIdx(sys), s) && first(_observedIdx(sys)[s]) !== :param)
+
+"The position in p.values of the parameter `x` of an array model; `nothing` for another name."
+function _parameterPosition(sys::ArraySystem, @nospecialize(x))::Union{Nothing, Int}
+  local s::Union{Nothing, Symbol} = _sym(x)
+  s === nothing && return nothing
+  local entry::Union{Nothing, Tuple{Symbol, Int}} = get(_observedIdx(sys), s, nothing)
+  return (entry === nothing || first(entry) !== :param) ? nothing : last(entry)
+end
 function SII.observed(sys::ArraySystem, x)
   local (kind, i) = _observedIdx(sys)[_sym(x)]
   local model = getfield(sys, :model)
@@ -804,8 +859,9 @@ function SII.observed(sys::ArraySystem, x)
   end
 end
 SII.observed(sys::ArraySystem, x::ArrayVar) = invoke(SII.observed, Tuple{ArraySystem, Any}, sys, x)
-SII.all_variable_symbols(sys::ArraySystem) = vcat(getfield(sys, :stateSyms), collect(keys(_observedIdx(sys))))
-SII.all_symbols(sys::ArraySystem) = vcat(SII.all_variable_symbols(sys), :t)
+SII.all_variable_symbols(sys::ArraySystem) =
+  vcat(getfield(sys, :stateSyms), Symbol[s for (s, (kind, _)) in _observedIdx(sys) if kind !== :param])
+SII.all_symbols(sys::ArraySystem) = vcat(SII.all_variable_symbols(sys), SII.parameter_symbols(sys), :t)
 SII.default_values(::ArraySystem) = Dict()
 
 """
@@ -858,11 +914,13 @@ end
 
 """
 An event-generating function (integer, floor, ceil, div, mod, rem; MLS 3.7.2): its value
-v = floor/ceil/trunc(q) changes only at events (in mode), and then (as a relation, _rel)
-only where q has left the interval that keeps v by more than the hysteresis eps: the state
-just before an event (an interpolation a hair past the boundary) keeps the old value. Two
-crossing functions bound that interval: z[k] crosses where q passes its upper end, z[k + 1]
-its lower end. At the initialization (H = 0) the value is literal.
+v = floor/ceil/trunc(q) changes only at events (in mode), and there it is literal, as
+OpenModelica's `_event_floor` at a discrete call. Two crossing functions bound the interval
+that keeps v, widened by the hysteresis eps: z[k] crosses where q passes its upper end,
+z[k + 1] its lower end. The value kept within eps past the interval's end at an event
+(another relation's) was stale where that relation read it: `DNTime > 24` of `DNTime =
+mod(time, 24)`, `if DNTime > 24 then DNTime = 0` switched back and forth at t = 24 (its
+crossing comes 2e-6 before the mod's: PersonalityAspects).
 """
 _evInterval(kind::Symbol, v) = kind === :floor ? (v, v + 1) : kind === :ceil ? (v - 1, v) :
                                v > 0 ? (v, v + 1) : v < 0 ? (v - 1, v) : (-1.0, 1.0)
@@ -872,10 +930,7 @@ _evInterval(kind::Symbol, v) = kind === :floor ? (v, v + 1) : kind === :ceil ? (
   local (lo, hi) = _evInterval(kind, v)
   if mode
     local literal::Float64 = Float64(kind === :floor ? floor(q) : kind === :ceil ? ceil(q) : trunc(q))
-    #= an argument that jumped exactly onto an end of the interval (`integer(delay(x, T))` of a logic value going
-       from 3 to 4.0: it stays there and never leaves the band) takes its literal value, as a relation at an exact
-       zero (`_relationAt`) =#
-    if p.hyst[1] == 0 || q - hi - eps >= 0 || q - lo + eps < 0 || ((q == hi || q == lo) && literal != v)
+    if literal != v
       v = p.evv[k] = literal
       (lo, hi) = _evInterval(kind, v)
     end
@@ -936,6 +991,12 @@ end
 @inline function _checkedIndex(a::AbstractArray, i::Vararg{Integer, N}) where {N}
   checkbounds(Bool, a, i...) || _indexError(a, i)
   return @inbounds a[i...]
+end
+
+"`t[i]` of a literal tuple (an enumeration's literal names, `String(e)`) by a subscript computed from variable values, checked."
+@inline function _checkedIndex(t::Tuple, i::Integer)
+  (1 <= i <= length(t)) || _subscriptError(Int(i), length(t), "the literals of an enumeration")
+  return @inbounds t[i]
 end
 
 "`a[i...] = v` with subscripts computed from variable values, checked."
@@ -1463,6 +1524,8 @@ function jl(g::Gen, x::IR)
     x.op == :terminal && return :(p.state.terminal)
     x.op == :String && return Expr(:call, _modelicaString, args...)
     x.op == :fcall && return Expr(:call, args...)
+    #= a call's outputs as arguments of an enclosing call (`_recordArrayCallIRx`) =#
+    x.op == :splat && return Expr(:..., args[1])
     if x.op == :partial
       #= a function with inputs bound (`_partialApplicationIRx`): a closure of its free inputs =#
       local freeInputs::Vector{Symbol} = Symbol[]
@@ -2846,12 +2909,11 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
     end
 
     #= The initial algorithms, once at the start (asserts checked); the variables they read that the equations
-       compute, from the equations at the initial state (evaluated again where an earlier algorithm's assignments
-       reach them). =#
+       compute, from the equations at the initial state, evaluated before the first algorithm that reads one and
+       again where an earlier algorithm's assignments reach them (`_initAlgPlan`). =#
     function initialAlgorithms!(u, p, t)
       $(paramLocals...)
       local du = similar(u); local a = similar(u, $nAlg)
-      equations!(du, a, u, p, t, nothing, true)
       local z = nothing; local mode = true; local fire = false; local _fired = false
       p.checking[1] = true
       try
@@ -3477,6 +3539,7 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
       #= the relations were set literally above; from the solve on they have the hysteresis =#
       N_RELATIONS > 0 && push!(cbs, VectorContinuousCallback(conditions!, affectCrossing!, N_RELATIONS;
                                                              rootfind = DifferentialEquations.SciMLBase.RightRootFind,
+                                                             interp_points = $(RELATION_CHECKS),
                                                              initialize = _startHysteresis!),
                                     DiscreteCallback(relationsChanged, affect!; save_positions = (false, false)))
       N_SAMPLES == 0 || push!(cbs, DiscreteCallback(_sampleDue, affectSample!; initialize = _sampleStart!))
@@ -3540,14 +3603,16 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
 
     function simulate(tspan = (0.0, 1.0), solver = Tsit5(); parameters::AbstractDict = Dict{String, Any}(),
                       abstol = $(DEFAULT_ABSTOL), kwargs...)
-      local (prob, callbacks) = $(Symbol(modelName, "Model"))(tspan; parameters = parameters)
+      local (ode, callbacks) = $(Symbol(modelName, "Model"))(tspan; parameters = parameters)
+      local prob = $(_problemFor)(ode, solver)
+      local initKw = (; $(_initializeKwargs)(prob, kwargs, abstol)..., $(_stepKwargs)(kwargs, tspan, N_RELATIONS)...)
       OMBackend.CodeGeneration._resetRHSError!()
       local sol = $(hasTerminate ?
                     :(prob.p.state.terminated === nothing ?
-                        DifferentialEquations.solve(prob, solver; callback = callbacks, abstol = abstol, kwargs...) :
+                        DifferentialEquations.solve(prob, solver; callback = callbacks, abstol = abstol, initKw..., kwargs...) :
                       $(solveStoppedAtStart)(prob, solver, something(prob.p.state.terminated); callback = callbacks,
-                                             abstol = abstol, kwargs...)) :
-                    :(DifferentialEquations.solve(prob, solver; callback = callbacks, abstol = abstol, kwargs...)))
+                                             abstol = abstol, initKw..., kwargs...)) :
+                    :(DifferentialEquations.solve(prob, solver; callback = callbacks, abstol = abstol, initKw..., kwargs...)))
       #= an error that every smaller step met ends the run =#
       OMBackend.CodeGeneration._rethrowRHSError(sol)
       return sol
@@ -3769,8 +3834,10 @@ otherwise, and for a cycle), as the initialization solves them: an initial secti
 first and read its start (MSL OnDelay's `delaySignal := u` before `u := time >= 0`: false; the MTK code runs it late,
 true). An assignment reaches a variable directly, or through the equations that compute it (a connection between two
 blocks: MSL Digital's gate reads `x`, equal to the source's `y` by a connect equation; before the source it read the
-start). `refresh[k]`: the equations are evaluated again before the k-th of the order, as an algorithm run since their
-last evaluation assigned what a variable it reads is computed from.
+start). `refresh[k]`: the equations are evaluated before the k-th of the order, as it reads what they compute and they
+were not evaluated yet, or an algorithm run since their last evaluation assigned what a variable it reads is computed
+from. Not before an algorithm that reads none of it: the equations may read what it assigns (a lifted cluster's
+initial arm `b := if time < 0.5 then 3 else 4` before `y = table[b, a]`: index 0 with b's start).
 """
 function _initAlgPlan(g::Gen)::Tuple{Vector{AlgClass}, BitVector}
   local algs::Vector{AlgClass} = g.initAlgs
@@ -3839,7 +3906,8 @@ function _initAlgPlan(g::Gen)::Tuple{Vector{AlgClass}, BitVector}
   local done::BitVector = falses(n)
   local order::Vector{AlgClass} = AlgClass[]
   local refresh::BitVector = falses(n)
-  local stale::Set{String} = Set{String}()
+  #= before the first evaluation of the equations each computed variable holds its start =#
+  local stale::Set{String} = copy(computed)
   while length(order) < n
     local ready::Union{Nothing, Int} = findfirst(i::Int -> !done[i] && all(j::Int -> done[j], waitsFor[i]), 1:n)
     local k::Int = ready === nothing ? findfirst(!, done) : ready

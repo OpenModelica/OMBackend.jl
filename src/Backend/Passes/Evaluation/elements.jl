@@ -127,6 +127,22 @@ function selectElement(@nospecialize(e::IR.Expression), subscripts::Vector{IR.Su
     end
     return selectElement(e.exp, merged, ty)
   end
+  #= a reference of whole dimensions in its last part, the same (`val[idx, :][1]` is `val[idx, 1]`, as the frontend's
+     scalarization writes it: a row of a parameter table by a discrete index, CDL's TimeTable; left subscripted, the
+     scalar model read the array `val`, which it has as elements only: UndefVarError) =#
+  if e isa IR.CREF && !isempty(e.cref.parts)
+    local last::IR.CrefPart = e.cref.parts[end]
+    if count(s -> s isa IR.WHOLE, last.subscripts) == length(subscripts) &&
+       all(s -> s isa Union{IR.INDEX, IR.WHOLE}, last.subscripts) && all(s -> s isa IR.INDEX, subscripts)
+      local placed::Vector{IR.Subscript} = IR.Subscript[]
+      local taken::Int = 0
+      for s::IR.Subscript in last.subscripts
+        push!(placed, s isa IR.WHOLE ? subscripts[taken += 1] : s)
+      end
+      local parts::Vector{IR.CrefPart} = IR.CrefPart[e.cref.parts[1:end - 1]; IR.CrefPart(last.name, placed, last.ty)]
+      return IR.CREF(IR.ComponentRef(parts), ty)
+    end
+  end
   local k::Union{Nothing, Int} = IR.literalIndex(subscripts[1])
   if k !== nothing
     local record = asRecord(e)
