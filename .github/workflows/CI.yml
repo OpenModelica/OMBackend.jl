@@ -23,25 +23,36 @@ env:
 
 jobs:
   test:
-    name: Julia ${{ matrix.version }} - ${{ matrix.os }} - ${{ matrix.arch }} - ${{ github.event_name }}
+    name: Julia ${{ matrix.version }} - ${{ matrix.os }} - ${{ matrix.arch }} - ${{ matrix.group }} - ${{ github.event_name }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     env:
       # the nightly failure mail needs both mail secrets (not set: GitHub's own notification)
       MAIL_CONFIGURED: ${{ secrets.MAIL_USERNAME != '' && secrets.MAIL_PASSWORD != '' }}
+      # the depot cache's name: one per OS, arch and Julia version (the Linux shards share theirs)
+      DEPOT_CACHE_NAME: ombackend-cpu-targets;os=${{ matrix.os }};arch=${{ matrix.arch }};version=${{ matrix.version }}
     strategy:
       fail-fast: false
+      # group: OMBACKEND_TEST_GROUP (test/runtests.jl). Linux runs the whole suite in two shards, one per route of the
+      # array path's models: "scalarized" (with the platform tests) and "kept". macOS and Windows run "platform".
       matrix:
         include:
           - os: ubuntu-latest
             arch: x64
             version: '1.13'
+            group: scalarized
+          - os: ubuntu-latest
+            arch: x64
+            version: '1.13'
+            group: kept
           - os: macos-latest
             arch: arm64
             version: '1.13'
+            group: platform
           - os: windows-latest
             arch: x64
             version: '1.13'
+            group: platform
 
     steps:
       - name: Cap precompile concurrency (macOS)
@@ -94,8 +105,8 @@ jobs:
         if: github.event_name != 'pull_request'
         uses: julia-actions/cache@v2
         with:
-          cache-name: ombackend-cpu-targets
-          include-matrix: true
+          cache-name: ${{ env.DEPOT_CACHE_NAME }}
+          include-matrix: false
 
       # A pull request restores master's cache and saves none: each PR run
       # saved 0.8-2.6 GB per OS, the repository went over its 10 GB and GitHub
@@ -117,7 +128,7 @@ jobs:
                           "$depot/scratchspaces" "$depot/logs"
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
-          echo "key=ombackend-cpu-targets;os=${{ runner.os }};os=${{ matrix.os }};arch=${{ matrix.arch }};version=${{ matrix.version }};" >> "$GITHUB_OUTPUT"
+          echo "key=${DEPOT_CACHE_NAME};os=${{ runner.os }};" >> "$GITHUB_OUTPUT"
 
       - name: Restore Julia depot from master (pull request)
         if: github.event_name == 'pull_request'
@@ -169,12 +180,11 @@ jobs:
       - name: Run tests
         uses: julia-actions/julia-runtest@v1
         env:
-          # the whole suite (and coverage) on Linux; macOS and Windows run the
-          # platform group: all but the array path's models (test/runtests.jl)
-          OMBACKEND_TEST_GROUP: ${{ runner.os == 'Linux' && 'all' || 'platform' }}
+          OMBACKEND_TEST_GROUP: ${{ matrix.group }}
         with:
           project: OMBackend.jl
-          # Coverage on Linux only: the whole suite runs there. Coverage of a
+          # Coverage on Linux only: the whole suite runs there (Codecov merges
+          # the two shards' uploads of a commit). Coverage of a
           # path (`@OMBackend.jl`) still loads the dependencies' package images
           # from the cache (the cache report shows them on Linux).
           coverage: ${{ runner.os == 'Linux' }}
