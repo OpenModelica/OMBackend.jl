@@ -157,9 +157,7 @@ import .ExampleModels
            The test environment, which has OMBackend's dependencies: the package's own
            project is not instantiated where its siblings are developed into a
            temporary environment (OMJL's ci/test-package.jl, since [sources] is gone). =#
-        #= the child loads this process's package images: their CPU target (JULIA_CPU_TARGET, as Julia's precompile
-           workers), not julia_cmd()'s default `-C native` =#
-        local output = read(`$(Base.julia_cmd(; cpu_target = get(ENV, "JULIA_CPU_TARGET", nothing))) --startup-file=no --project=$(Base.active_project()) -e $script`, String)
+        local output = read(`$(Base.julia_cmd()) --startup-file=no --project=$(Base.active_project()) -e $script`, String)
         @test occursin("same_module=true", output)
         @test occursin("run_count=2", output)
         @test occursin("root_codegen=false", output)
