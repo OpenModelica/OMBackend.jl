@@ -120,10 +120,6 @@ DiscreteCluster(names, members, reads, nOperands, nPre, strict, exact, body, atS
 MTK_CodeGenerationUtil._symbolicReads!(out::Vector{Any}, c::DiscreteCluster)::Nothing =
   MTK_CodeGenerationUtil._symbolicReads!(out, c.reads)
 
-#= SciMLBase 3 renamed u_modified! (now deprecated) to derivative_discontinuity!. =#
-const _derivativeDiscontinuity! = isdefined(ModelingToolkit.SciMLBase, :derivative_discontinuity!) ?
-  ModelingToolkit.SciMLBase.derivative_discontinuity! : ModelingToolkit.SciMLBase.u_modified!
-
 #= Every evaluation of a cluster's body is printed with
    OMBACKEND_EVENT_TRACE=true (read at the start of a solve, `_initialize!`: an ENV lookup at every body call cost
    about 0.3 us), or when this is set to true. =#
@@ -394,7 +390,7 @@ function _write!(c::DiscreteCluster, integrator, values)
     integrator.u[k] = values[i]
     changed = true
   end
-  changed && _derivativeDiscontinuity!(integrator, true)
+  changed && SciMLBase.derivative_discontinuity!(integrator, true)
   return changed
 end
 
@@ -578,7 +574,7 @@ function _search!(c::DiscreteCluster, integrator, pre, relPre, reinit, relStart,
   end
   copyto!(integrator.u, u0)
   c.rel .= rel0
-  _derivativeDiscontinuity!(integrator, true)
+  SciMLBase.derivative_discontinuity!(integrator, true)
   @warn "[events] the discretes $(join(c.names, ", ")) have no consistent values at t = $(integrator.t)" _id = Symbol(:search_, first(c.names)) maxlog = 1
   return false
 end
@@ -611,7 +607,7 @@ function (a::ClusterCrossings)(integrator, events)
   for (k, d) in pairs(events)
     d == 0 || (a.cluster.crossed[k] = Int8(d))
   end
-  _derivativeDiscontinuity!(integrator, false)
+  SciMLBase.derivative_discontinuity!(integrator, false)
   return nothing
 end
 

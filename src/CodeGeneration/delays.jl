@@ -252,7 +252,7 @@ function withDelayEvents(callbacks, model::Symbol)
   local affect! = function (integrator)
     local s = delayState(model)
     s === nothing || (s.rightLimit = true)
-    _derivativeDiscontinuity!(integrator, true)
+    SciMLBase.derivative_discontinuity!(integrator, true)
     return nothing
   end
   local cb = DiffEqBase.DiscreteCallback(due, affect!; save_positions = (false, false))

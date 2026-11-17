@@ -1967,9 +1967,9 @@ function generateEliminatedObservedBlock(simCode::SC.SIM_CODE,
      is left out. =#
   #= Names already emitted by `generateAliasObservedBlock` from `aliasMap`
      have a direct `elim ~ rep` observed equation. Re-deriving the same
-     observation here via `solve_for(0 ~ residual, elim)` is redundant and
+     observation here via `symbolic_linear_solve(0 ~ residual, elim)` is redundant and
      fails when the residual has already been alias-substituted (the
-     residual no longer mentions `elim` and `solve_for` returns NaN, which
+     residual no longer mentions `elim` and `symbolic_linear_solve` returns NaN, which
      then propagates into `sol(t; idxs = elim)`). =#
   local aliasNames = OrderedSet{String}(entry.eliminatedName for entry in simCode.aliasMap)
   union!(aliasNames, string.(keys(relayAliases)))
@@ -1990,14 +1990,14 @@ function generateEliminatedObservedBlock(simCode::SC.SIM_CODE,
       push!(solveBodyExprs, quote
         local _elimResidual = OMBackend.CodeGeneration.substituteDerivatives($(residualExpr), eqs)
         if _elimResidual !== nothing
-          push!(_elimObsEqs, $(elimSym) ~ Symbolics.solve_for(0 ~ _elimResidual, $(elimSym)))
+          push!(_elimObsEqs, $(elimSym) ~ Symbolics.symbolic_linear_solve(0 ~ _elimResidual, $(elimSym)))
         end
       end)
       continue
     end
     push!(solveBodyExprs, quote
       local _elimResidual = $(residualExpr)
-      local _elimRhs = Symbolics.solve_for(0 ~ _elimResidual, $(elimSym))
+      local _elimRhs = Symbolics.symbolic_linear_solve(0 ~ _elimResidual, $(elimSym))
       push!(_elimObsEqs, $(elimSym) ~ _elimRhs)
     end)
   end

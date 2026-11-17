@@ -520,7 +520,7 @@ end
 #= The crossing only locates the event: it is handled after the step, with
    every other relation (the event iteration). The state is not changed; the
    relation records that it located it (_whenRelationUpdate!). =#
-(a::RelationWhenAffect)(integrator) = (a.located = true; _derivativeDiscontinuity!(integrator, false); nothing)
+(a::RelationWhenAffect)(integrator) = (a.located = true; SciMLBase.derivative_discontinuity!(integrator, false); nothing)
 
 """
     relationWhenCallback(names, eval, strict, body!) -> ContinuousCallback
@@ -669,7 +669,7 @@ struct _WhenInitialize
 end
 function (w::_WhenInitialize)(c, u, t, integrator)::Nothing
   w.when.initialize!(u, t, integrator)
-  _derivativeDiscontinuity!(integrator, false)
+  SciMLBase.derivative_discontinuity!(integrator, false)
   return nothing
 end
 

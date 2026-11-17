@@ -2703,7 +2703,7 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
         function affectAssertCrossing!(integrator, _)
           _assertPending!(integrator)
           isnan(integrator.p.state.pending[1]) && (integrator.p.state.pending = (Float64(integrator.t), copy(integrator.u)))
-          DifferentialEquations.u_modified!(integrator, false)
+          DifferentialEquations.derivative_discontinuity!(integrator, false)
           return nothing
         end
 
@@ -2758,7 +2758,7 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
       integrator.p.state.delays.rightLimit = true
       _eventAt!(integrator)
       _logDiscretes!(integrator.p, integrator.t)
-      DifferentialEquations.u_modified!(integrator, true)
+      DifferentialEquations.derivative_discontinuity!(integrator, true)
       return nothing
     end
 
@@ -3285,7 +3285,7 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
       local t = integrator.t
       local p = integrator.p
       if _atSampleInstant(p, t, integrator.sol.prob.tspan)
-        DifferentialEquations.u_modified!(integrator, false)
+        DifferentialEquations.derivative_discontinuity!(integrator, false)
         return nothing
       end
       #= the delay() arguments' left limits, before the relations take their new values =#
@@ -3316,7 +3316,7 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
         p.hyst[1] = _hyst
       end
       _logDiscretes!(p, t)
-      DifferentialEquations.u_modified!(integrator, true)
+      DifferentialEquations.derivative_discontinuity!(integrator, true)
       return nothing
     end
 
@@ -3349,7 +3349,7 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
       end
       fill!(p.sampleActive, false)
       _logDiscretes!(p, t)
-      DifferentialEquations.u_modified!(integrator, true)
+      DifferentialEquations.derivative_discontinuity!(integrator, true)
       #= the stop after this one =#
       stops[1] = t
       stops[2] = next
@@ -3414,12 +3414,12 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
 
     function affect!(integrator)
       if _atSampleInstant(integrator.p, integrator.t, integrator.sol.prob.tspan)
-        DifferentialEquations.u_modified!(integrator, false)
+        DifferentialEquations.derivative_discontinuity!(integrator, false)
         return nothing
       end
       _eventAt!(integrator)
       _logDiscretes!(integrator.p, integrator.t)
-      DifferentialEquations.u_modified!(integrator, true)
+      DifferentialEquations.derivative_discontinuity!(integrator, true)
       return nothing
     end
 

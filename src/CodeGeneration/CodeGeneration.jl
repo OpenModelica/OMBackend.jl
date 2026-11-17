@@ -41,6 +41,7 @@ using Setfield
 using ModelingToolkit
 using LinearAlgebra
 import DiffEqBase
+import SciMLBase
 import DiffEqCallbacks
 import OrdinaryDiffEq
 import ADTypes
