@@ -348,7 +348,7 @@ function clearCaches!(; models::Bool=true,
   cleared = String[]
   models          && (CodeGeneration.freeAllExternalObjects!();
                       empty!(COMPILED_MODELS_MTK);
-                      empty!(IMTKGen.BUILT); empty!(IMTKGen.BUILT_HASH);
+                      empty!(IMTKGen.BUILT); empty!(IMTKGen.BUILT_AT_SIMULATE); empty!(IMTKGen.BUILT_HASH);
                       empty!(IMTKGen.REDUCED_SYSTEMS); empty!(IMTKGen.PRISTINE_P);
                       empty!(CodeGeneration.DAE_REINIT);
                       empty!(Runtime.RECOMPILED_MODES);
@@ -586,8 +586,8 @@ end
 """
     backendScalarizedModel(lower::Function, name::String) -> Union{Nothing, OMJLIR.Model}
 
-The model `name` (canonical) that `lower()` lowers to OMJLIR with its arrays kept, scalarized by the backend's
-element view (`Passes.IndexReduction.scalarizeArrays`, the view for the scalar passes) and through the scalar
+The model `name` (canonical) that `lower()` lowers to OMJLIR with its arrays kept, scalarized by the backend
+(`Passes.IndexReduction.scalarizeModel`: its partitions and structural modes) and through the scalar
 passes with index reduction (`Passes.runPasses!`): what the frontend's scalarizing flatten, lowered and through the
 passes, gives, without flattening again. For the models the array form does not take (`reducedArrayModel`).
 `nothing` where the element view does not take the model (switched off, OMBACKEND_BACKEND_SCALARIZATION; what it
@@ -601,7 +601,7 @@ function backendScalarizedModel(lower::Function, name::String)::Union{Nothing, O
     return nothing
   end
   return _arrayReductionStep(name, decline; route = "the backend's scalarization") do
-    Passes.runPasses!(Passes.IndexReduction.scalarizeArrays(lower(); passesFollow = true).model)
+    Passes.runPasses!(Passes.IndexReduction.scalarizeModel(lower()))
   end
 end
 

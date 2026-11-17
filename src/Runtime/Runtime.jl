@@ -676,8 +676,9 @@ function _switchMode(change::AbstractStructuralChange, problem::ODEProblem, inte
   _fill_observed_u0!(newU0, oldSyms, newProblem, change.solutionAtChange)
   @VSS_DEBUG @info "[solve OM_ProblemRecompilation] new u0" newU0 anyNaN = any(isnan, newU0)
   #= In the latest world, as the steps: init runs the new mode's callbacks' initialization (a table's time events). =#
+  #= the solver options (`kwargs`: tolerances) go to init; reinit! takes none of them =#
   local newIntegrator::DEIntegrator = Base.invokelatest(init, newProblem, alg; force_dtmin = true, kwargs...)
-  Base.invokelatest(reinit!, newIntegrator, newU0; t0 = tChange, tf = last(tspan), reset_dt = true, kwargs...)
+  Base.invokelatest(reinit!, newIntegrator, newU0; t0 = tChange, tf = last(tspan), reset_dt = true)
   #= The structural event may trigger again in this step: reset after it. =#
   newIntegrator.dt = min(newIntegrator.dt, 1e-6)
   Base.invokelatest(step!, newIntegrator, newIntegrator.dt, true)

@@ -74,6 +74,9 @@ const DUMP_ENABLED = Ref(false)
    by the generated `<name>Model(tspan)`: (problem, callbacks, ivs, _ivs_all,
    reducedSystem, tspan, pars, vars, irreducibleSyms). =#
 const BUILT           = Dict{String, Tuple}()
+#= The models whose build is their module's own simulate (structural transitions, sub-models: `generateIMTKCode`
+   skips the build at translate), so no `BUILT` entry: translated all the same. =#
+const BUILT_AT_SIMULATE = Set{String}()
 #= Hash of (modelCode, build-affecting flags) for each cached build. A repeat
    translate (e.g. overwriteCache) whose regenerated code and flags are
    unchanged reuses the live module + cached build instead of re-eval'ing, which
@@ -100,7 +103,7 @@ another mode): an older build must not answer for the current one.
 """
 function forgetBuild(cname::String)
   _forgetReinit(cname)
-  for cache in (BUILT, BUILT_HASH, REDUCED_SYSTEMS, PRISTINE_P, TUNABLE_SETS)
+  for cache in (BUILT, BUILT_AT_SIMULATE, BUILT_HASH, REDUCED_SYSTEMS, PRISTINE_P, TUNABLE_SETS)
     delete!(cache, cname)
   end
   #= and its external objects (tables): kept, every translate of the model left its tables
@@ -147,6 +150,7 @@ function generateIMTKCode(simCode::SC.SIM_CODE)
     _buildAndCache(modelName, modelCode)
   else
     forgetBuild(cname)
+    push!(BUILT_AT_SIMULATE, cname)
     @info "[IMTK GEN] structural / sub-model path; build-cache skipped (iMTK delegates to MTK simulate)" model = modelName
   end
   return (modelName, modelCode)

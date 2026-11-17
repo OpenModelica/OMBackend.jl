@@ -47,13 +47,15 @@ element's reference as the scalarized model names it (`c[2].p.T` of the array `c
 record array's; `\$DER.c[2].T` of the backend's `\$DER.c.T`). `passesFollow`: the view is of a model as lowered, for
 the scalar passes (`scalarizeArrays(model; passesFollow = true)`), and keeps what they take as the frontend's
 scalarization does: a reference by a subscript known at run time only (`chooseRuntimeIndices!`), a record equation
-of a call (`fieldEquations`). The view the array form's index reduction plans on does not.
+of a call (`fieldEquations`). The view the array form's index reduction plans on does not. `structural[p]` the value
+of the structural Integer parameter `p` (`structuralValues`): a range over it (`1:N`) has its translated value.
 """
 struct Elements
   elements::Dict{Symbol, Vector{Symbol}}
   sizes::Dict{Symbol, Vector{Int}}
   array::Dict{Symbol, Tuple{Symbol, Vector{Int}}}
   crefs::Dict{Symbol, IR.ComponentRef}
+  structural::Dict{Symbol, Int}
   passesFollow::Bool
 end
 
@@ -175,7 +177,7 @@ already (a record field array of a parameter, `expandRecordFieldArrays`). `passe
 """
 function elements(variables::IR.VariableSet; passesFollow::Bool = false)::Elements
   local E = Elements(Dict{Symbol, Vector{Symbol}}(), Dict{Symbol, Vector{Int}}(), Dict{Symbol, Tuple{Symbol, Vector{Int}}}(),
-                     Dict{Symbol, IR.ComponentRef}(), passesFollow)
+                     Dict{Symbol, IR.ComponentRef}(), structuralValues(variables), passesFollow)
   local derived::Vector{Tuple{IR.Variable, Vector{IR.CrefPart}, Symbol}} = Tuple{IR.Variable, Vector{IR.CrefPart}, Symbol}[]
   #= the arrays of rolled components first (their elements may be another array's, kept beside them: rollComponents!) =#
   local rolledFirst::Vector{IR.Variable} = IR.Variable[v for v in variables if IR.isRolled(v.cref.parts[1].ty)]
@@ -200,6 +202,50 @@ function elements(variables::IR.VariableSet; passesFollow::Bool = false)::Elemen
   addDerivedArrays!(E, derived)
   return E
 end
+
+"""
+    structuralValues(variables) -> Dict{Symbol, Int}
+
+The values of the structural Integer parameters of `variables` (`IR.PARAMETER(true)`: the frontend evaluated them,
+the generated code holds their translated values) whose bindings fold to an Integer, also through other structural
+parameters (`M = 2 * N`).
+"""
+function structuralValues(variables::IR.VariableSet)::Dict{Symbol, Int}
+  local values::Dict{Symbol, Int} = Dict{Symbol, Int}()
+  local todo::Vector{IR.Variable} = IR.Variable[v for v in variables
+                                               if v.kind isa IR.PARAMETER && v.kind.structural && v.binding !== nothing]
+  local progress::Bool = true
+  while progress && !isempty(todo)
+    progress = false
+    for k in length(todo):-1:1
+      local value::Union{Nothing, Int} = foldInteger(withStructural(todo[k].binding, values))
+      value === nothing && continue
+      values[todo[k].name] = value
+      deleteat!(todo, k)
+      progress = true
+    end
+  end
+  return values
+end
+
+"`e` with the references to the structural parameters of `values` (`structuralValues`) replaced by their values."
+function withStructural(e::IR.Expression, values::Dict{Symbol, Int})::IR.Expression
+  isempty(values) && return e
+  local replace = (@nospecialize(x::IR.Expression)) -> begin
+    (x isa IR.CREF && !IR.hasSubscripts(x.cref) && haskey(values, x.cref.name)) || return x
+    return IR.INTEGER(values[x.cref.name])
+  end
+  return IR.mapExp(replace, e)
+end
+
+"""
+    iterationRange(range, values, E) -> Union{Nothing, StepRange{Int, Int}}
+
+The values of a loop's `range` at the iterators `values`: literal once the iterators and the structural parameters
+(`E.structural`) are replaced (`1:N`); `nothing` where it is not.
+"""
+iterationRange(range::IR.Expression, values::Dict{Symbol, Int}, E::Elements)::Union{Nothing, StepRange{Int, Int}} =
+  literalRange(withStructural(scalarExpression(range, values, E), E.structural))
 
 """
     addDerivedElements!(E, v, operators, of)
@@ -233,7 +279,7 @@ end
 made of), a new `Elements`; `E` not changed. NotHandled for an added array that is no backend-made one.
 """
 function extendedElements(E::Elements, added::Vector{IR.Variable}, variables::IR.VariableSet)::Elements
-  local out = Elements(copy(E.elements), copy(E.sizes), copy(E.array), copy(E.crefs), E.passesFollow)
+  local out = Elements(copy(E.elements), copy(E.sizes), copy(E.array), copy(E.crefs), E.structural, E.passesFollow)
   local derived::Vector{Tuple{IR.Variable, Vector{IR.CrefPart}, Symbol}} = Tuple{IR.Variable, Vector{IR.CrefPart}, Symbol}[]
   for v in added
     v.ty isa IR.T_ARRAY || continue
@@ -883,7 +929,7 @@ by `scalarExpression`). NotHandled for a for-equation over a range that is not c
 """
 function scalarEquations!(out::Vector{IR.Equation}, origins::Vector{EquationOrigin}, eq::IR.FOR_EQUATION,
                           origin::EquationOrigin, values::Dict{Symbol, Int}, E::Elements)::Nothing
-  local range = literalRange(scalarExpression(eq.iterator.range, values, E))
+  local range::Union{Nothing, StepRange{Int, Int}} = iterationRange(eq.iterator.range, values, E)
   range === nothing && throw(NotHandled("a for-equation over a range that is not constant ($(IR.toString(eq.iterator.range)))"))
   local inner = copy(values)
   local paths = Vector{Int}[vcat(origin.path, b) for b in eachindex(eq.body)]
@@ -980,7 +1026,7 @@ function scalarEquations!(out::Vector{IR.Equation}, origins::Vector{EquationOrig
                           origin::EquationOrigin, values::Dict{Symbol, Int}, E::Elements)::Nothing
   local loop::Union{Nothing, IR.FOR_STATEMENT} = E.passesFollow ? independentLoop(eq.statements) : nothing
   local range::Union{Nothing, StepRange{Int, Int}} =
-    loop === nothing ? nothing : literalRange(scalarExpression(loop.iterator.range, values, E))
+    loop === nothing ? nothing : iterationRange(loop.iterator.range, values, E)
   if loop !== nothing && range !== nothing
     #= one algorithm per iteration, as the frontend's scalarization has one per component =#
     local inner::Dict{Symbol, Int} = copy(values)
@@ -1285,27 +1331,60 @@ function scalarizeArrays(model::IR.Model; passesFollow::Bool = false,
                          cache::Union{Nothing, ScalarCache} = nothing)::Scalarized
   (length(model.continuous) == 1 && isempty(model.clocked) && isempty(model.modes)) ||
     throw(NotHandled("arrays in a model of several partitions or structural modes"))
-  local E = elements(model.variables; passesFollow)
-  local variables = scalarVariables(model.variables, E)
-  local p = model.continuous[1]
-  local equations = IR.Equation[]
-  local origins = EquationOrigin[]
+  local E::Elements = elements(model.variables; passesFollow)
+  local (partition::IR.Partition, origins::Vector{EquationOrigin}) = scalarPartition(model.continuous[1], E, cache)
+  local scalar::IR.Model = IR.Model(model.name, scalarVariables(model.variables, E), IR.Partition[partition], model.clocked,
+                                    model.baseClocks, model.functions, model.initialMode, model.modes, model.transitions,
+                                    model.frontendModel)
+  return Scalarized(scalar, origins, E)
+end
+
+"""
+    scalarPartition(p, E, cache) -> (partition, origins)
+
+The partition `p` with its equations and initial equations as their elements (`scalarEquationsOf!`) and its array
+unknowns as their elements (`E`), and the origins of its element equations.
+"""
+function scalarPartition(p::IR.Partition, E::Elements,
+                         cache::Union{Nothing, ScalarCache})::Tuple{IR.Partition, Vector{EquationOrigin}}
+  local equations::Vector{IR.Equation} = IR.Equation[]
+  local origins::Vector{EquationOrigin} = EquationOrigin[]
   for (i, eq) in enumerate(p.equations)
     scalarEquationsOf!(equations, origins, eq, i, E, cache)
   end
-  local initialEquations = IR.Equation[]
-  local initialOrigins = EquationOrigin[]
+  local initialEquations::Vector{IR.Equation} = IR.Equation[]
+  local initialOrigins::Vector{EquationOrigin} = EquationOrigin[]
   for (i, eq) in enumerate(p.initialEquations)
     scalarEquationsOf!(initialEquations, initialOrigins, eq, i, E, cache)
   end
-  local unknowns = Symbol[]
+  local unknowns::Vector{Symbol} = Symbol[]
   for n in p.unknowns
     haskey(E.elements, n) ? append!(unknowns, E.elements[n]) : push!(unknowns, n)
   end
-  local partition = IR.Partition(p.index, p.association, unknowns, equations, initialEquations)
-  local scalar = IR.Model(model.name, variables, IR.Partition[partition], model.clocked, model.baseClocks, model.functions,
-                          model.initialMode, model.modes, model.transitions, model.frontendModel)
-  return Scalarized(scalar, origins, E)
+  return (IR.Partition(p.index, p.association, unknowns, equations, initialEquations), origins)
+end
+
+"""
+    scalarizeModel(model) -> IR.Model
+
+`model` as lowered with its arrays as their elements, for the scalar passes (`scalarizeArrays` with `passesFollow`)
+in every part of it: its continuous and clocked partitions, and each structural mode with its own variables. The
+backend's scalarization (`backendScalarizedModel`) of a model the array form does not take. The model is not
+changed.
+"""
+function scalarizeModel(model::IR.Model)::IR.Model
+  local E::Elements = elements(model.variables; passesFollow = true)
+  return IR.Model(model.name, scalarVariables(model.variables, E),
+                  IR.Partition[first(scalarPartition(p, E, nothing)) for p in model.continuous],
+                  IR.Partition[first(scalarPartition(p, E, nothing)) for p in model.clocked], model.baseClocks,
+                  model.functions, model.initialMode, IR.StructuralMode[scalarMode(m) for m in model.modes],
+                  model.transitions, model.frontendModel)
+end
+
+"The structural mode `m` with its variables and its system as their elements (`scalarizeModel`)."
+function scalarMode(m::IR.StructuralMode)::IR.StructuralMode
+  local E::Elements = elements(m.variables; passesFollow = true)
+  return IR.StructuralMode(m.name, scalarVariables(m.variables, E), first(scalarPartition(m.system, E, nothing)))
 end
 
 """
