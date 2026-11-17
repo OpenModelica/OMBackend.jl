@@ -49,6 +49,17 @@ jobs:
         shell: bash
         run: echo "JULIA_NUM_PRECOMPILE_TASKS=2" >> "$GITHUB_ENV"
 
+      # The x64 runners differ in CPU (AMD znver4/znver5, Intel): package images
+      # compiled for the build runner's CPU (`native`) were rejected on another,
+      # and the whole depot precompiled again (#108's Ubuntu run: 387 packages,
+      # 28 min). The targets of Julia's own x64 binaries (doc/src/devdocs/sysimg.md;
+      # its system image has them): images load on every runner, each runner uses
+      # its best target. The arm64 macOS runners have one CPU: native.
+      - name: CPU target of package images (x64)
+        if: matrix.arch == 'x64'
+        shell: bash
+        run: echo "JULIA_CPU_TARGET=generic;sandybridge,-xsaveopt,clone_all;haswell,-rdrnd,base(1)" >> "$GITHUB_ENV"
+
       - name: Checkout OMBackend.jl
         uses: actions/checkout@v4
         with:
@@ -159,10 +170,9 @@ jobs:
           OMBACKEND_TEST_GROUP: ${{ runner.os == 'Linux' && 'all' || 'platform' }}
         with:
           project: OMBackend.jl
-          # Coverage forces --pkgimages=no, which rejects the warm depot cache
-          # and forces a full precompile on every run. Keep coverage on Linux,
-          # where it is cheap, and disable it on Windows and macOS so the
-          # restored pkgimage cache is actually usable on those runners.
+          # Coverage on Linux only: the whole suite runs there. Coverage of a
+          # path (`@OMBackend.jl`) still loads the dependencies' package images
+          # from the cache (the cache report shows them on Linux).
           coverage: ${{ runner.os == 'Linux' }}
           # Use Julia's default bounds-check behavior (honor @inbounds) instead
           # of the action default --check-bounds=yes. The forced setting is a
