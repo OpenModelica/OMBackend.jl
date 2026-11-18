@@ -79,7 +79,7 @@ end
   local run = (old::Bool, op, x::Real, y::Real; mode::Bool = true, H::Float64 = H) -> begin
     local p = (rel = [old], hyst = [H])
     local z = [0.0]
-    local v = rel(z, p, mode, 1, x, y, op)
+    local v = rel(OMBackend.CodeGeneration.ArrayODEGen.CrossingOut(z), p, mode, 1, x, y, op)
     return (v, p.rel[1], z[1])
   end
   #= exact zero, positive H: false stays false for a strict relation, becomes true for a closed one; true stays true =#
