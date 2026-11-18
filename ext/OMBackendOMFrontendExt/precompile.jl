@@ -127,6 +127,31 @@ end
   end
 end
 
+"""
+    _precompileSignatures(file::String) -> Nothing
+
+The `precompile` statements of `file`, each evaluated on its own: a statement naming a function or type that was
+renamed or removed is skipped (counted in one line), not an error that fails the extension's image and with it
+OM.jl's load.
+"""
+function _precompileSignatures(file::String)::Nothing
+  include_dependency(file)
+  local total::Int = 0
+  local stale::Int = 0
+  for statement in Meta.parseall(read(file, String); filename = file).args
+    statement isa Expr || continue
+    total += 1
+    try
+      Core.eval(@__MODULE__, statement)
+    catch err
+      stale += 1
+      @debug "[OMBackend] stale precompile signature skipped" statement exception = err
+    end
+  end
+  stale > 0 && @info "[OMBackend] precompile signatures: $(stale) of $(total) no longer resolve; regenerate $(basename(file))"
+  return nothing
+end
+
 #= what the workloads do not reach, from a trace (precompileSignatures.jl): with the workload's switch, as the
    workloads =#
-OMBackend.envSwitch("OMBACKEND_NO_PRECOMPILE_WORKLOAD") || include("precompileSignatures.jl")
+OMBackend.envSwitch("OMBACKEND_NO_PRECOMPILE_WORKLOAD") || _precompileSignatures(joinpath(@__DIR__, "precompileSignatures.jl"))

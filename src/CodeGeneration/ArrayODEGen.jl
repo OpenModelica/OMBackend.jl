@@ -178,6 +178,29 @@ The algebraic loops' roots at a time of a run (`ArrayRuntimeState.rootLog`): the
 const RootLogEntry = Tuple{Float64, Vector{Matrix{Float64}}, Vector{Vector{Float64}}}
 
 """
+A parameter rule of an array model (`PARAMETER_RULES`, in dependency order): the parameter, the parameters its
+binding reads, its binding as a function of the values (`nothing`: no code). The rules' vector has this element type,
+not `Any`: `parameterValues` destructures every rule, and over `Any` each closure's tuple type compiled its own
+`indexed_iterate` (MSL FullRobot: 930 instances, 1.1 s per build).
+"""
+const ParameterRule = Tuple{Symbol, Vector{Symbol}, Union{Nothing, Function}}
+
+"""
+    _parameterRules(symbols, deps, functions) -> Vector{ParameterRule}
+
+An array model's `PARAMETER_RULES` from the parameters, their reads and their bindings' functions (`nothing`: no
+code). Built here, not as a typed literal in the model's module: `ParameterRule[...]` compiled a `getindex` over all
+the functions' types (MSL FullRobot: 1.17 s); `Any[...]` does not specialize.
+"""
+function _parameterRules(symbols::Vector{Symbol}, deps::Vector{Vector{Symbol}}, functions::Vector{Any})::Vector{ParameterRule}
+  local out::Vector{ParameterRule} = Vector{ParameterRule}(undef, length(symbols))
+  for k in eachindex(symbols)
+    out[k] = (symbols[k], deps[k], functions[k]::Union{Nothing, Function})
+  end
+  return out
+end
+
+"""
     ArrayStartState(discrete, wcond, wnew, ndlog, upre, ureinit, loops, blocks, nRootLog, nObjectLog)
 
 A problem's state after its initialization (`ArrayRuntimeState.atStart`): the discrete state (`_discreteState`), the
@@ -2653,10 +2676,22 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
   #= structural parameters, and the ones a start reads that the array code does not compute =#
   local fixedParams = Symbol[g.paramSyms[nm] for nm in paramOrder
                              if nm in g.structural || nm in startFixed]
-  #= a rule without code as its tuple (a value in the code: 202 tuple expressions took EngineV6's module 0.19 s to
-     lower) =#
-  local ruleExprs::Vector{Any} = Any[code === nothing ? (sym, deps, nothing) : :(($(QuoteNode(sym)), $(deps), $code))
-                                     for (sym, deps, code) in rules]
+  #= the rules as three vectors (`_parameterRules`): the names and reads as values; a binding's code a named function,
+     each its own top-level definition (closures in one statement lower in quadratic time: MSL FullRobot's 465) =#
+  local ruleSymbols::Vector{Symbol} = Symbol[rule[1]::Symbol for rule in rules]
+  local ruleDeps::Vector{Vector{Symbol}} = Vector{Symbol}[rule[2]::Vector{Symbol} for rule in rules]
+  local ruleDefs::Vector{Expr} = Expr[]
+  local ruleFunctions::Vector{Any} = Any[]
+  for (k::Int, rule) in enumerate(rules)
+    local code::Union{Nothing, Expr} = rule[3]
+    if code === nothing
+      push!(ruleFunctions, nothing)
+    else
+      local ruleName::Symbol = Symbol("PARAMETER_RULE_", k)
+      push!(ruleDefs, :(function $(ruleName)(vals) $(code.args[2]) end))
+      push!(ruleFunctions, ruleName)
+    end
+  end
   local jacProto = pattern === nothing ? :(nothing) :
     :(Symbolics.SparseArrays.sparse($(pattern[1]), $(pattern[2]), ones($(length(pattern[1]))), $nStates, $nStates, $(_keepFirst)))
   local paramsType = ArrayModelParameters
@@ -2678,7 +2713,7 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
   local splitDefs::Vector{Expr} = vcat(rhsDefs, condDefs, Expr[d for (defs, _) in blockSplits for d in defs])
   #= equations! and invariants! with their parts: the model module's submodule ColdCode =#
   local coldDefs::Vector{Expr} = vcat(eqDefs, invDefs, assertRowDefs)
-  local coldNames::Vector{Symbol} = vcat(Symbol[:equations!, :invariants!, :assertRows!], Symbol[_definedName(d) for d in coldDefs])
+  local coldNames::Vector{Symbol} = vcat(Symbol[:equations!, :invariants!, :assertRows!, :whens!], Symbol[_definedName(d) for d in coldDefs])
   local code = quote
     using DifferentialEquations
     using OrdinaryDiffEq
@@ -2722,7 +2757,8 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
     const FIXED_STRINGS = $(Set{Int}(k for (k, s) in enumerate(g.strings) if s[1] in g.structural))
     #= (parameter, the parameters its binding reads, its binding as a function of them) in
        dependency order =#
-    const PARAMETER_RULES = Any[$(ruleExprs...)]
+    $(ruleDefs...)
+    const PARAMETER_RULES = $(_parameterRules)($(ruleSymbols), $(ruleDeps), Any[$(ruleFunctions...)])
     #= parameters the translation has no value of: their rules run at each start =#
     const START_COMPUTED = Set{Symbol}($(Symbol[g.paramSyms[nm] for nm in g.startComputed if haskey(g.paramSyms, nm)]))
     #= the ones the translation knew nothing of (a scalar, or a whole call's result): a parameter with a value computed
@@ -2849,21 +2885,6 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
 
     #= The flat parameter vector with the overrides `numeric` (and the parameters computed at the start). =#
     overriddenParameters(numeric::Dict{String, Any})::Vector{Float64} = flatParameters(parameterValues(numeric))
-
-    #= The when-equations: all conditions first (into p.wnew, crossing functions into z), then,
-       when fire, the bodies of those whose condition is true and was false at the start of the
-       sweep (p.wcond, pre() of the condition), in order (OpenModelica's order: a when on a
-       variable another body sets fires in the next pass, after the equations); reinit() goes
-       to p.ureinit (eventIteration! applies it after the sweep). Returns whether one fired. =#
-    function whens!(du, a, u, p, t, z, mode::Bool, fire::Bool)
-      $(paramLocals...)
-      local _fired = false
-      @inbounds begin
-        $(whenConds...)
-        $(whenBody...)
-      end
-      return _fired
-    end
 
     #= The when-bodies' calls that read an external object, made again for a read of the solution (`algebraics`) and
        for a second solve (`_restoreStart!`): an MSL table keeps the event interval of its last `getNextTimeEvent`
@@ -3124,9 +3145,10 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
        (arrayEvents.jl, arrayAsserts.jl, arrayInitialization.jl), over the model's code =#
     $(_driverBindings()...)
 
-    #= equations! and invariants! with their parts at LLVM level 0: called at the saved points, the events, the
-       initialization and, where the model has asserts, once per accepted step (their check), not in the solver's stages
-       (RHS!, the blocks and crossings! are). They are most of a large model's
+    #= equations!, invariants! with their parts and whens! at LLVM level 0: called at the saved points, the events, the
+       initialization, the event callback's condition (with equations!) and, where the model has asserts, once per
+       accepted step (their check), not in the solver's stages (RHS!, the blocks and crossings! are; MSL FullRobot's
+       whens! 0.8 s to compile at the default level). They are most of a large model's
        code (MSL EngineV6: 445k of 739k nodes; its rebuild's compile 17.9 -> 13.8 s, the solve unchanged). The module's
        names so far are imported first (`importParentNames!`). Defined here: after what they call, before CODE. =#
     module ColdCode
@@ -3167,8 +3189,22 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
         end
         return nothing
       end
+      #= The when-equations: all conditions first (into p.wnew, crossing functions into z), then,
+         when fire, the bodies of those whose condition is true and was false at the start of the
+         sweep (p.wcond, pre() of the condition), in order (OpenModelica's order: a when on a
+         variable another body sets fires in the next pass, after the equations); reinit() goes
+         to p.ureinit (eventIteration! applies it after the sweep). Returns whether one fired. =#
+      function whens!(du, a, u, p, t, z, mode::Bool, fire::Bool)
+        $(paramLocals...)
+        local _fired = false
+        @inbounds begin
+          $(whenConds...)
+          $(whenBody...)
+        end
+        return _fired
+      end
     end
-    using .ColdCode: equations!, invariants!, assertRows!
+    using .ColdCode: equations!, invariants!, assertRows!, whens!
 
     const CODE = $(ArrayModelCode)(equations!, whens!, crossings!, delayNow!, initialResiduals!, initialAlgorithms!,
                                    checkAsserts, USES_LEFT, CROSSINGS_ONLY, $(hasTerminate), $(nCross > 0), N_DELAYS,
