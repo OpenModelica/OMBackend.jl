@@ -424,13 +424,16 @@ function slicedReference(x::IR.Expression, family::Dict{Symbol, Vector{Int}})::I
 end
 
 """
-    splitArrays!(model, view, arrays, equations)
+    splitArrays!(model, view, arrays, equations; cache)
 
 The arrays `arrays` of the arrays-kept `model` split into their element variables (the element view `view`'s), with
 the arrays of their families (`familyBase`), and the equations that read them unrolled (`splitEquations`), with the
 for-equations `equations` (indices in the partition); the initial equations likewise. The model changed in place.
+`cache`: the caller's element equations (`ScalarCache`), for the view made after an inner split (`splitInner!` keeps
+the equations it does not change: MSL EngineV6's first split round 0.36 s without).
 """
-function splitArrays!(model::IR.Model, view::Scalarized, arrays::Vector{Symbol}, equations::Vector{Int})::Nothing
+function splitArrays!(model::IR.Model, view::Scalarized, arrays::Vector{Symbol}, equations::Vector{Int};
+                      cache::Union{Nothing, ScalarCache} = nothing)::Nothing
   local E::Elements = view.elements
   local bases::Set{Symbol} = Set{Symbol}(familyBase(a, model.variables) for a in arrays)
   #= a rolled array of more dimensions than the instances' (rolled components): along its inner dimensions only =#
@@ -439,7 +442,7 @@ function splitArrays!(model::IR.Model, view::Scalarized, arrays::Vector{Symbol},
     splitInner!(model, inner)
     setdiff!(bases, inner)
     (isempty(bases) && isempty(equations)) && return nothing
-    view = scalarizeArrays(model)
+    view = scalarizeArrays(model; cache)
     E = view.elements
   end
   local split::Set{Symbol} = Set{Symbol}(n for n in keys(E.elements) if familyBase(n, model.variables) in bases)

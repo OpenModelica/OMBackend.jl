@@ -1122,7 +1122,7 @@ function reduceIndexArrays!(model::IR.Model; arrays::Bool = true)::Bool
       break
     catch err
       (err isa NotHandled && needsSplit(err) && splits < 256) || rethrow()
-      splitArrays!(model, view, err.arrays, err.equations)
+      splitArrays!(model, view, err.arrays, err.equations; cache)
       splits += 1
       #= split down to no array equations, or most of the arrays' elements split: little the array form keeps, the
          scalarized path is the one (MSL EngineV6: its frames' vectors and rotations, 10877 elements split) =#

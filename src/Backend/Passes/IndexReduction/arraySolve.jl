@@ -344,7 +344,7 @@ function solvedInArrays(model::IR.Model;
       return solvedInArraysOnce(model, view, solution)
     catch err
       (err isa NotHandled && needsSplit(err)) || rethrow()
-      splitArrays!(model, view, err.arrays, err.equations)
+      splitArrays!(model, view, err.arrays, err.equations; cache)
       view = scalarizeArrays(model; cache)
       stale = true
     end
