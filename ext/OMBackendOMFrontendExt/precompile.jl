@@ -126,3 +126,7 @@ end
     end
   end
 end
+
+#= what the workloads do not reach, from a trace (precompileSignatures.jl): with the workload's switch, as the
+   workloads =#
+OMBackend.envSwitch("OMBACKEND_NO_PRECOMPILE_WORKLOAD") || include("precompileSignatures.jl")
