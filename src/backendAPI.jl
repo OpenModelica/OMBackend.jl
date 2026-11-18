@@ -699,7 +699,8 @@ solution", with no route left to take. Not while a package image is generated (n
 for a model without a loop.
 """
 function _arrayStartFailure(name::String, modelCode::Expr)::Union{Nothing, String}
-  (_calls(modelCode, CodeGeneration.ArrayODEGen.blockSolve!) || _defines(modelCode, "LOOPFAMILY_")) || return nothing
+  (_calls(modelCode, CodeGeneration.ArrayODEGen.blockSolve!) || _calls(modelCode, CodeGeneration.ArrayODEGen.loopFamilySolve!)) ||
+    return nothing
   ccall(:jl_generating_output, Cint, ()) == 1 && return nothing
   try
     getMTKProblem(name)
@@ -709,12 +710,6 @@ function _arrayStartFailure(name::String, modelCode::Expr)::Union{Nothing, Strin
     return string("the array model does not start: ", first(replace(sprint(showerror, err), r"\s+" => " "), 300))
   end
 end
-
-"Whether the code `ex` defines a function whose name starts with `prefix` (the array code's loop families)."
-_defines(ex::Expr, prefix::String)::Bool =
-  (ex.head === :function && !isempty(ex.args) && ex.args[1] isa Expr && ex.args[1].head === :call &&
-   ex.args[1].args[1] isa Symbol && startswith(String(ex.args[1].args[1]), prefix)) ||
-  any(a -> a isa Expr && _defines(a, prefix), ex.args)
 
 "Whether the code `ex` calls the function `f` (a function object in the head of a call)."
 _calls(ex::Expr, f::Function)::Bool =

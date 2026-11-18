@@ -275,7 +275,7 @@ end
 """
     LoopWork{T}(k)
 
-The work arrays of a loop family's solve (`LOOPFAMILY_f!`) of `k` unknowns: the iterate, the residuals there and at a
+The work arrays of a loop family's solve (`loopFamilySolve!`) of `k` unknowns: the iterate, the residuals there and at a
 perturbed point, the step, an attempt's start, the Jacobian, its LU factors (`_luFactor!`) and their pivots. One per
 family in the parameters for solves on Float64 (`ArrayModelParameters.loopWork`), so that a right-hand side allocates
 none; a solve on another number type (a solver's dual numbers) makes its own.
@@ -450,6 +450,203 @@ function Base.deepcopy_internal(p::ArrayModelParameters, dict::IdDict)::ArrayMod
   local q::ArrayModelParameters = ArrayModelParameters(fields...)
   dict[p] = q
   return q
+end
+
+"""
+    _setLoopUnknowns!(du, a, x, ids, m, nS)
+
+The unknowns `x` of the member `m` of a loop family where the equations read them: `ids[j, m]` a state's derivative
+in `du` up to `nS`, an algebraic variable in `a` after.
+"""
+@inline function _setLoopUnknowns!(du::AbstractVector, a::AbstractVector, x::Vector, ids::Matrix{Int}, m::Int, nS::Int)::Nothing
+  for j::Int in axes(ids, 1)
+    local id::Int = ids[j, m]
+    if id <= nS
+      du[id] = x[j]
+    else
+      a[id - nS] = x[j]
+    end
+  end
+  return nothing
+end
+
+"""
+    loopFamilySolve!(residual!, f, ids, start, initial, nS, linear, relations, du, a, u, p, t, z, mode, fire, members)
+
+The solve of the loop family `f` for its members `members` (`_loopFamilyCode`), each by Newton's method on the
+residuals of its instances, `residual!(f, rv, du, a, u, p, t, z, mode, fire, m)` (the model's one function over its
+families, `LOOPRES!`, a branch per family: this solve is compiled once per model, not once per family; MSL EngineV6,
+18 families: 75 ms each), the unknowns of member `m` at `ids[:, m]` (a state derivative in du up to `nS`, an
+algebraic variable in a after), the Jacobian by forward differences; the last solution kept as the next guess in
+`p.loops[f]` (in Float64 solves); residuals or a Jacobian not finite, or a singular Jacobian, make the unknowns NaN
+(the solver rejects the step); a solve that does not converge is made again with damped steps, from the last solution
+and then from the start values `start`. Relations in the loop (`relations`) hold their values in Newton's iterations
+(MLS 8.5: a relation changes at events only; no crossing written, no relation changed); the residuals once more at the
+solution write the crossings and, at an event, the relations, whose change the event iteration sweeps again
+(`_settle!`; a combination of relations `_searchRelations!` tries is solved with, not replaced by the relations at the
+point a solve starts from). MSL's FluxTubes hysteresis, `\$DER.ifEq_tmp1 = if core.Hstat < -650.0 then ...`; a
+comparator in an op-amp's loop. In the initial solve (`p.pass.on`) a member the initial system holds (`initial`: its
+unknowns' offset there, -1 for none) takes its unknowns from it and gives it its residuals (`InitialPass`).
+A family whose residuals are affine in its unknowns (`linear`, `_affineIn`) is solved by one Jacobian, by differences
+over the unknowns' size (exact for an affine residual), and one LU: one step from the last solution and one more at
+the residuals there; Newton's method as above where that fails. The work arrays are the parameters' (`LoopWork`) in a
+Float64 solve.
+"""
+function loopFamilySolve!(residual!::R, f::Int, ids::Matrix{Int}, start::Matrix{Float64}, initial::Vector{Int}, nS::Int,
+                          linear::Bool, relations::Bool, du::AbstractVector, a::AbstractVector{T}, u::AbstractVector,
+                          p::ArrayModelParameters, t::Real, z::CrossingOut, mode::Bool, fire::Bool,
+                          members::Vector{Int})::Nothing where {R <: Function, T}
+  local k::Int = size(ids, 1)
+  #= the work arrays: the parameters' on Float64 (no allocation in a right-hand side), else of the number type =#
+  local w::LoopWork{T} = T === Float64 ? p.loopWork[f] : LoopWork{T}(k)
+  local x::Vector{T} = w.x; local r::Vector{T} = w.r; local r2::Vector{T} = w.r2
+  local dx::Vector{T} = w.dx; local xs::Vector{T} = w.xs
+  local J::Matrix{T} = w.J; local F::Matrix{T} = w.F
+  local G::Matrix{Float64} = p.loops[f]
+  #= in Newton's iterations the relations hold their values: no crossing written, none changed =#
+  local zHeld::CrossingOut = relations ? NO_CROSSINGS : z
+  local modeHeld::Bool = relations ? false : mode
+  @inbounds for m::Int in members
+    if p.pass.on && initial[m] >= 0
+      local b::Int = initial[m]
+      for j::Int in 1:k
+        x[j] = p.pass.x[b + j]
+      end
+      _setLoopUnknowns!(du, a, x, ids, m, nS)
+      residual!(f, r, du, a, u, p, t, zHeld, modeHeld, fire, m)
+      for j::Int in 1:k
+        p.pass.r[b + j] = r[j]
+      end
+      continue
+    end
+    local converged::Bool = false
+    if linear
+      #= affine in its unknowns: the Jacobian by differences over the unknowns' size (exact for an affine residual),
+         one step from the last solution, and the step at the residuals there once more (the round-off of a badly
+         conditioned loop); the Newton attempts below where it is singular or the second step not within 1e-8 =#
+      for j::Int in 1:k
+        x[j] = G[j, m]
+      end
+      _setLoopUnknowns!(du, a, x, ids, m, nS)
+      residual!(f, r, du, a, u, p, t, zHeld, modeHeld, fire, m)
+      for j::Int in 1:k
+        local xj::T = x[j]
+        local h::T = max(one(xj), abs(xj))
+        x[j] = xj + h
+        _setLoopUnknowns!(du, a, x, ids, m, nS)
+        residual!(f, r2, du, a, u, p, t, zHeld, modeHeld, fire, m)
+        for i::Int in 1:k
+          J[i, j] = (r2[i] - r[i]) / h
+        end
+        x[j] = xj
+      end
+      if all(isfinite, r) && all(isfinite, J) && _luFactor!(copyto!(F, J), w.pivots)
+        _luSolve!(dx, F, w.pivots, r)
+        for j::Int in 1:k
+          x[j] -= dx[j]
+        end
+        _setLoopUnknowns!(du, a, x, ids, m, nS)
+        residual!(f, r, du, a, u, p, t, zHeld, modeHeld, fire, m)
+        _luSolve!(dx, F, w.pivots, r)
+        local refined::T = zero(T)
+        for j::Int in 1:k
+          x[j] -= dx[j]
+          refined = max(refined, abs(dx[j]) / (1.0 + abs(x[j])))
+        end
+        converged = all(isfinite, x) && refined <= 1.0e-8
+      end
+    end
+    #= from the last solution; where that does not converge, again with the step damped (halved until the residuals
+       decrease), then so from the start values. A piecewise equation's Newton step from a solution on another piece
+       can cycle between two points that are no solutions (MSL IdealizedOpAmpLimited: from the saturated output,
+       reached in an event's sweep, back to the linear range; the last iterate went into the equations as the
+       solution), an exponential's can overflow (a Zener diode's) =#
+    for attempt::Int in 1:3
+      converged && break
+      for j::Int in 1:k
+        attempt == 2 && (xs[j] = x[j])
+        x[j] = attempt == 3 ? start[j, m] : G[j, m]
+      end
+      for _ in 1:50
+        _setLoopUnknowns!(du, a, x, ids, m, nS)
+        residual!(f, r, du, a, u, p, t, zHeld, modeHeld, fire, m)
+        for j::Int in 1:k
+          local xj::T = x[j]
+          local h::T = 1.4901161193847656e-8 * max(one(xj), abs(xj))
+          x[j] = xj + h
+          _setLoopUnknowns!(du, a, x, ids, m, nS)
+          residual!(f, r2, du, a, u, p, t, zHeld, modeHeld, fire, m)
+          for i::Int in 1:k
+            J[i, j] = (r2[i] - r[i]) / h
+          end
+          x[j] = xj
+        end
+        #= residuals or a Jacobian not finite, or a singular Jacobian (a trial point of the solver where the equations
+           overflow, or a junction's derivative underflows: MSL DifferenceAmplifier's transistors): the unknowns NaN,
+           so the step is rejected =#
+        if !(all(isfinite, r) && all(isfinite, J))
+          fill!(x, NaN)
+          break
+        end
+        if _luFactor!(copyto!(F, J), w.pivots)
+          _luSolve!(dx, F, w.pivots, r)
+        elseif attempt > 1 && T === Float64
+          #= singular where two unknowns whose product the equations take are both zero (`v = R_actual * i` at the
+             starts, MSL's resistor with a heat port): the least-squares step of the smallest norm =#
+          copyto!(dx, _LINALG.pinv(J; rtol = RANK_TOLERANCE) * r)
+        else
+          fill!(x, NaN)
+          break
+        end
+        local scale::Float64 = 1.0
+        if attempt > 1
+          local norm::T = sum(abs2, r)
+          for j::Int in 1:k
+            r2[j] = x[j]
+          end
+          while true
+            for j::Int in 1:k
+              x[j] = r2[j] - scale * dx[j]
+            end
+            _setLoopUnknowns!(du, a, x, ids, m, nS)
+            residual!(f, r, du, a, u, p, t, zHeld, modeHeld, fire, m)
+            (sum(abs2, r) <= norm || scale < 1.0e-3) && break
+            scale *= 0.5
+          end
+          for j::Int in 1:k
+            x[j] = r2[j]
+          end
+        end
+        #= converged by the whole step of Newton's method, damped or not =#
+        local step::T = zero(T)
+        for j::Int in 1:k
+          x[j] -= scale * dx[j]
+          step = max(step, abs(dx[j]) / (1.0 + abs(x[j])))
+        end
+        converged = step <= 1.0e-8
+        step <= 1.0e-12 && break
+      end
+      converged && break
+      #= no attempt converged: the first one's last iterate (NaN where it was not finite: the step is rejected) =#
+      if attempt == 3
+        for j::Int in 1:k
+          x[j] = xs[j]
+        end
+      end
+    end
+    _setLoopUnknowns!(du, a, x, ids, m, nS)
+    #= the relations at the solution: their crossings, at an event their values =#
+    relations && residual!(f, r, du, a, u, p, t, z, mode, fire, m)
+    #= the solution as the next guess: not a failed solve's NaN, nor the last iterate of a solve that did not converge
+       (unknowns that hold no solution, as a state set's selection read with the other side's states: the next solve
+       went to another root from there) =#
+    if converged && T === Float64 && all(isfinite, x)
+      for j::Int in 1:k
+        G[j, m] = x[j]
+      end
+    end
+  end
+  return nothing
 end
 
 "The discrete state of `p`: the discrete values, their pre() values, the relations, the event-generating functions' values."
@@ -1114,7 +1311,7 @@ const CHUNK_NODES = Base.RefValue(20_000)
 _nodeCount(x)::Int = x isa Expr ? 1 + sum(_nodeCount, x.args; init = 0) : 1
 
 "Every symbol in `x`, into `out`."
-function _symbolsIn!(out::Set{Symbol}, x)::Set{Symbol}
+function _symbolsIn!(out::Set{Symbol}, @nospecialize(x::Any))::Set{Symbol}
   if x isa Symbol
     push!(out, x)
   elseif x isa Expr
@@ -1179,6 +1376,56 @@ function _splitStatements(name::Symbol, args::Vector{Symbol}, passed::Vector{Sym
     push!(calls, fired ? :(_fired = $call || _fired) : call)
   end
   return (defs, calls)
+end
+
+"""
+Whether `s` declares one of the parameter locals `names` (`local P_x = view(p.values, ...)`); not a declaration of
+several (`local (x, y) = ...`).
+"""
+function _isParameterLocal(@nospecialize(s::Any), names::Set{Symbol})::Bool
+  s isa Expr && s.head === :local || return false
+  local x::Any = s.args[1]
+  x isa Expr && x.head == :(=) && (x = x.args[1])
+  x isa Expr && x.head == :(::) && (x = x.args[1])
+  return x isa Symbol && x in names
+end
+
+"""
+    _dropUnusedParameterLocals!(x, names) -> x
+
+In each function `x` defines (at any depth), the declarations of the parameter locals `names` at the top of its body
+that the rest of the function does not read. The generated functions declare them all (`paramLocals`), and Julia
+infers each declaration (MSL EngineV6: 99 in each of 17 functions; a large loop's residual function had 2062 nodes,
+most of them these).
+"""
+function _dropUnusedParameterLocals!(@nospecialize(x::Any), names::Set{Symbol})::Any
+  x isa Expr || return x
+  for a::Any in x.args
+    _dropUnusedParameterLocals!(a, names)
+  end
+  if x.head === :function && length(x.args) == 2 && x.args[2] isa Expr && x.args[2].head === :block
+    local body::Expr = x.args[2]
+    local used::Set{Symbol} = Set{Symbol}()
+    foreach(s::Any -> _isParameterLocal(s, names) || _symbolsIn!(used, s), body.args)
+    filter!(s::Any -> !_isParameterLocal(s, names) || _localName(s) in used, body.args)
+  end
+  return x
+end
+
+"""
+    _blocksFunction(n) -> Expr
+
+The model's function `BLOCKS!(k, res, y, du, a, u, p, t, z, mode, fire)` over its `n` large algebraic loops: the
+residual function of the `k`-th (`BLOCK_k!`), a branch per loop (`BlockResidual`). Nothing for a model without one.
+"""
+function _blocksFunction(n::Int)::Union{Nothing, Expr}
+  n == 0 && return nothing
+  local branches::Vector{Expr} = Expr[:(k == $j && return $(Symbol("BLOCK_", j, "!"))(res, y, du, a, u, p, t, z, mode, fire))
+                                     for j in 1:n]
+  return :(function BLOCKS!(k::Int, res, y, du, a, u, p, t, z, mode, fire)
+             $(branches...)
+             return nothing
+           end)
 end
 
 "The name of a part `_splitStatements` defines (`function name(args...) ... end`)."
@@ -1268,26 +1515,11 @@ end
 """
     _loopFamilyCode(g, f, template, blocks, el, matchRow, a0, relBases, bases) -> Tuple{Vector{Any}, Expr, Expr}
 
-The solve of the loop family `f` (`LOOPFAMILY_f!`): its tables (each member's instance columns and unknowns, the first
-guess per unknown: the start values; a run keeps its last solutions as the next guesses in its parameters, `p.loops`)
-and the body that solves the members it is called for,
-each by Newton's method on the residuals of its instances (lhs - rhs, by the template's classes at the member's
-columns), the unknowns set in place (a state derivative in du, an algebraic variable in a), the Jacobian by forward
-differences; the last solution kept as the next guess (in Float64 solves); residuals or a Jacobian not finite, or a
-singular Jacobian, make the unknowns NaN (the solver rejects the step); a solve that does not converge is made again
-with damped steps, from the last solution and then from the start values. Not a discrete unknown.
-Relations in the loop hold their values in Newton's iterations (MLS 8.5: a relation changes at events only; `z`,
-`mode` shadowed: no crossing written, no relation changed); the residuals once more at the solution write the crossings
-and, at an event, the relations, whose change the event iteration sweeps again (`_settle!`; a combination of relations
-`_searchRelations!` tries is solved with, not replaced by the relations at the point a solve starts from). MSL's
-FluxTubes hysteresis, `\$DER.ifEq_tmp1 = if core.Hstat < -650.0 then ...`; a comparator in an op-amp's loop.
-In the initial solve (`p.pass.on`) a member the initial system holds (`bases`: its unknowns' offset there, -1 for
-none) takes its unknowns from it and gives it its residuals (`InitialPass`).
-A family whose residuals are affine in its unknowns (`_affineIn`) is solved by one Jacobian, by differences over the
-unknowns' size (exact for an affine residual), and one LU: one step from the last solution and one more at the
-residuals there; Newton's method as above where that fails. The work arrays are the parameters' (`LoopWork`) in a
-Float64 solve. The residuals are a function of their own (`_loopResidualFunction`, of the third value returned: its
-body).
+The solve of the loop family `f`: its tables (each member's instance columns and unknowns, the first guess per
+unknown: the start values; a run keeps its last solutions as the next guesses in its parameters, `p.loops`; per member
+its unknowns' offset in the initial system, -1 for none), the call of `loopFamilySolve!` that solves the members it is
+called for (without them: the last argument, appended where it is called) and the body of its residuals (lhs - rhs, by
+the template's classes at the member's columns; `_loopResidualFunction`). Not a discrete unknown.
 """
 function _loopFamilyCode(g::Gen, f::Int, template::Vector{Tuple{Int, Int}}, blocks::Vector{Vector{Int}}, el::InstanceTable,
                          matchRow::Vector{Int}, a0::Vector{Float64}, relBases::Vector{Int},
@@ -1316,18 +1548,6 @@ function _loopFamilyCode(g::Gen, f::Int, template::Vector{Tuple{Int, Int}}, bloc
     push!(parts, Expr(:let, Expr(:block, sets...), :(_rv[$j] = $(jl(g, c.lhs)) - $(jl(g, c.rhs)))))
   end
   local residualBody::Expr = Expr(:block, parts...)
-  local R::Symbol = Symbol("LOOPRES_", f, "!")
-  #= in Newton's iterations the relations hold their values: no crossing written, none changed =#
-  local residuals::Function = (rv::Symbol, held::Bool = true) ->
-    (held && hasRelations) ? :($R($rv, du, a, u, p, t, $(NO_CROSSINGS), false, fire, _m)) : :($R($rv, du, a, u, p, t, z, mode, fire, _m))
-  local set::Expr = :(for _j in 1:$k
-    local _id::Int = $I[_j, _m]
-    if _id <= $nS
-      du[_id] = _x[_j]
-    else
-      a[_id - $nS] = _x[_j]
-    end
-  end)
   #= affine in its unknowns (`_affineIn`, by the unknowns' variables): solved by one Jacobian =#
   local reads::Set{Tuple{String, Bool}} = _unknownVariables(g, ids)
   local readsUnknown::Function = (r::Ref) -> (r.name, r.der) in reads
@@ -1337,160 +1557,9 @@ function _loopFamilyCode(g::Gen, f::Int, template::Vector{Tuple{Int, Int}}, bloc
     println("[arraycode] loop family ", f, ": ", k, " unknowns, ", M, " members, ", linear ? "linear" : "nonlinear",
             " (", join(String[_unknownLabel(g, u) for u in view(ids, :, 1)], ", "), ")",
             join(String["\n[arraycode]   " * first(g.classes[ci].text, 1200) for (ci, _) in template]))
-  #= the step of a linear loop's solve and of each Newton step: its unknowns moved by the LU factors' solve =#
-  local solveStep::Expr = :($(_luSolve!)(_dx, _F, _w.pivots, _r))
-  local code::Expr = quote
-    #= the work arrays: the parameters' on Float64 (no allocation in a right-hand side), else of the number type =#
-    local _w::$(LoopWork){eltype(a)} = eltype(a) === Float64 ? p.loopWork[$f] : $(LoopWork){eltype(a)}($k)
-    local _x::Vector{eltype(a)} = _w.x; local _r::Vector{eltype(a)} = _w.r; local _r2::Vector{eltype(a)} = _w.r2
-    local _dx::Vector{eltype(a)} = _w.dx; local _xs::Vector{eltype(a)} = _w.xs
-    local _J::Matrix{eltype(a)} = _w.J; local _F::Matrix{eltype(a)} = _w.F
-    local _G::Matrix{Float64} = p.loops[$f]
-    for _m in members
-      $(any(>=(0), bases) ? quote
-          if p.pass.on && $B[_m] >= 0
-            local _b::Int = $B[_m]
-            for _j in 1:$k
-              _x[_j] = p.pass.x[_b + _j]
-            end
-            $set
-            $(residuals(:_r))
-            for _j in 1:$k
-              p.pass.r[_b + _j] = _r[_j]
-            end
-            continue
-          end
-        end : nothing)
-      local _converged::Bool = false
-      $(linear ? quote
-          #= affine in its unknowns: the Jacobian by differences over the unknowns' size (exact for an affine
-             residual), one step from the last solution, and the step at the residuals there once more (the round-off
-             of a badly conditioned loop); the Newton attempts below where it is singular or the second step not
-             within 1e-8 =#
-          for _j in 1:$k
-            _x[_j] = _G[_j, _m]
-          end
-          $set
-          $(residuals(:_r))
-          for _j in 1:$k
-            local _xj::eltype(a) = _x[_j]
-            local _h::eltype(a) = max(one(_xj), abs(_xj))
-            _x[_j] = _xj + _h
-            $set
-            $(residuals(:_r2))
-            for _i in 1:$k
-              _J[_i, _j] = (_r2[_i] - _r[_i]) / _h
-            end
-            _x[_j] = _xj
-          end
-          if all(isfinite, _r) && all(isfinite, _J) && $(_luFactor!)(copyto!(_F, _J), _w.pivots)
-            $solveStep
-            for _j in 1:$k
-              _x[_j] -= _dx[_j]
-            end
-            $set
-            $(residuals(:_r))
-            $solveStep
-            local _refined::eltype(a) = zero(eltype(a))
-            for _j in 1:$k
-              _x[_j] -= _dx[_j]
-              _refined = max(_refined, abs(_dx[_j]) / (1.0 + abs(_x[_j])))
-            end
-            _converged = all(isfinite, _x) && _refined <= 1.0e-8
-          end
-        end : nothing)
-      #= from the last solution; where that does not converge, again with the step damped (halved until the residuals
-         decrease), then so from the start values. A piecewise equation's Newton step from a solution on another piece
-         can cycle between two points that are no solutions (MSL IdealizedOpAmpLimited: from the saturated output,
-         reached in an event's sweep, back to the linear range; the last iterate went into the equations as the
-         solution), an exponential's can overflow (a Zener diode's) =#
-      for _attempt in 1:3
-        _converged && break
-        for _j in 1:$k
-          _attempt == 2 && (_xs[_j] = _x[_j])
-          _x[_j] = _attempt == 3 ? $G[_j, _m] : _G[_j, _m]
-        end
-        for _it in 1:50
-          $set
-          $(residuals(:_r))
-          for _j in 1:$k
-            local _xj::eltype(a) = _x[_j]
-            local _h::eltype(a) = 1.4901161193847656e-8 * max(one(_xj), abs(_xj))
-            _x[_j] = _xj + _h
-            $set
-            $(residuals(:_r2))
-            for _i in 1:$k
-              _J[_i, _j] = (_r2[_i] - _r[_i]) / _h
-            end
-            _x[_j] = _xj
-          end
-          #= residuals or a Jacobian not finite, or a singular Jacobian (a trial point of the solver where the equations
-             overflow, or a junction's derivative underflows: MSL DifferenceAmplifier's transistors): the unknowns NaN,
-             so the step is rejected =#
-          if !(all(isfinite, _r) && all(isfinite, _J))
-            fill!(_x, NaN)
-            break
-          end
-          if $(_luFactor!)(copyto!(_F, _J), _w.pivots)
-            $solveStep
-          elseif _attempt > 1 && eltype(a) === Float64
-            #= singular where two unknowns whose product the equations take are both zero (`v = R_actual * i` at
-               the starts, MSL's resistor with a heat port): the least-squares step of the smallest norm =#
-            copyto!(_dx, LinearAlgebra.pinv(_J; rtol = $(RANK_TOLERANCE)) * _r)
-          else
-            fill!(_x, NaN)
-            break
-          end
-          local _scale::Float64 = 1.0
-          if _attempt > 1
-            local _norm::eltype(a) = sum(abs2, _r)
-            for _j in 1:$k
-              _r2[_j] = _x[_j]
-            end
-            while true
-              for _j in 1:$k
-                _x[_j] = _r2[_j] - _scale * _dx[_j]
-              end
-              $set
-              $(residuals(:_r))
-              (sum(abs2, _r) <= _norm || _scale < 1.0e-3) && break
-              _scale *= 0.5
-            end
-            for _j in 1:$k
-              _x[_j] = _r2[_j]
-            end
-          end
-          #= converged by the whole step of Newton's method, damped or not =#
-          local _step::eltype(a) = zero(eltype(a))
-          for _j in 1:$k
-            _x[_j] -= _scale * _dx[_j]
-            _step = max(_step, abs(_dx[_j]) / (1.0 + abs(_x[_j])))
-          end
-          _converged = _step <= 1.0e-8
-          _step <= 1.0e-12 && break
-        end
-        _converged && break
-        #= no attempt converged: the first one's last iterate (NaN where it was not finite: the step is rejected) =#
-        if _attempt == 3
-          for _j in 1:$k
-            _x[_j] = _xs[_j]
-          end
-        end
-      end
-      $set
-      #= the relations at the solution: their crossings, at an event their values =#
-      $(hasRelations ? residuals(:_r, false) : nothing)
-      #= the solution as the next guess: not a failed solve's NaN, nor the last iterate of a solve that did not
-         converge (unknowns that hold no solution, as a state set's selection read with the other side's states: the
-         next solve went to another root from there) =#
-      if _converged && eltype(a) === Float64 && all(isfinite, _x)
-        for _j in 1:$k
-          _G[_j, _m] = _x[_j]
-        end
-      end
-    end
-  end
-  return (Any[:(const $C = $cols), :(const $I = $ids), :(const $G = $guess), :(const $B = $bases)], code, residualBody)
+  local call::Expr = :($(loopFamilySolve!)(LOOPRES!, $f, $I, $G, $B, $nS, $linear, $hasRelations, du, a, u, p, t, z, mode,
+                                           fire))
+  return (Any[:(const $C = $cols), :(const $I = $ids), :(const $G = $guess), :(const $B = $bases)], call, residualBody)
 end
 
 """
@@ -1498,8 +1567,7 @@ end
 
 The residuals of the loop family `f` (`body`, from `_loopFamilyCode`: `_rv[j]` the j-th residual of the member `_m`)
 as the function `LOOPRES_<f>!(_rv, du, a, u, p, t, z, mode, fire, _m)`, with the parameter views it reads (of
-`paramLocals`): not inlined, so compiled once for the places of the family's solve that call it (z and mode `nothing`
-and `false` where the relations hold their values: a second specialization).
+`paramLocals`): not inlined, so compiled once for the places of the family's solve that call it.
 """
 function _loopResidualFunction(f::Int, body::Expr, paramLocals::Vector{Any})::Expr
   return :(@noinline function $(Symbol("LOOPRES_", f, "!"))(_rv, du, a, u, p, t, z, mode, fire, _m)
@@ -1507,6 +1575,23 @@ function _loopResidualFunction(f::Int, body::Expr, paramLocals::Vector{Any})::Ex
              @inbounds begin
                $(body)
              end
+             return nothing
+           end)
+end
+
+"""
+    _loopResidualsFunction(fs) -> Expr
+
+The model's function `LOOPRES!(f, rv, du, a, u, p, t, z, mode, fire, m)` over its loop families `fs` solved by
+Newton's method: the residuals of family `f`'s member `m` (`LOOPRES_f!`), a branch per family (`loopFamilySolve!`).
+Nothing for a model without one.
+"""
+function _loopResidualsFunction(fs::Vector{Int})::Union{Nothing, Expr}
+  isempty(fs) && return nothing
+  local branches::Vector{Expr} = Expr[:(f == $j && return $(Symbol("LOOPRES_", j, "!"))(rv, du, a, u, p, t, z, mode, fire, m))
+                                     for j in fs]
+  return :(function LOOPRES!(f::Int, rv, du, a, u, p, t, z, mode, fire, m::Int)
+             $(branches...)
              return nothing
            end)
 end
@@ -2020,10 +2105,12 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
   foreach(f::Int -> largeFamily[f] ? push!(loopBodies, :(nothing)) :
                                       loopFamily!(f, familyTemplates[f], familyBlocks[f], familyBases[f]),
           eachindex(familyTemplates))
+  #= a family's solve for some of its members: its call (`loopFamilySolve!`) with them =#
+  local familyCall::Function = (f::Int, ms::Vector{Int}) -> Expr(:call, (loopBodies[f]::Expr).args..., ms)
   local callFamily!::Function = function (f::Int, members::Vector{Int}, neededMembers::Vector{Int}, crossingMembers::Vector{Int})
-    push!(body, :($(Symbol("LOOPFAMILY_", f, "!"))(du, a, u, p, t, z, mode, fire, $(members))))
-    isempty(neededMembers) || push!(rhsBody, :($(Symbol("LOOPFAMILY_", f, "!"))(du, a, u, p, t, z, mode, fire, $(neededMembers))))
-    isempty(crossingMembers) || push!(condBody, :($(Symbol("LOOPFAMILY_", f, "!"))(du, a, u, p, t, z, mode, fire, $(crossingMembers))))
+    push!(body, familyCall(f, members))
+    isempty(neededMembers) || push!(rhsBody, familyCall(f, neededMembers))
+    isempty(crossingMembers) || push!(condBody, familyCall(f, crossingMembers))
   end
   #= the large blocks, in schedule order: each a residual function (its unknowns placed where the equations read them,
      then its instances' residuals, a loop per class over their columns) and its solver's call (blockSolve!) =#
@@ -2085,13 +2172,13 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
     end
     push!(blockBodies, Expr(:block, parts...))
     local kb::Int = length(blockBodies)
-    local call::Expr = :($(blockSolve!)(p.blocks[$kb], $(Symbol("BLOCK_", kb, "!")), du, a, u, p, t, z, mode, fire))
+    local residual::Expr = :($(BlockResidual)(BLOCKS!, $kb))
+    local call::Expr = :($(blockSolve!)(p.blocks[$kb], $residual, du, a, u, p, t, z, mode, fire))
     #= held by the initial solve: its unknowns from it, its residuals to it (`InitialPass`) =#
     local base::Int = initialSystem.blockBase[b]
     if base >= 0
       foreach(j::Int -> (initPlaces[base + j] = (-kb, j, 0)), eachindex(ids))
-      call = :(p.pass.on ? $(_passBlock!)(p.blocks[$kb], $(Symbol("BLOCK_", kb, "!")), p.pass, $base, du, a, u, p, t,
-                                          fire) : $call)
+      call = :(p.pass.on ? $(_passBlock!)(p.blocks[$kb], $(copy(residual)), p.pass, $base, du, a, u, p, t, fire) : $call)
     end
     push!(body, call)
     needed[rs[1]] && push!(rhsBody, copy(call))
@@ -2365,6 +2452,14 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
     layoutOf[nm] = (poff, len)
     poff += len
   end
+  #= the translated values as the flat vector (FLAT_PARAMETERS, as flatParameters lays them out): a run without
+     overrides takes a copy =#
+  local flatValues::Vector{Float64} = zeros(poff)
+  for nm in paramOrder
+    local (off::Int, len::Int) = layoutOf[nm]
+    local v::Any = g.params[nm]
+    v isa AbstractArray ? (flatValues[(off + 1):(off + len)] .= Float64.(vec(v))) : (flatValues[off + 1] = Float64(v))
+  end
   #= a parameter the translation has no value of is computed at each start (parameterValues) from its binding: it needs
      the binding as code (a call with a function argument, a comprehension over such an array have none) and sizes or
      subscripts nothing; one with a value that reads it keeps that value (the translation computed it without it) =#
@@ -2418,7 +2513,9 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
       push!(paramLocals, :(local $sym = $(_discreteRead(info, :(p.values[$(off + 1)])))))
     end
   end
-  local paramTuple = (; (g.paramSyms[k] => g.params[k] for k in paramOrder)...)
+  #= the translated values by symbol: a Dict, not a NamedTuple (one type per model: EngineV6's 202 fields, the code's
+     `hash` and the overrides' path compiled for it) =#
+  local paramValues::Dict{Symbol, Any} = Dict{Symbol, Any}(g.paramSyms[k] => g.params[k] for k in paramOrder)
   #= Element names of the parameters, for overrides of single elements. =#
   local paramElements = Dict{String, Tuple{Symbol, Tuple}}()
   local paramNames = Dict{String, Symbol}()
@@ -2447,7 +2544,10 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
   #= structural parameters, and the ones a start reads that the array code does not compute =#
   local fixedParams = Symbol[g.paramSyms[nm] for nm in paramOrder
                              if nm in g.structural || nm in startFixed]
-  local ruleExprs = [:(($(QuoteNode(sym)), $(deps), $(code === nothing ? :(nothing) : code))) for (sym, deps, code) in rules]
+  #= a rule without code as its tuple (a value in the code: 202 tuple expressions took EngineV6's module 0.19 s to
+     lower) =#
+  local ruleExprs::Vector{Any} = Any[code === nothing ? (sym, deps, nothing) : :(($(QuoteNode(sym)), $(deps), $code))
+                                     for (sym, deps, code) in rules]
   local jacProto = pattern === nothing ? :(nothing) :
     :(Symbolics.SparseArrays.sparse($(pattern[1]), $(pattern[2]), ones($(length(pattern[1]))), $nStates, $nStates, $(_keepFirst)))
   local paramsType = ArrayModelParameters
@@ -2481,14 +2581,8 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
     $(functionDefs...)
     $(loopDefs...)
     $(splitDefs...)
-    $([:(function $(Symbol("LOOPFAMILY_", f, "!"))(du, a, u, p, t, z, mode, fire, members)
-           $(_usedLocals(paramLocals, code)...)
-           @inbounds begin
-             $(code)
-           end
-           return nothing
-         end) for (f, code) in enumerate(loopBodies)]...)
     $([_loopResidualFunction(f, body, paramLocals) for (f, body) in sort!(collect(loopResiduals); by = first)]...)
+    $(_loopResidualsFunction(sort!(collect(keys(loopResiduals)))))
     $([:(function $(Symbol("BLOCK_", k, "!"))(res, y, du, a, u, p, t, z, mode, fire)
            $(paramLocals...)
            @inbounds begin
@@ -2496,13 +2590,15 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
            end
            return nothing
          end) for (k, (_, stmts)) in enumerate(blockSplits)]...)
+    $(_blocksFunction(length(blockSplits)))
     const STATE_NAMES = $(stateNamesOrdered)
     const ALGEBRAIC_NAMES = $(algNamesOrdered)
     const DISCRETE_NAMES = $(discreteNamesOrdered)
     const STATE_INDEX = $(_nameIndex(stateNamesOrdered))
     const ALGEBRAIC_INDEX = $(_nameIndex(algNamesOrdered))
     const DISCRETE_INDEX = $(_nameIndex(discreteNamesOrdered))
-    const PARAMS = $(paramTuple)
+    const PARAMETER_VALUES = $(paramValues)
+    const FLAT_PARAMETERS = $(flatValues)
     $(objectDefs...)
     const PARAMETER_LAYOUT = $(layout)
     const PARAMETER_NAMES = $(paramNames)
@@ -2525,7 +2621,7 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
     const U0 = $(u0)
     #= the large algebraic loops (blockSolve!), in schedule order: their residuals' sparsity in their unknowns, its
        column colors, the unknowns' start values =#
-    const BLOCK_PATTERNS = Symbolics.SparseArrays.SparseMatrixCSC{Float64, Int}[$([:(Symbolics.SparseArrays.sparse($I, $J, ones($(length(I))), $(length(gs)), $(length(gs)), (x, y) -> x))
+    const BLOCK_PATTERNS = Symbolics.SparseArrays.SparseMatrixCSC{Float64, Int}[$([:(Symbolics.SparseArrays.sparse($I, $J, ones($(length(I))), $(length(gs)), $(length(gs)), $(_keepFirst)))
                                                                                   for ((I, J), gs) in zip(blockPatterns, blockGuesses)]...)]
     const BLOCK_COLORS = Vector{Int}[$(columnColors)(S) for S in BLOCK_PATTERNS]
     const BLOCK_GUESSES = $(blockGuesses)
@@ -2569,7 +2665,7 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
     #= The parameter values with `overrides` (Modelica names of parameters or of their
        elements => values) applied; parameters whose bindings read a changed one are
        computed again. =#
-    #= The parameter values (PARAMS) with `overrides` (Modelica names of parameters or of their elements => values),
+    #= The parameter values (PARAMETER_VALUES) with `overrides` (Modelica names of parameters or of their elements => values),
        in the rules' dependency order:
        - one overridden whole takes the given value; an element override is set after its parameter's rule, when that
          runs, else into its value;
@@ -2580,7 +2676,7 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
          translation computed it without them);
        - a structural one (FIXED_PARAMETERS) the overrides change is an error: the code holds its translated value. =#
     function parameterValues(overrides::AbstractDict = Dict{String, Any}())
-      local vals = Dict{Symbol, Any}(k => copy(v) for (k, v) in pairs(PARAMS))
+      local vals = Dict{Symbol, Any}(k => copy(v) for (k, v) in PARAMETER_VALUES)
       local whole = Set{Symbol}()
       local later = Dict{Symbol, Vector{Any}}()
       for (name, v) in overrides
@@ -2608,9 +2704,9 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
           if atStart || (depChanged && !(rule === nothing && opaqueOnly))
             rule === nothing && error(string("array model: parameter ", sym, " depends on a changed parameter, but its binding cannot be computed here"))
             #= of the translated value's type (a Real array bound to Integers: {m, n}) =#
-            vals[sym] = convert(typeof(getfield(PARAMS, sym)), rule(vals))
+            vals[sym] = convert(typeof(PARAMETER_VALUES[sym]), rule(vals))
           end
-          (atStart ? depChanged : vals[sym] != getfield(PARAMS, sym)) && push!(changed, sym)
+          (atStart ? depChanged : vals[sym] != PARAMETER_VALUES[sym]) && push!(changed, sym)
         end
         local elems = get(later, sym, nothing)
         if elems !== nothing
@@ -2623,14 +2719,14 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
       for sym in FIXED_PARAMETERS
         sym in changed && error(string("array model: parameter ", sym, " is structural (array sizes, subscripts, if-equation conditions) and changes with the overrides; translate again"))
       end
-      return (; (k => vals[k] for k in keys(PARAMS))...)
+      return vals
     end
 
-    #= Parameter values (as PARAMS) as the flat vector of PARAMETER_LAYOUT. =#
-    function flatParameters(vals)
+    #= Parameter values (as parameterValues returns them) as the flat vector of PARAMETER_LAYOUT. =#
+    function flatParameters(vals::Dict{Symbol, Any})
       local pv = Vector{Float64}(undef, $(poff))
       for (sym, off, len, _) in PARAMETER_LAYOUT
-        local v = getfield(vals, sym)
+        local v = vals[sym]
         if v isa AbstractArray
           pv[(off + 1):(off + len)] .= Float64.(vec(v))
         else
@@ -2639,6 +2735,9 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
       end
       return pv
     end
+
+    #= The flat parameter vector with the overrides `numeric` (and the parameters computed at the start). =#
+    overriddenParameters(numeric::Dict{String, Any})::Vector{Float64} = flatParameters(parameterValues(numeric))
 
     #= The when-equations: all conditions first (into p.wnew, crossing functions into z), then,
        when fire, the bodies of those whose condition is true and was false at the start of the
@@ -2969,7 +3068,12 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
           strings[k] = String(v)
         end
       end
-      return $(paramsType)(flatParameters(isempty(numeric) && isempty(START_COMPUTED) ? PARAMS : parameterValues(numeric)),
+      #= the translated values unless overridden or computed at the start; the overrides' path behind a call inference
+         does not follow (`Base.inferencebarrier`), so that only a run with overrides compiles it (MSL EngineV6:
+         parameterValues and flatParameters 0.27 s) =#
+      local values::Vector{Float64} = isempty(numeric) && isempty(START_COMPUTED) ? copy(FLAT_PARAMETERS) :
+                                      Base.inferencebarrier(overriddenParameters)(numeric)::Vector{Float64}
+      return $(paramsType)(values,
                            zeros(Bool, N_RELATIONS), copy(D0), copy(D0), zeros(Bool, N_WHENS),
                            zeros(Bool, N_SAMPLES), [false], [false], copy(U0), copy(U0),
                            zeros(Bool, N_WHENS), Tuple{Float64, Vector{Float64}}[], zeros(N_RELATIONS), [0.0], [Float64(tspan[2])],
@@ -3127,6 +3231,7 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
       return sol
     end
   end
+  _dropUnusedParameterLocals!(code, Set{Symbol}(Symbol[_localName(l) for l in paramLocals]))
   return Expr(:module, true, Symbol(modelName), stripBeginBlocks(code))
 end
 
@@ -3535,9 +3640,9 @@ end
 
 """
 The external objects the code reads (`Gen.objects`) as the module's constants `OBJECT_k`: each made once, when the
-module is evaluated, by its constructor's call on the translated parameter values (`PARAMS`), and registered under the
-model with its destructor (`CodeGeneration._externalObjectRef`); the objects of the model's build before this one are
-freed first. NotSupported for a constructor call without code.
+module is evaluated, by its constructor's call on the translated parameter values (`PARAMETER_VALUES`), and registered
+under the model with its destructor (`CodeGeneration._externalObjectRef`); the objects of the model's build before this
+one are freed first. NotSupported for a constructor call without code.
 """
 function _objectDefinitions(g::Gen, modelName::String)::Vector{Any}
   isempty(g.objects) && return Any[]
@@ -3547,7 +3652,7 @@ function _objectDefinitions(g::Gen, modelName::String)::Vector{Any}
     local rule::Any = _bindingCode(g, ParameterBinding(nm, _bindingDeps(g, g.vars[nm].var), :scalar, IR[value]))
     rule === nothing && ns("the constructor of the external object $(nm)")
     push!(defs, :(const $(Symbol("OBJECT_", k)) =
-                    $(_OMBACKEND.CodeGeneration._externalObjectRef)($(QuoteNode(Symbol(nm))), ($rule)(PARAMS),
+                    $(_OMBACKEND.CodeGeneration._externalObjectRef)($(QuoteNode(Symbol(nm))), ($rule)(PARAMETER_VALUES),
                                                                     $(QuoteNode(Symbol(destructor))), $model)))
   end
   return defs

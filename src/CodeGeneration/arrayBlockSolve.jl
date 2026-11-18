@@ -149,6 +149,23 @@ _holdDiscretes!(s::BlockSolver, ::Nothing)::Nothing = nothing
 _sameDiscretes(s::BlockSolver, ::Nothing)::Bool = true
 
 """
+    BlockResidual(blocks!, k)
+
+The residual function of a model's `k`-th large algebraic loop: `blocks!(k, res, y, du, a, u, p, t, z, mode, fire)`,
+the model's one function that calls its loops' residual functions (`BLOCKS!`, a branch per loop). `blockSolve!` and
+`_passBlock!` are specialized on the residual's type: one type per model, not one per loop (MSL EngineV6, 13 loops:
+0.225 s of compile each).
+"""
+struct BlockResidual{F <: Function} <: Function
+  blocks!::F
+  k::Int
+end
+
+@inline (r::BlockResidual)(res::AbstractVector, y::AbstractVector, du::AbstractVector, a::AbstractVector, u::AbstractVector, p,
+                           t::Real, z::CrossingOut, mode::Bool, fire::Bool)::Nothing =
+  r.blocks!(r.k, res, y, du, a, u, p, t, z, mode, fire)
+
+"""
     blockSolve!(s, residual!, du, a, u, p, t, z, mode, fire)
 
 Solve a large algebraic loop of an array model where the equations reach it: `residual!(res, y, du, a, u, p, t, z,
