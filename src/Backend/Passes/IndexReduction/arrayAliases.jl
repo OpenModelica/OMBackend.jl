@@ -338,14 +338,14 @@ function substituteArrayAliases!(model::IR.Model, view::Scalarized)::AliasUndo
 end
 
 """
-    arrayAliasPlan(model, view, written, cache) -> Tuple{Scalarized, Plan}
+    arrayAliasPlan(model, view, cache) -> Tuple{Scalarized, Union{Nothing, Plan}}
 
-`aliasPlan` of an arrays-kept model that needs index reduction (`written`, the plan of its element view `view` as
-written): planned again with the aliases read through their representatives (`substituteArrayAliases!`), which the
-model keeps, its new element view and plan. Where that leaves nothing to reduce (the aliases were the constraint: a
-capacitor loop's `v1 = v2`) or is not handled, the model as written, `view` and `written`.
+`aliasPlan` of an arrays-kept model that needs index reduction (`differentiates` of its element view `view`): planned
+with the aliases read through their representatives (`substituteArrayAliases!`), which the model keeps, its new
+element view and plan. Where that leaves nothing to reduce (the aliases were the constraint: a capacitor loop's
+`v1 = v2`) or is not handled, the model as written, `view` and `nothing` (the caller plans it as written).
 """
-function arrayAliasPlan(model::IR.Model, view::Scalarized, written::Plan, cache::ScalarCache)::Tuple{Scalarized, Plan}
+function arrayAliasPlan(model::IR.Model, view::Scalarized, cache::ScalarCache)::Tuple{Scalarized, Union{Nothing, Plan}}
   local order::Vector{Symbol} = Symbol[v.name for v in model.variables]
   #= a reference it does not rewrite (a slice of the representative that ends inside a part's dimensions) throws
      before the model is changed =#
@@ -353,9 +353,9 @@ function arrayAliasPlan(model::IR.Model, view::Scalarized, written::Plan, cache:
     substituteArrayAliases!(model, view)
   catch err
     err isa NotHandled || rethrow()
-    return (view, written)
+    return (view, nothing)
   end
-  aliases.substituted > 0 || return (view, written)
+  aliases.substituted > 0 || return (view, nothing)
   local substitutedView::Union{Nothing, Scalarized} = nothing
   local p::Union{Nothing, Plan} = try
     substitutedView = scalarizeArrays(model; cache)
@@ -366,7 +366,7 @@ function arrayAliasPlan(model::IR.Model, view::Scalarized, written::Plan, cache:
   end
   (p !== nothing && !isempty(p.differentiated)) && return (something(substitutedView), p)
   undoArrayAliases!(model, aliases, order)
-  return (view, written)
+  return (view, nothing)
 end
 
 """

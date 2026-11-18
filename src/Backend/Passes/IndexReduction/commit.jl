@@ -110,6 +110,38 @@ function plan(model::IR.Model, partition::IR.Partition;
 end
 
 """
+    differentiates(model, partition; initialDerivatives = false) -> Bool
+
+Whether `plan(model, partition; initialDerivatives)` differentiates equations (index above 1, artificial states, or
+derivatives the initial equations read): its structure through Pantelides' algorithm and the initial equations'
+derivatives, without the choice of dummy derivatives; true where these throw NotHandled (the plan decides then). What
+`reduceIndex!` and `reduceIndexArrays!` decide by before they plan with the aliases substituted, which replaces the plan
+as written where it applies (MSL EngineV6: 0.2 s instead of a plan's 0.6 s). NotHandled as `plan` for a system that is
+not square or has arrays.
+"""
+function differentiates(model::IR.Model, partition::IR.Partition; initialDerivatives::Bool = false)::Bool
+  any(v -> v.ty isa IR.T_ARRAY && !(v.kind isa Union{IR.PARAMETER, IR.CONSTANT}), model.variables) &&
+    throw(NotHandled("array variables (the arrays-kept path; scalarized models only)"))
+  local (folded::IR.Partition, _) = withKnownValuesAndConstants(model, partition)
+  local functions::Dict{Symbol, IR.ModelicaFunction} = Dict{Symbol, IR.ModelicaFunction}(f.name => f for f in model.functions)
+  local derived::Vector{Symbol} = expandDerivatives!(folded.equations, continuousNames(model.variables, folded), model.variables, functions)
+  local s::Structure = Structure(model.variables, folded, model.functions; derived)
+  local nRows::Int = length(s.rows)
+  nRows == unknownCount(s) ||
+    throw(NotHandled("a continuous system of $(nRows) rows over $(unknownCount(s)) unknowns (not square as the structure reads it)"))
+  try
+    artificialStates!(s, folded, model.variables; prefer = envSwitch("OMBACKEND_PREFER_STATES"))
+    local m::PantelidesMatching = pantelides!(s)
+    length(s.rows) > nRows && return true
+    initialDerivatives && initialDerivatives!(s, m, initialDerivativeReads(folded.initialEquations))
+    return length(s.rows) > nRows
+  catch err
+    err isa NotHandled || rethrow()
+    return true
+  end
+end
+
+"""
     planStructure(s, nRows, partition, model; trace, known, indexOne) -> Union{Nothing, Plan}
 
 The plan of `plan` from the structure `s` of `partition` (its first `nRows` rows the partition's, its artificial
@@ -379,15 +411,14 @@ function knownPlan(model::IR.Model, partition::IR.Partition;
 end
 
 """
-    aliasPlan(model, partition, written; trace) -> Tuple{Union{Nothing, Plan}, Union{Nothing, AliasUndo}}
+    aliasPlan(model, partition; trace) -> Tuple{Union{Nothing, Plan}, Union{Nothing, AliasUndo}}
 
-The plan of a partition that needs index reduction (`written`, its first plan as written): with
-OMBACKEND_ALIAS_SUBSTITUTION planned again with the aliases read through their representatives
-(`substituteAliases!`), which the model keeps; where that leaves nothing to reduce (the aliases
-were the constraint: a capacitor loop's `v1 = v2`) or is not handled, the model as written and
+The plan of a partition that needs index reduction (`differentiates`): with OMBACKEND_ALIAS_SUBSTITUTION planned with
+the aliases read through their representatives (`substituteAliases!`), which the model keeps; where that leaves nothing
+to reduce (the aliases were the constraint: a capacitor loop's `v1 = v2`) or is not handled, the model as written and
 its plan (`knownPlan`; `nothing` where the simulation code's values leave nothing to reduce).
 """
-function aliasPlan(model::IR.Model, partition::IR.Partition, written::Plan;
+function aliasPlan(model::IR.Model, partition::IR.Partition;
                    trace::Union{Nothing, Vector{BlockTrace}} = nothing)::Tuple{Union{Nothing, Plan}, Union{Nothing, AliasUndo}}
   if envSwitch("OMBACKEND_ALIAS_SUBSTITUTION")
     local aliases = substituteAliases!(model, partition)
@@ -402,8 +433,8 @@ function aliasPlan(model::IR.Model, partition::IR.Partition, written::Plan;
     end
     undoAliases!(model, partition, aliases)
   end
-  local known = KNOWN_VALUES[] === nothing ? Dict{Symbol, IR.Expression}() : KNOWN_VALUES[](model)
-  return (isempty(known) ? written : plan(model, partition; known, trace), nothing)
+  local known::Dict{Symbol, IR.Expression} = KNOWN_VALUES[] === nothing ? Dict{Symbol, IR.Expression}() : KNOWN_VALUES[](model)
+  return (plan(model, partition; known, trace), nothing)
 end
 
 """
@@ -425,8 +456,7 @@ function reduceIndex!(model::IR.Model)::IR.Model
   local partition = model.continuous[1]
   local exposed = exposeLinearConstraints!(model, partition)
   local (p, aliases) = try
-    local written = plan(model, partition)
-    written === nothing ? (nothing, nothing) : aliasPlan(model, partition, written)
+    differentiates(model, partition) ? aliasPlan(model, partition) : (nothing, nothing)
   catch err
     err isa NotHandled || rethrow()
     @info "[index reduction] $(model.name): $(sprint(showerror, err)); MTK reduces the index"

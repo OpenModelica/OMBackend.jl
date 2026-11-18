@@ -97,8 +97,7 @@ function explain(model::IR.Model)::Explanation
   try
     #= planned as `reduceIndex!` plans: as written, where reduced with the aliases substituted (`aliasPlan`) =#
     local p = try
-      local written = plan(model, partition; trace)
-      written === nothing ? nothing : ((q, aliases) = aliasPlan(model, partition, written; trace); q)
+      differentiates(model, partition) ? ((q, aliases) = aliasPlan(model, partition; trace); q) : nothing
     catch err
       err isa NotHandled || rethrow()
       return Explanation(model.name, :notHandled, sprint(showerror, err))

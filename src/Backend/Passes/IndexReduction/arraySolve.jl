@@ -333,9 +333,10 @@ function solvedInArrays(model::IR.Model;
   local stale::Bool = false
   for _ in 1:64
     try
-      local result::Tuple{IR.Model, Vector{Symbol}} = solvedInArraysOnce(model, view, solution)
-      stale || return result
-      #= a new view: the check put the derivatives into this one's (the model is not changed) =#
+      stale || return solvedInArraysOnce(model, view, solution)
+      #= after a split only the splits asked for (`arrayTemplates`), then a new view solved: the stale view's values
+         and check were made and dropped (EngineV6: 0.8 s) =#
+      arrayTemplates(model, view, solution)
       view = scalarizeArrays(model)
       solution = derivativeSolution(view.model, view.model.continuous[1]; known, literalCoefficients = false)
       solution === nothing && return (model, Symbol[])
@@ -445,13 +446,14 @@ function withTemplateValues(body::IR.SCALAR_EQUATION, others::Set{Symbol}, E::El
 end
 
 """
-    solvedInArraysOnce(model, view, solution) -> Tuple{IR.Model, Vector{Symbol}}
+    arrayTemplates(model, view, solution) -> Tuple{Dict{Symbol, SolvedTemplate}, Dict{Symbol, Tuple{Int, Vector{Int}}}}
 
-`solvedInArrays` without splitting, of the model's element view `view` and its derivatives' solution `solution`:
-NotHandled, naming the arrays or for-equations to split, where solved differently.
+The solved derivatives (arrays or scalars) of `model` in array form, of its element view `view` and its derivatives'
+solution `solution`: each one's template (`solvedTemplate`) and its body (equation, path). NotHandled, naming the
+arrays or for-equations to split, where solved differently: the only place `solvedInArraysOnce` asks for splits.
 """
-function solvedInArraysOnce(model::IR.Model, view::Scalarized, solution::DerivativeSolution)::Tuple{IR.Model, Vector{Symbol}}
-  local elementPartition::IR.Partition = view.model.continuous[1]
+function arrayTemplates(model::IR.Model, view::Scalarized,
+                        solution::DerivativeSolution)::Tuple{Dict{Symbol, SolvedTemplate}, Dict{Symbol, Tuple{Int, Vector{Int}}}}
   local E::Elements = view.elements
   local partition::IR.Partition = model.continuous[1]
   local rowsOf::Dict{Tuple{Int, Vector{Int}}, Vector{Int}} = Dict{Tuple{Int, Vector{Int}}, Vector{Int}}()
@@ -515,6 +517,20 @@ function solvedInArraysOnce(model::IR.Model, view::Scalarized, solution::Derivat
   isempty(splitEquations) ||
     throw(NotHandled("for-equations whose iterations are solved differently ($(length(splitEquations)): slicing)", Symbol[],
                      sort!(collect(splitEquations))))
+  return (templates, bodyOf)
+end
+
+"""
+    solvedInArraysOnce(model, view, solution) -> Tuple{IR.Model, Vector{Symbol}}
+
+`solvedInArrays` without splitting, of the model's element view `view` and its derivatives' solution `solution`:
+NotHandled, naming the arrays or for-equations to split, where solved differently (`arrayTemplates`).
+"""
+function solvedInArraysOnce(model::IR.Model, view::Scalarized, solution::DerivativeSolution)::Tuple{IR.Model, Vector{Symbol}}
+  local elementPartition::IR.Partition = view.model.continuous[1]
+  local E::Elements = view.elements
+  local partition::IR.Partition = model.continuous[1]
+  local (templates::Dict{Symbol, SolvedTemplate}, bodyOf::Dict{Symbol, Tuple{Int, Vector{Int}}}) = arrayTemplates(model, view, solution)
   #= a solved derivative put in where the element view puts its elements' values in (all of them small) =#
   local small::Set{Symbol} = Set{Symbol}()
   for target in keys(templates)
@@ -524,7 +540,7 @@ function solvedInArraysOnce(model::IR.Model, view::Scalarized, solution::Derivat
   end
   local resolved::Dict{Symbol, IR.Expression} = resolvedTemplates(templates, E, small)
   #= the values put in (a copy: the model with its arrays stays the scalarized path's), the bodies their definitions =#
-  local equations::Vector{IR.Equation} = deepcopy(partition.equations)
+  local equations::Vector{IR.Equation} = IR.Equation[IR.copyEquation(eq) for eq in partition.equations]
   local substitute::Function = (x::IR.Expression) -> begin
     local s::Union{Nothing, Symbol} = solvedTarget(x, E, templates)
     (s === nothing || !haskey(resolved, s)) && return x
