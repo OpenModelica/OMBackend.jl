@@ -334,10 +334,10 @@ function solvedInArrays(model::IR.Model;
   for _ in 1:64
     try
       stale || return solvedInArraysOnce(model, view, solution)
-      #= after a split only the splits asked for (`arrayTemplates`), then a new view solved: the stale view's values
-         and check were made and dropped (EngineV6: 0.8 s) =#
+      #= after a split only the splits asked for (`arrayTemplates`), then the view solved: the stale view's values
+         and check were made and dropped (EngineV6: 0.8 s). `view` is the model's view already (made after the last
+         split; neither call changes the model or the view): scalarized again, 0.22 s =#
       arrayTemplates(model, view, solution)
-      view = scalarizeArrays(model)
       solution = derivativeSolution(view.model, view.model.continuous[1]; known, literalCoefficients = false)
       solution === nothing && return (model, Symbol[])
       stale = false
@@ -478,9 +478,11 @@ function arrayTemplates(model::IR.Model, view::Scalarized,
     length(solvedRows[key]) == length(rowsOf[key]) || push!(splitEquations, key[1])
     (haskey(E.elements, target) && length(solvedRows[key]) != length(E.elements[target])) && push!(splitArrays, target)
   end
-  (isempty(splitArrays) && isempty(splitEquations)) ||
+  if !(isempty(splitArrays) && isempty(splitEquations))
+    splitClosure!(splitArrays, splitEquations, model, E, bodyOf)
     throw(NotHandled("derivative arrays solved element by element differently ($(length(splitArrays)) arrays, " *
                      "$(length(splitEquations)) for-equations: slicing)", sort!(collect(splitArrays)), sort!(collect(splitEquations))))
+  end
   local functions::Dict{Symbol, IR.ModelicaFunction} = Dict{Symbol, IR.ModelicaFunction}(f.name => f for f in model.functions)
   local parameters::StartValues = StartValues(model.variables, model.functions; parametersOnly = true)
   local templates::Dict{Symbol, SolvedTemplate} = Dict{Symbol, SolvedTemplate}()
@@ -514,10 +516,73 @@ function arrayTemplates(model::IR.Model, view::Scalarized,
       push!(splitEquations, key[1])
     end
   end
-  isempty(splitEquations) ||
-    throw(NotHandled("for-equations whose iterations are solved differently ($(length(splitEquations)): slicing)", Symbol[],
-                     sort!(collect(splitEquations))))
+  if !isempty(splitEquations)
+    local more::Set{Symbol} = Set{Symbol}()
+    splitClosure!(more, splitEquations, model, E, bodyOf)
+    throw(NotHandled("for-equations whose iterations are solved differently ($(length(splitEquations)): slicing)",
+                     sort!(collect(more)), sort!(collect(splitEquations))))
+  end
   return (templates, bodyOf)
+end
+
+"""
+    splitClosure!(arrays, equations, model, E, bodyOf)
+
+The splits that splitting `arrays` and unrolling `equations` (`splitArrays!`) asks for next, added to `arrays`: an
+equation that reads a split array is unrolled, so a derivative array of more than one element solved from it has its
+elements from different equations, and is split in the next round; its readers are unrolled in turn. MSL EngineV6
+split the angular velocities along its frames' chain, a frame per round (rounds 3 to 7 of 7, 0.1 s each). Not where
+an array is split along its inner dimensions only (`innerSplittable`: its slices are new arrays of the next view),
+nor for such an array found: the next round asks for those.
+"""
+function splitClosure!(arrays::Set{Symbol}, equations::Set{Int}, model::IR.Model, E::Elements,
+                       bodyOf::Dict{Symbol, Tuple{Int, Vector{Int}}})::Nothing
+  local variables::IR.VariableSet = model.variables
+  local bases::Set{Symbol} = Set{Symbol}(familyBase(a, variables) for a in arrays)
+  any(b::Symbol -> innerSplittable(model, b), bases) && return nothing
+  #= the element view's arrays by their family; the equations reading each name (`readsArrays`), a whole record or
+     array apart (the containers of a split array) =#
+  local members::Dict{Symbol, Vector{Symbol}} = Dict{Symbol, Vector{Symbol}}()
+  for n in keys(E.elements)
+    push!(get!(() -> Symbol[], members, familyBase(n, variables)), n)
+  end
+  local readers::Dict{Symbol, Vector{Int}} = Dict{Symbol, Vector{Int}}()
+  local wholeReaders::Dict{Symbol, Vector{Int}} = Dict{Symbol, Vector{Int}}()
+  for (i, eq) in enumerate(model.continuous[1].equations)
+    IR.foreachExp(eq) do x::IR.Expression
+      x isa IR.CREF || return nothing
+      local name::Symbol = IR.hasSubscripts(x.cref) ? unsubscriptedName(x.cref) : x.cref.name
+      push!(get!(() -> Int[], readers, name), i)
+      x.ty isa Union{IR.T_RECORD, IR.T_ARRAY} && push!(get!(() -> Int[], wholeReaders, name), i)
+      nothing
+    end
+  end
+  #= the derivative arrays of more than one element, by the equation they are solved from =#
+  local solvedFrom::Dict{Int, Vector{Symbol}} = Dict{Int, Vector{Symbol}}()
+  for (target, key) in bodyOf
+    (haskey(E.elements, target) && length(E.elements[target]) > 1) && push!(get!(() -> Symbol[], solvedFrom, key[1]), target)
+  end
+  local unrolled::Set{Int} = copy(equations)
+  local newEquations::Vector{Int} = collect(equations)
+  local queue::Vector{Symbol} = collect(bases)
+  while !(isempty(queue) && isempty(newEquations))
+    for b in queue, n in get(members, b, Symbol[])
+      local reading::Vector{Int} = copy(get(readers, n, Int[]))
+      foreach(c::Symbol -> append!(reading, get(wholeReaders, c, Int[])), arrayContainers(Set{Symbol}((n,))))
+      for i in reading
+        i in unrolled && continue
+        push!(unrolled, i); push!(newEquations, i)
+      end
+    end
+    empty!(queue)
+    for i in newEquations, target in get(solvedFrom, i, Symbol[])
+      local b::Symbol = familyBase(target, variables)
+      (b in bases || innerSplittable(model, b)) && continue
+      push!(bases, b); push!(arrays, target); push!(queue, b)
+    end
+    empty!(newEquations)
+  end
+  return nothing
 end
 
 """
