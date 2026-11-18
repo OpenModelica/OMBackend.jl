@@ -92,7 +92,7 @@ import ...SimCode.Domains: DomainSystem, InstanceTable, EqClass, EvFn, Gen, IR, 
   AlgClass, DelaySite,
   _affineIn, _unknownVariables, _blockFamilies, _callOfParameters, _condElements, _initAlgAssigned, _parameterAlgorithms, _paramValue!,
   _parametersOnly, _relationSlots, _relationInstances,
-  _isTimeRelation, _timeRelationSlots, _continuous,
+  _isTimeRelation, _timeRelationSlots, _continuous, _assertRows,
   domainSystem, ns, Schedule, causalSchedule!, ParameterBinding, parameterBindings, _bindingDeps, InitialSystem
 
 const SII = ModelingToolkit.SymbolicIndexingInterface
@@ -2066,6 +2066,8 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
     (schedule.deps, schedule.pattern)
   local solutions::Dict{Tuple{Int, Int}, Union{Nothing, Tuple{Ref, IR}}} = schedule.solutions
   local (needed::BitVector, relNeeded::BitVector, invariant::BitVector) = (schedule.needed, schedule.relNeeded, schedule.invariant)
+  local functionAsserts::Bool = _containsErrorCall(functionDefs)
+  local assertNeeded::BitVector = _assertRows(g, el, matchRow, producer, loops, invariant, functionAsserts)
   local (initUnknowns::Vector{Int}, nInit::Int, freeCols::Vector{Tuple{String, Int}}) =
     (schedule.initial.matchRow, schedule.initial.nRows, schedule.initial.freeColumns)
   local initialSystem::InitialSystem = schedule.initialSystem
@@ -2153,7 +2155,11 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
      compiled there and in invariants!. =#
   local body = Any[]; local rhsBody = Any[]
   local invariantBody = Any[]; local condBody = Any[]
+  #= the rows the asserts' checks during a solve compute (`assertRows!`, `_assertRows`) =#
+  local assertRowBody = Any[]
   local emit! = function (nslots, domain, batch, code)
+    local checked = [r for r in batch if assertNeeded[r]]
+    isempty(checked) || push!(assertRowBody, nslots == 0 ? _oneColumn(copy(code)) : _loopCode(nslots, domain, [el.col[r] for r in checked], copy(code)))
     local dynamic = [r for r in batch if !invariant[r]]
     isempty(dynamic) ||
       push!(body, nslots == 0 ? _oneColumn(code) : _loopCode(nslots, domain, [el.col[r] for r in dynamic], code))
@@ -2206,10 +2212,12 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
           eachindex(familyTemplates))
   #= a family's solve for some of its members: its call (`loopFamilySolve!`) with them =#
   local familyCall::Function = (f::Int, ms::Vector{Int}) -> Expr(:call, (loopBodies[f]::Expr).args..., ms)
-  local callFamily!::Function = function (f::Int, members::Vector{Int}, neededMembers::Vector{Int}, crossingMembers::Vector{Int})
+  local callFamily!::Function = function (f::Int, members::Vector{Int}, neededMembers::Vector{Int}, crossingMembers::Vector{Int},
+                                          checkedMembers::Vector{Int})
     push!(body, familyCall(f, members))
     isempty(neededMembers) || push!(rhsBody, familyCall(f, neededMembers))
     isempty(crossingMembers) || push!(condBody, familyCall(f, crossingMembers))
+    isempty(checkedMembers) || push!(assertRowBody, familyCall(f, checkedMembers))
   end
   #= the large blocks, in schedule order: each a residual function (its unknowns placed where the equations read them,
      then its instances' residuals, a loop per class over their columns) and its solver's call (blockSolve!) =#
@@ -2282,6 +2290,7 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
     push!(body, call)
     needed[rs[1]] && push!(rhsBody, copy(call))
     relNeeded[rs[1]] && push!(condBody, copy(call))
+    assertNeeded[rs[1]] && push!(assertRowBody, copy(call))
   end
   for ((ci, p), batch) in batches
     if ci == 0 && large[batch[1]]
@@ -2291,7 +2300,8 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
     if ci == 0
       local members::Vector{Int} = Int[blockMember[b] for b in batch]
       callFamily!(p, members, Int[blockMember[b] for b in batch if needed[loops.blocks[b][1]]],
-                  Int[blockMember[b] for b in batch if relNeeded[loops.blocks[b][1]]])
+                  Int[blockMember[b] for b in batch if relNeeded[loops.blocks[b][1]]],
+                  Int[blockMember[b] for b in batch if assertNeeded[loops.blocks[b][1]]])
       continue
     end
     if ci < 0
@@ -2317,7 +2327,7 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
       local f::Int = length(familyTemplates)
       loopFamily!(f, familyTemplates[f], [[r] for r in batch], Int[get(initialSystem.rowBase, r, -1) for r in batch])
       callFamily!(f, collect(1:length(batch)), Int[k for (k, r) in enumerate(batch) if needed[r]],
-                  Int[k for (k, r) in enumerate(batch) if relNeeded[r]])
+                  Int[k for (k, r) in enumerate(batch) if relNeeded[r]], Int[k for (k, r) in enumerate(batch) if assertNeeded[r]])
       continue
     end
     local (target::Ref, value::IR) = solution
@@ -2659,14 +2669,16 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
     _splitStatements(:crossings!, Symbol[:du, :a, :u, :p, :t, :z, :mode], Symbol[:fire], paramLocals, condBody; fired = true)
   local (invDefs::Vector{Expr}, invStmts::Vector{Any}) =
     _splitStatements(:invariants!, Symbol[:a, :p], Symbol[], paramLocals, _rollRuns(invariantBody); fired = false)
+  local (assertRowDefs::Vector{Expr}, assertRowStmts::Vector{Any}) =
+    _splitStatements(:assertRows!, Symbol[:du, :a, :u, :p, :t], Symbol[:z, :mode, :fire], paramLocals, assertRowBody; fired = true)
   local blockSplits::Vector{Tuple{Vector{Expr}, Vector{Any}}} =
     Tuple{Vector{Expr}, Vector{Any}}[_splitStatements(Symbol("BLOCK_", k, "!"), Symbol[:res, :y, :du, :a, :u, :p, :t, :z, :mode, :fire],
                                                       Symbol[], paramLocals, code.args; fired = false)
                                      for (k, code) in enumerate(blockBodies)]
   local splitDefs::Vector{Expr} = vcat(rhsDefs, condDefs, Expr[d for (defs, _) in blockSplits for d in defs])
   #= equations! and invariants! with their parts: the model module's submodule ColdCode =#
-  local coldDefs::Vector{Expr} = vcat(eqDefs, invDefs)
-  local coldNames::Vector{Symbol} = vcat(Symbol[:equations!, :invariants!], Symbol[_definedName(d) for d in coldDefs])
+  local coldDefs::Vector{Expr} = vcat(eqDefs, invDefs, assertRowDefs)
+  local coldNames::Vector{Symbol} = vcat(Symbol[:equations!, :invariants!, :assertRows!], Symbol[_definedName(d) for d in coldDefs])
   local code = quote
     using DifferentialEquations
     using OrdinaryDiffEq
@@ -2888,7 +2900,7 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
     #= A model function with an assert: the equations are evaluated after each step as for
        the model's asserts (a call only an algebraic variable reads was never made: OMJL's
        AssertTests.ConstantCall, positiveTwice(-1.0)). =#
-    const FUNCTION_ASSERTS = $(_containsErrorCall(functionDefs))
+    const FUNCTION_ASSERTS = $(functionAsserts)
 
     $(hasTerminate ? quote
         #= a terminate() reached (its message, p.state.terminated): the run ends after the event, at the start if the
@@ -2896,11 +2908,13 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
         _terminate!(p, message) = (p.state.terminated === nothing && (p.state.terminated = string(message)); nothing)
       end : nothing)
 
+    #= The asserts at (u, t) during a solve: the rows they need first (assertRows!, on p.abuf with its time-invariant
+       values; the algorithms' asserts checked there). =#
     function checkAsserts(u, p, t)
-      local du = similar(u); local a = similar(u, $nAlg)
+      local du = similar(u); local a = p.abuf
       p.checking[1] = true
       try
-        equations!(du, a, u, p, t, $(NO_CROSSINGS), false)
+        assertRows!(du, a, u, p, t)
       finally
         p.checking[1] = false
       end
@@ -2912,12 +2926,12 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
     end
 
     $(nCross == 0 ? nothing : quote
-        #= The asserts' relations as crossings (the right-hand side's equations at (u, t) first), checked at the step
+        #= The asserts' relations as crossings (the rows they need at (u, t) first, assertRows!), checked at the step
            ends: a violation that starts and ends within a step is found where it starts. =#
         function assertCrossings!(out, u, t, integrator)
           local p = integrator.p
-          local du = similar(u); local a = similar(u, $nAlg)
-          equations!(du, a, u, p, t, $(NO_CROSSINGS), false)
+          local du = similar(u); local a = p.abuf
+          assertRows!(du, a, u, p, t)
           $(paramLocals...)
           @inbounds begin
             $(crossBody...)
@@ -3141,8 +3155,20 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
         end
         return nothing
       end
+
+      #= The rows the asserts' checks during a solve need (`_assertRows`) into a, which holds the time-invariant values
+         (p.abuf, from invariants!): what the asserts read, the algorithms with asserts, the calls of functions with
+         asserts. =#
+      function assertRows!(du, a, u, p, t)
+        $(paramLocals...)
+        local z = $(NO_CROSSINGS); local mode::Bool = false; local fire::Bool = false; local _fired::Bool = false
+        @inbounds begin
+          $(assertRowStmts...)
+        end
+        return nothing
+      end
     end
-    using .ColdCode: equations!, invariants!
+    using .ColdCode: equations!, invariants!, assertRows!
 
     const CODE = $(ArrayModelCode)(equations!, whens!, crossings!, delayNow!, initialResiduals!, initialAlgorithms!,
                                    checkAsserts, USES_LEFT, CROSSINGS_ONLY, $(hasTerminate), $(nCross > 0), N_DELAYS,
