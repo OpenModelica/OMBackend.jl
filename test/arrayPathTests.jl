@@ -3461,4 +3461,29 @@ end DivideInLoop;
     @test _arrayPathTaken(name)
     @test_logs (:warn, r"e=  three\|$") match_mode = :any OMBackend.simulateModel(name; tspan = (0.0, 1.0))
   end
+
+  @testset "A translate of unchanged code keeps the module; changed code evaluates it again" begin
+    #= a model of a file simulated again is translated again: its module was compiled again (BouncingBall: 0.7 s) =#
+    local decay(rate::String) = OMFrontend.OMParser.@Modelica """
+      model KeptDecay
+        Real x[2](each start = 1.0, each fixed = true);
+      equation
+        der(x) = {-x[1], -$(rate) * x[2]};
+      end KeptDecay;
+      """
+    local name::String = _translateProgram(decay("2.0"), "KeptDecay"; scalarized = false)
+    @test _arrayPathTaken(name)
+    OMBackend.simulateModel(name; tspan = (0.0, 1.0))
+    local evaluated::Module = OMBackend._modelModule(Symbol(name))
+    _translateProgram(decay("2.0"), "KeptDecay"; scalarized = false)
+    @test !OMBackend.modelWasCompiledAgainDE(name)
+    local sol = OMBackend.simulateModel(name; tspan = (0.0, 1.0), reltol = 1e-8, abstol = 1e-10)
+    @test OMBackend._modelModule(Symbol(name)) === evaluated
+    @test _values(sol, ["x[1]", "x[2]"]) ≈ [exp(-1.0), exp(-2.0)] rtol = 1e-6
+    _translateProgram(decay("3.0"), "KeptDecay"; scalarized = false)
+    @test OMBackend.modelWasCompiledAgainDE(name)
+    sol = OMBackend.simulateModel(name; tspan = (0.0, 1.0), reltol = 1e-8, abstol = 1e-10)
+    @test OMBackend._modelModule(Symbol(name)) !== evaluated
+    @test _values(sol, ["x[1]", "x[2]"]) ≈ [exp(-1.0), exp(-3.0)] rtol = 1e-6
+  end
 end

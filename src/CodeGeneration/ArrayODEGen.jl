@@ -340,6 +340,52 @@ function _luSolve!(x::Vector{T}, F::Matrix{T}, pivots::Vector{Int}, b::Vector{T}
   return x
 end
 
+"""
+What the simulation's functions common to every array model (arrayEvents.jl: the event iteration and callbacks;
+arrayAsserts.jl: the asserts during a solve; arrayInitialization.jl: the initial system) read of a model
+(`ArrayModelParameters.code`, the module's `CODE`): its own functions, the code of its equations, its relations' slots
+and its initial system. The functions are called through `Function` fields: the common functions are compiled once
+(into the package image), not again for each model's module.
+"""
+struct ArrayModelCode
+  equations!::Function
+  whens!::Function
+  crossings!::Function
+  delayNow!::Function
+  initialResiduals!::Function
+  initialAlgorithms!::Function
+  checkAsserts::Function
+  #= the algebraic variables' left limit at an event (pre() of an algebraic variable) =#
+  usesLeft::Bool
+  #= the relations' crossing functions need no when-condition (crossings!) =#
+  crossingsOnly::Bool
+  hasTerminate::Bool
+  #= the asserts' relations on continuous values are crossings (assertCrossings!) =#
+  hasCrossingAsserts::Bool
+  nDelays::Int
+  nSamples::Int
+  #= per relation slot: a relation (not an event-generating function's crossing function), of time, the first slot of
+     its equation instance =#
+  relationSlot::BitVector
+  timeSlot::BitVector
+  relationInstance::Vector{Int}
+  #= the initial system: the states and the fixed = false parameters (positions in p.values) it determines, the initial
+     equations' instances it is solved from and the ones beyond them (with their texts), the loops' unknowns it holds,
+     per row the unknowns it reads (`nothing`: from finite differences) =#
+  initUnknowns::Vector{Int}
+  initParams::Vector{Int}
+  nInit::Int
+  initRows::Vector{Int}
+  initRedundant::Vector{Int}
+  initRedundantTexts::Vector{String}
+  initLoopPlaces::Vector{Tuple{Int, Int, Int}}
+  initReads::Union{Nothing, Vector{Vector{Int}}}
+  #= the discrete variables of the lifted clusters (initialClusters!) =#
+  clusterPre::Vector{Int}
+  #= per assert its condition's text, its message's and whether it is a warning =#
+  asserts::Vector{Tuple{String, String, Bool}}
+end
+
 struct ArrayModelParameters
   values::Vector{Float64}
   rel::Vector{Bool}
@@ -368,15 +414,16 @@ struct ArrayModelParameters
   pass::InitialPass           #= the loops the initial solve holds (`initialize`) =#
   state::ArrayRuntimeState     #= the run's state (samples, memo, warnings, asserts, terminate) =#
   model::Module
+  code::ArrayModelCode
 end
 
 """
 A copy of a problem's parameters (`remake(prob; p = deepcopy(prob.p))`, an ensemble's trajectories): its buffers,
-solvers and run state copied, the model's module shared (a module is no value: `deepcopy` refused it).
+solvers and run state copied, the model's module and code shared (a module is no value: `deepcopy` refused it).
 """
 function Base.deepcopy_internal(p::ArrayModelParameters, dict::IdDict)::ArrayModelParameters
   haskey(dict, p) && return dict[p]
-  local fields::Vector{Any} = Any[f === :model ? p.model : Base.deepcopy_internal(getfield(p, f), dict)
+  local fields::Vector{Any} = Any[f in (:model, :code) ? getfield(p, f) : Base.deepcopy_internal(getfield(p, f), dict)
                                   for f in fieldnames(ArrayModelParameters)]
   local q::ArrayModelParameters = ArrayModelParameters(fields...)
   dict[p] = q
@@ -2447,9 +2494,6 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
     const N_DELAYS = $(nDelays)
     #= the sample() instances (their starts and intervals each problem's, set by sampleSchedule! after the initialization) =#
     const N_SAMPLES = $(length(sampleSchedule))
-    #= the round-off of a tick st + k dt, relative to the largest magnitude in it (omc's SAMPLE_EPS 1e-14): ticks within
-       it of each other or of the start or stop time are one instant =#
-    const SAMPLE_EPS = 1.0e-14
     const N_WHENS = $(nWhenInst)
     #= discrete variables equations compute (unknowns kept in the discrete buffer, set by the event iteration) =#
     const N_DISCRETE_UNKNOWNS = $(length(g.discUnknown))
@@ -2597,73 +2641,7 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
         #= a terminate() reached (its message, p.state.terminated): the run ends after the event, at the start if the
            initialization reached it =#
         _terminate!(p, message) = (p.state.terminated === nothing && (p.state.terminated = string(message)); nothing)
-        function _terminateReached!(integrator)
-          local message = integrator.p.state.terminated
-          message === nothing && return true
-          integrator.p.state.terminated = nothing
-          @info "Modelica terminate() reached" message time = integrator.t
-          DifferentialEquations.SciMLBase.terminate!(integrator)
-          return true
-        end
       end : nothing)
-
-    #= p.state.probe: _violated! looks for a violation without reporting it =#
-    function _assertFailed(p, k::Int, instance, t, message)
-      local (condition, _, warning) = ASSERTS[k]
-      if p.state.probe
-        (warning && instance in p.state.warned) || (p.state.violated = true)
-        return true
-      end
-      warning || throw($(ModelicaAssertionError)(Float64(t), message, condition))
-      instance in p.state.warned ||
-        (push!(p.state.warned, instance); @warn string("Assertion violated at time ", t, ": ", message) condition)
-      return true
-    end
-
-    #= Whether an assert is violated at (u, t) (a warning reported already does not count). =#
-    function _violated!(u, p, t)
-      p.state.probe = true; p.state.violated = false
-      try
-        checkAsserts(u, p, t)
-      finally
-        p.state.probe = false
-      end
-      return p.state.violated
-    end
-
-    #= After a step: an assert violated at its end is reported at the first violating time in
-       the step (bisection on the step's interpolation), as the MTK path reports the crossing. =#
-    function _assertStep(u, t, integrator)
-      local p = integrator.p
-      try
-        $(nCross == 0 ? nothing : quote
-            #= a violation at a crossing is decided halfway to the next check, not at the step that ends at it =#
-            _assertPending!(integrator)
-            p.state.pending[1] == t && return false
-          end)
-        _violated!(u, p, t) || return false
-        #= violated within the step, with its discrete state (the step start's: an event that ended it changed them)
-           and the state just before an event that ended it (a reinit moved it): at the first violating time, by
-           bisection; else the event's, at it =#
-        local stepStart = p.state.stepStart
-        local uLeft = p.state.leftLimit[1] == t ? p.state.leftLimit[2] : u
-        local lo = integrator.tprev; local hi = t
-        $(_withDiscreteState)(() -> _violated!(uLeft, p, t), p, stepStart) || return (checkAsserts(u, p, t); false)
-        $(_withDiscreteState)(p, stepStart) do
-          if hi > lo
-            for _ in 1:100
-              local mid = (lo + hi) / 2
-              _violated!(integrator(mid), p, mid) ? (hi = mid) : (lo = mid)
-              hi - lo <= 1.0e-12 * max(1.0, abs(hi)) && break
-            end
-          end
-          checkAsserts(hi == t ? uLeft : integrator(hi), p, hi)
-        end
-        return false
-      finally
-        p.state.stepStart = $(_discreteState)(p)
-      end
-    end
 
     function checkAsserts(u, p, t)
       local du = similar(u); local a = similar(u, $nAlg)
@@ -2694,53 +2672,6 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
           return nothing
         end
 
-        #= A crossing (its time and state): decided at the next check, halfway to it, as the scalarized path: a relation
-           that touches its boundary (a piston at its top dead center) is past it by rounding there and holds again; one
-           that crosses fails halfway too, reported at the crossing, or after it where the relation is at its boundary
-           there (`x <= lim` at x = lim holds) at the first violation, by bisection on the step's interpolation. =#
-        function _assertPending!(integrator)
-          local p = integrator.p
-          local (τp, up) = p.state.pending
-          (isnan(τp) || integrator.t <= τp) && return nothing
-          p.state.pending = (NaN, Float64[])
-          local τm = (τp + integrator.t) / 2
-          #= within the step (its discrete state the step start's: an event that ended it changed them) =#
-          local within = integrator.tprev <= τm
-          local decide = () -> begin
-            local (um, tm) = within ? (integrator(τm), τm) : (copy(integrator.u), Float64(integrator.t))
-            _violated!(um, p, tm) || return nothing
-            _violated!(up, p, τp) && return (checkAsserts(up, p, τp); nothing)
-            (within && integrator.tprev <= τp) || return (checkAsserts(um, p, tm); nothing)
-            local lo = τp; local hi = tm
-            for _ in 1:100
-              local mid = (lo + hi) / 2
-              _violated!(integrator(mid), p, mid) ? (hi = mid) : (lo = mid)
-              hi - lo <= 1.0e-12 * max(1.0, abs(hi)) && break
-            end
-            checkAsserts(integrator(hi), p, hi)
-            return nothing
-          end
-          within ? $(_withDiscreteState)(decide, p, p.state.stepStart) : decide()
-          return nothing
-        end
-
-        function affectAssertCrossing!(integrator, _)
-          _assertPending!(integrator)
-          isnan(integrator.p.state.pending[1]) && (integrator.p.state.pending = (Float64(integrator.t), copy(integrator.u)))
-          DifferentialEquations.derivative_discontinuity!(integrator, false)
-          return nothing
-        end
-
-        #= at the end, a violation still pending is decided on the final state =#
-        function _assertPendingAtEnd!(integrator)
-          local p = integrator.p
-          local (τp, up) = p.state.pending
-          isnan(τp) && return nothing
-          p.state.pending = (NaN, Float64[])
-          _violated!(integrator.u, p, integrator.t) || return nothing
-          _violated!(up, p, τp) ? checkAsserts(up, p, τp) : checkAsserts(integrator.u, p, integrator.t)
-          return nothing
-        end
       end)
 
     #= The present values of the delay() calls' arguments and delay times at (u, t), into the run's delay state. =#
@@ -2755,149 +2686,11 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
       return nothing
     end
 
-    #= The delay() arguments at the integrator's point as left limits: a step's end, the state before an event. =#
-    function _delayLeft!(integrator)
-      delayNow!(integrator.u, integrator.p, integrator.t)
-      $(recordDelayStepEnd!)(integrator.p.state.delays, Float64(integrator.t))
-      return false
-    end
-
-    #= After the events of a step: an argument that changed at its end jumped (due again its delay time later). =#
-    function _delayJumps!(integrator)
-      delayNow!(integrator.u, integrator.p, integrator.t)
-      $(recordDelayJumps!)(() -> nothing, integrator.p.state.delays, Float64(integrator.t), integrator)
-      return false
-    end
-
-    #= At a solve's start, after the other callbacks' initializations: each history's first point. =#
-    function _delayStart!(integrator)
-      delayNow!(integrator.u, integrator.p, integrator.t)
-      $(startDelayHistories!)(integrator.p.state.delays, Float64(integrator.t))
-      return nothing
-    end
-
-    #= A delayed jump is due (delays.jl): the event iteration with the delayed values as right limits, until the
-       recorder after the events (`_delayJumps!`). =#
-    function affectDelay!(integrator)
-      integrator.p.state.delays.rightLimit = true
-      _eventAt!(integrator)
-      _logDiscretes!(integrator.p, integrator.t)
-      DifferentialEquations.derivative_discontinuity!(integrator, true)
-      return nothing
-    end
-
     #= Residuals of the initial equations at (u, t), du and a from equations!. =#
     function initialResiduals!(res, du, a, u, p, t)
       $(paramLocals...)
       @inbounds begin
         $(initBody...)
-      end
-      return nothing
-    end
-
-    #= The loops' unknowns of the initial solve (INIT_LOOP_PLACES): their guesses, and the guesses set to them. =#
-    function loopGuesses(p)
-      return Float64[f > 0 ? p.loops[f][j, m] : p.blocks[-f].y[j] for (f, j, m) in INIT_LOOP_PLACES]
-    end
-    function loopGuesses!(p, x)
-      for (k, (f, j, m)) in enumerate(INIT_LOOP_PLACES)
-        f > 0 ? (p.loops[f][j, m] = x[k]) : (p.blocks[-f].y[j] = x[k])
-      end
-      return p
-    end
-
-    #= The initial state: the free states (and fixed = false parameters, into p.values) the
-       initial equations determine, solved for them with the unknowns of the loops the initial equations reach
-       (`InitialSystem`, from `guesses`; the loops' residuals rows of the solve), as OpenModelica's initial system;
-       the loops solved again in the equations at the solution, from it. =#
-    function initialize(u0, p, t, guesses = loopGuesses(p))
-      local nS = length(INIT_UNKNOWNS)
-      local nR = nS + length(INIT_PARAMS)
-      local u = copy(u0)
-      local du = similar(u); local a = similar(u, $nAlg)
-      local setUnknowns! = function (uu, z)
-        uu[INIT_UNKNOWNS] .= view(z, 1:nS)
-        p.values[INIT_PARAMS] .= view(z, (nS + 1):nR)
-        loopGuesses!(p, view(z, (nR + 1):length(z)))
-        return uu
-      end
-      #= the relations keep their values during a solve =#
-      local residual = function (res, z, _)
-        local uz = similar(z, length(u0))
-        uz .= u0
-        setUnknowns!(uz, z)
-        local duz = similar(uz); local az = similar(uz, $nAlg)
-        p.pass.x .= view(z, (nR + 1):length(z))
-        p.pass.on = true
-        try
-          equations!(duz, az, uz, p, t, $(NO_CROSSINGS), false)
-        finally
-          p.pass.on = false
-        end
-        if isempty(INIT_REDUNDANT)
-          initialResiduals!(view(res, 1:nR), duz, az, uz, p, t)
-        else
-          local every = similar(res, N_INIT)
-          initialResiduals!(every, duz, az, uz, p, t)
-          view(res, 1:nR) .= view(every, INIT_ROWS)
-        end
-        view(res, (nR + 1):length(res)) .= p.pass.r
-        return nothing
-      end
-      #= MLS 8.6, as the MTK path: the relations at the guess, a solve with them, then at the
-         solution again, until they settle (a branch the solved state selects); relations that
-         cycle (no consistent branch) keep the first solution =#
-      local z = vcat(u0[INIT_UNKNOWNS], p.values[INIT_PARAMS], guesses)
-      #= sorted into blocks as OpenModelica's initial system (arrayInitialBlocks.jl), each solved scaled in a trust
-         region; Newton where that fails =#
-      local scale = map(x -> x == 0 ? 1.0 : abs(x), z)
-      local whole = (res, w) -> residual(res, w, nothing)
-      local scaledSolve = z0 -> $(sortedInitialSolve)(whole, Vector{Float64}(z0), scale, INIT_READS)
-      local first = nothing
-      local seen = Tuple{Vector{Bool}, Vector{Float64}}[]
-      for _ in 1:20
-        equations!(du, a, setUnknowns!(u, z), p, t, $(NO_CROSSINGS), true)
-        local rel0 = copy(p.rel); local e0 = copy(p.evv)
-        if (rel0, e0) in seen
-          equations!(du, a, setUnknowns!(u, first), p, t, $(NO_CROSSINGS), true)
-          return u
-        end
-        push!(seen, (rel0, e0))
-        local (ok, zs, _) = scaledSolve(z)
-        if ok
-          z = zs
-          first === nothing && (first = copy(z))
-          equations!(du, a, setUnknowns!(u, z), p, t, $(NO_CROSSINGS), true)
-          (p.rel == rel0 && p.evv == e0) && return u
-          continue
-        end
-        local sol = $(newtonInitialSolve)(residual, Vector{Float64}(z))
-        #= no solution: refused as the MTK path refuses it (OpenModelica fails there too) =#
-        DifferentialEquations.SciMLBase.successful_retcode(sol) ||
-          $(_OMBACKEND.unsupported)("fixed start values or initial equations that the initialization cannot hold",
-                                    string("the initial system (", sol.retcode, ")"))
-        z = copy(sol.u)
-        first === nothing && (first = copy(z))
-        equations!(du, a, setUnknowns!(u, z), p, t, $(NO_CROSSINGS), true)
-        (p.rel == rel0 && p.evv == e0) && return u
-      end
-      equations!(du, a, setUnknowns!(u, first), p, t, $(NO_CROSSINGS), true)
-      return u
-    end
-
-    #= The initial equations beyond the free states (INIT_REDUNDANT) at the initial state: each satisfied by what the
-       others gave, as OpenModelica keeps a model whose redundant initial equations are consistent; an error for
-       one that is not. =#
-    function checkRedundantInitial(u, p, t)
-      local du = similar(u); local a = similar(u, $nAlg)
-      equations!(du, a, u, p, t, $(NO_CROSSINGS), false)
-      local res = zeros(N_INIT)
-      initialResiduals!(res, du, a, u, p, t)
-      for (k, r) in enumerate(INIT_REDUNDANT)
-        abs(res[r]) <= 1.0e-6 ||
-          $(_OMBACKEND.unsupported)("fixed start values or initial equations that the initialization cannot hold",
-                                    string("the initialization is over-determined: ", INIT_REDUNDANT_TEXTS[k],
-                                           " (residual ", res[r], ")"))
       end
       return nothing
     end
@@ -2954,32 +2747,6 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
       end
       return nothing
     end
-
-    #= The start's mixed system (MLS 8.6: pre() the start values), as OpenModelica and the MTK path
-       (`_settleInitialDiscretes!`): the initial system was solved with the lifted clusters' variables at `used`
-       (their start values); their initial arms (`initialAlgorithms!`) gave their values at that solution. Where
-       those differ, the initial system again from the start values `uStart` with them, pre() of them the start
-       values `preStart`, until they stay (a cycle or 10 passes: the last solution stands, the start's event
-       iteration settles them). MSL RobotR3's bearing friction: solved unlocked (`a = sa + tau0_max`), the steady
-       start held the motor at the friction's limit (La.i = -0.43, omc 0); locked, sa keeps its start in the
-       initial system (`InitialSystem`). =#
-    $(isempty(clusterPre) ? nothing : quote
-        function initialClusters!(uStart, u, p, t, preStart::Vector{Float64}, used::Vector{Float64},
-                                  guessStart::Vector{Float64})
-          length(INIT_ROWS) > 0 || return u
-          local seen = Vector{Float64}[used]
-          for _ in 1:10
-            local now::Vector{Float64} = p.d[$clusterPre]
-            now in seen && return u
-            push!(seen, now)
-            p.dpre[$clusterPre] .= preStart
-            u = initialize(copy(uStart), p, t, copy(guessStart))
-            isempty(INIT_REDUNDANT) || checkRedundantInitial(u, p, t)
-            initialAlgorithms!(u, p, t)
-          end
-          return u
-        end
-      end)
 
     #= The starts of states and discrete variables that read a parameter, from the parameter values (an override
        reaches them); the loops' first guesses that are starts of algebraic variables computed at the start. =#
@@ -3089,384 +2856,20 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
                               [false], [false], copy(p.upre), copy(p.ureinit), copy(p.wnew), p.dlog, evv, copy(p.hyst), copy(p.tend),
                               copy(p.homotopy),
                               zeros($nAlg), copy(p.aleft), p.tgradAfter, p.tgradBefore, p.blocks, $(_rootsAt)(p, t, right), p.loopWork, p.pass, p.state,
-                              p.model)
+                              p.model, p.code)
       POSITIONS_OBJECTS && k > 0 && replayObjects!(u, q, times[k])
       equations!(similar(u), a, u, q, t, $(NO_CROSSINGS), false)
       return a
     end
 
-    #= One sweep at (u, t): passes with the same pre() until nothing changes (a fired body runs in each: with pre()
-       fixed it gives the same values). Returns whether they settled. =#
-    function _settle!(du, a, u, p, t, fire::Bool, searched::Bool = false)
-      p.upre .= u; p.ureinit .= u
-      empty!(p.state.whenMemo)
-      local rel0 = copy(p.rel); local d0 = copy(p.d)
-      local flips = falses(length(rel0))
-      for pass in 1:50
-        local relBefore = copy(p.rel); local dBefore = copy(p.d)
-        local rBefore = copy(p.ureinit); local wBefore = copy(p.wnew); local eBefore = copy(p.evv)
-        equations!(du, a, u, p, t, $(NO_CROSSINGS), true, fire)
-        whens!(du, a, u, p, t, $(NO_CROSSINGS), true, fire)
-        (relBefore == p.rel && dBefore == p.d && rBefore == p.ureinit && wBefore == p.wnew && eBefore == p.evv) &&
-          return true
-        pass > 25 && (flips .|= relBefore .!= p.rel)
-        pass > 46 && $(_traceSettlePass)(t, pass, (relBefore, dBefore, eBefore, wBefore, rBefore),
-                                         (p.rel, p.d, p.evv, p.wnew, p.ureinit))
-      end
-      #= relations that keep changing (a mixed system that cycles: a bridge's commutation): the combination of their
-         values that gives itself back, then the sweeps from it =#
-      searched && return false
-      $(_searchRelations!)(equations!, whens!, du, a, u, p, t, fire, rel0, d0, flips, RELATION_INSTANCE,
-                           RELATION_SLOT) || return false
-      return _settle!(du, a, u, p, t, fire, true)
-    end
-
-    #= The initialization's solution at (u, t): the relations, the when-conditions and the discrete variables the
-       equations compute, with pre() the start values (OpenModelica: pre(v) = v.start for the discrete variables).
-       No when fires on its condition there, the conditions' values become pre() of the conditions; with fire
-       (initial() true) the bodies of the whens initial() turns true run. reinit() has no effect. =#
-    function startSolution!(u, p, t, fire::Bool)
-      local du = similar(u); local a = similar(u, $nAlg)
-      _settle!(du, a, u, p, t, fire) || return false
-      p.ureinit .= u
-      p.wcond .= p.wnew
-      return true
-    end
-
-    #= homotopy() (MLS 3.7.4.4), as OpenModelica's default and the scalarized route (`_homotopyContinuation`): the
-       start solved at λ = 0 (the simplified expressions), then from each solution at λ = 1/3 and 2/3, the relations
-       and the loops' guesses at each step's solution; the initialization at λ = 1 follows from the last. MSL's
-       IdealizedOpAmpLimited (SignalGenerator): from the start values the limiter's loop went to the unstable linear
-       solution, all values 0 (OpenModelica: saturated). A step that fails: the initialization from the start values. =#
-    function homotopyStart!(u0, p, t)
-      local u = copy(u0)
-      local before = $(_discreteState)(p); local wcond = copy(p.wcond); local guesses = deepcopy(p.loops)
-      try
-        for λ in (0.0, 1 / 3, 2 / 3)
-          p.homotopy[1] = λ
-          length(INIT_ROWS) > 0 && (u = initialize(u, p, t))
-          startSolution!(u, p, t, false)
-        end
-      catch e
-        $(_OMBACKEND._fallback)(e, :arrayHomotopyContinuation, impact = :result)
-        u = copy(u0)
-        p.d .= before[1]; p.dpre .= before[2]; p.rel .= before[3]; p.evv .= before[4]
-        p.wcond .= wcond
-        for (g, g0) in zip(p.loops, guesses)
-          copyto!(g, g0)
-        end
-      finally
-        p.homotopy[1] = 1.0
-      end
-      return u
-    end
-
-    #= Event iteration at (u, t), in sweeps as OpenModelica's updateDiscreteSystem (and the MTK
-       path, relationRefresh.jl): within a sweep pre() keeps the values from before it, and the
-       relations, equations and fired when bodies are evaluated again until they settle (an
-       equation reading a variable a when body just set: ch = change(k)); a sweep that changed
-       a discrete value starts the next one from the new values, until one changes nothing. =#
-    #= The terminal event (MLS 8.6: terminal() is true at the end of a successful analysis): an event iteration at
-       the final time with terminal() true, in which the when-branches with it among their triggers run (MSL's
-       ContinuousSignalExtrema, `when {u <= x, u >= x, terminal()}`; an FFT's `when terminal()`); the discrete
-       values it gives logged at that time. =#
-    function _terminalEvent!(integrator)
-      local p = integrator.p
-      p.state.terminal = true
-      try
-        eventIteration!(integrator.u, p, integrator.t, true) ||
-          @error string("[events] the terminal event did not settle at t = ", integrator.t)
-        _logDiscretes!(p, integrator.t)
-      finally
-        p.state.terminal = false
-      end
-      return nothing
-    end
-
-    function eventIteration!(u, p, t, fire::Bool, sampleInstant::Bool = false; left::Bool = true)
-      local du = similar(u); local a = similar(u, $nAlg)
-      #= the algebraic variables' left limit: the equations with the relations and discrete values of before the
-         event (`left`; a crossing computed it already, before its relations changed: `affectCrossing!`) =#
-      if USES_LEFT && left
-        equations!(du, a, u, p, t, $(NO_CROSSINGS), false)
-        p.aleft .= a
-      end
-      for _ in 1:50
-        p.dpre .= p.d
-        _settle!(du, a, u, p, t, fire) || return false
-        #= at a sample instant the samples are true for the first pass only (OpenModelica's
-           updateDiscreteSystem: functionDAE once, the samples off, then iterated) =#
-        sampleInstant && fill!(p.sampleActive, false)
-        #= reinit() takes effect after the sweep; the next one reads it (and pre() of it), and
-           the conditions' values become pre() of the conditions =#
-        #= (at the initialization, as OpenModelica, reinit() has no effect) =#
-        local moved = !p.initPhase[1] && p.ureinit != u
-        moved && (u .= p.ureinit)
-        local switched = p.wnew != p.wcond
-        p.wcond .= p.wnew
-        (moved || switched || p.d != p.dpre) || return true
-        #= pre() in the next sweep: this one's values =#
-        USES_LEFT && (p.aleft .= a)
-      end
-      return false
-    end
-
-    #= The event iteration at an event during the solve: a model that does not settle
-       (relations switching back and forth) stops the simulation, as OpenModelica. =#
-    function _eventAt!(integrator, sampleInstant::Bool = false; left::Bool = true)
-      local p = integrator.p
-      #= the delay() arguments just before the event: their left limits (a jump is recorded after it, `_delayJumps!`) =#
-      N_DELAYS == 0 || _delayLeft!(integrator)
-      #= the state just before the event (a reinit moves it): the asserts' left limit =#
-      p.state.leftLimit = (Float64(integrator.t), copy(integrator.u))
-      local relBefore::Vector{Bool} = copy(p.rel); local dBefore::Vector{Float64} = copy(p.d)
-      if eventIteration!(integrator.u, p, integrator.t, true, sampleInstant; left)
-        #= After an event that changed the equations the next step starts small (`_restartStep!`). A relation's
-           crossing changed them; a sample instant did where a relation, a discrete variable or the state changed. =#
-        (!sampleInstant || relBefore != p.rel || dBefore != p.d || p.state.leftLimit[2] != integrator.u) &&
-          $(_restartStep!)(integrator)
-        return $(hasTerminate ? :(_terminateReached!(integrator)) : true)
-      end
-      @error string("[events] the event iteration did not settle at t = ", integrator.t,
-                    " (relations switching back and forth: a chattering model); the simulation stops")
-      DifferentialEquations.SciMLBase.terminate!(integrator, DifferentialEquations.SciMLBase.ReturnCode.Failure)
-      return false
-    end
-
-    function conditions!(out, u, t, integrator)
-      local p = integrator.p
-      local du = similar(u)
-      CROSSINGS_ONLY && return crossings!(du, p.abuf, u, p, t, $(CrossingOut)(out), false)
-      local a = similar(u, $nAlg)
-      equations!(du, a, u, p, t, $(CrossingOut)(out), false)
-      whens!(du, a, u, p, t, $(CrossingOut)(out), false, false)
-      return nothing
-    end
-
-    #= at the start of a solve: the relations' hysteresis for its tolerance and span =#
-    function _startHysteresis!(c, u, t, integrator)
-      integrator.p.hyst[1] = $(_hysteresis)(integrator)
-      return nothing
-    end
-
-    #= The loops' roots at the end of an accepted step, logged (_logRoots!). After an event at that time p holds
-       the roots of the event iteration's passes (the states before the reinit with the new discrete values): the
-       right-hand side at the state the next step starts from gives the roots the run goes on with. =#
-    function logStepRoots!(integrator)
-      local p = integrator.p
-      local t = integrator.t
-      if p.state.leftLimit[1] == t
-        local u = integrator.u
-        equations!(similar(u), similar(u, $nAlg), u, p, t, $(NO_CROSSINGS), false)
-      end
-      $(_logRoots!)(p, t)
-      return nothing
-    end
-
-    function _logDiscretes!(p, t)
-      local entry = vcat(p.d, Float64.(p.rel), p.evv)
-      (isempty(p.dlog) || p.dlog[end][2] != entry) && push!(p.dlog, (t, entry))
-      return nothing
-    end
-
-    #= A crossing: relations and when-conditions first take their values at the left limit
-       (the state just before the event), so a when fires exactly when its condition rises
-       across the event; a relation whose crossing the root finder found (`events`: +1 its crossing
-       function rose past zero, -1 it fell) changes where that is its change (a true one's rises, a
-       false one's falls) and its value at the left limit did not change already; then the event
-       iteration at the event. Re-evaluated there, a hair off its bound, the relation kept its value
-       where an algebraic loop solved inside the equations gave its last digits from another guess,
-       and the same crossing was found again in every step (MSL EngineV6's piston speed at dead
-       center). A time event (a relation of time and parameters crossed): the event iteration with
-       the relations literal at the instant (H = 0), as at a sample instant: one on its boundary
-       there changes with it (a brake's normal force ramped to 0 at the time event: f <= 0 holds).
-       The left limit lies beyond the hysteresis band (2H): a relation of time is located at its band's edge,
-       zc = -eps with eps = H*(1 + |t|), and at H = 1e-10 (reltol 1e-6) a left limit 1e-10*(1 + |t|) back put it
-       exactly on its threshold, where the exact-zero rule made it true already: the when on it took its rising
-       edge before the event and never fired (MSL 4.1 Trapezoid's `time >= (pre(count) + 1)*period +
-       startTime`: OpAmps.Differentiator's source stayed in its first period). =#
-    #= Whether t is the instant of the sample tick still to come (`sampleStops[2]`). A relation's change there
-       belongs to the tick's event (`affectSample!` takes the relations literal at the instant), which follows at this
-       time: handled first as an event of its own, the tick read the values of after the change (a clocked `sample(u)`
-       at the instant of u's step takes u's left limit, MLS 16.5.1: MSL Clocked BooleanSignals.Sample1). At: within
-       1e-12 of the run's time scale (its span, or the time where larger), not of a second: a pulse edge 1e-13 s after
-       a tick is no part of the tick (MSL Spice3 Inverter, a run of 1e-11 s: its sources' edges were dropped). Not a
-       tick that ran (`sampleStops[1]`): it took the relations at its time, and a threshold an ulp after it is a
-       crossing of its own (MSL SawTooth's `time >= (pre(count) + 1)*period + startTime` at 1251 * 25e-6, an ulp after
-       the tick of a sample of the same period: dropped, the reset waited for the end of the step after it, 1e-7 s, and
-       ChopperBuckBoost_DutyCycle's switching every other period with it). =#
-    function _atSampleInstant(p, t, tspan)
-      N_SAMPLES > 0 || return false
-      local stops = p.state.sampleStops
-      local span = abs(tspan[2] - tspan[1])
-      local w = 1.0e-12 * (isfinite(span) ? max(span, abs(t)) : 1 + abs(t))
-      return length(stops) >= 2 && abs(stops[2] - t) <= w
-    end
-
-    function affectCrossing!(integrator, events::AbstractVector{Int8})
-      local t = integrator.t
-      local p = integrator.p
-      if _atSampleInstant(p, t, integrator.sol.prob.tspan)
-        DifferentialEquations.derivative_discontinuity!(integrator, false)
-        return nothing
-      end
-      #= the delay() arguments' left limits, before the relations take their new values =#
-      N_DELAYS == 0 || _delayLeft!(integrator)
-      local tl = max(integrator.tprev, t - max(1e-10, 2 * p.hyst[1]) * (1 + abs(t)))
-      local ul = tl < t ? integrator(tl) : copy(integrator.uprev)
-      local du = similar(ul); local a = similar(ul, $nAlg)
-      local before::Vector{Bool} = copy(p.rel)
-      equations!(du, a, ul, p, tl, $(NO_CROSSINGS), true)
-      whens!(du, a, ul, p, tl, $(NO_CROSSINGS), true, false)
-      p.wcond .= p.wnew
-      #= the algebraic variables' left limit at t, with the relations of before the crossing: pre(u) of
-         u = if time < T then ... is u before the switch (MSL DemonstrateContinuousSignalExtrema's pulse edges) =#
-      if USES_LEFT
-        equations!(du, a, integrator.u, p, t, $(NO_CROSSINGS), false)
-        p.aleft .= a
-      end
-      local timed::Bool = false
-      for k in eachindex(events)
-        (events[k] != 0 && RELATION_SLOT[k] && p.rel[k] == before[k] && p.rel[k] == (events[k] > 0)) && (p.rel[k] = !p.rel[k])
-        timed |= events[k] != 0 && TIME_SLOT[k]
-      end
-      local _hyst = p.hyst[1]
-      timed && (p.hyst[1] = 0.0)
-      try
-        _eventAt!(integrator; left = false)
-      finally
-        p.hyst[1] = _hyst
-      end
-      _logDiscretes!(p, t)
-      DifferentialEquations.derivative_discontinuity!(integrator, true)
-      return nothing
-    end
-
-    #= A sample instant: the samples due now are true for the first pass of the event iteration,
-       false in the passes after it (OpenModelica's): what reads sample() other than as a when's
-       rising edge takes its fall at the instant (`y = not u and pre(u)` of `u = sample(...)`, CDL
-       FallingEdge: y rises and falls there; `k = if u then pre(k) + 1 else pre(k)` counts once),
-       and the when-conditions take that value too, so the next instant is a rising edge. =#
-    function affectSample!(integrator)
-      local t = integrator.t; local p = integrator.p; local u = integrator.u
-      N_DELAYS == 0 || _delayLeft!(integrator)
-      local tspan = integrator.sol.prob.tspan
-      local (starts, intervals, stops) = (p.state.sampleStart, p.state.sampleInterval, p.state.sampleStops)
-      local next = _nextSampleStop(p, t, tspan)
-      for id in eachindex(starts)
-        local k = round((t - starts[id]) / intervals[id])
-        local (ts, w) = _sampleTick(starts[id], intervals[id], k, tspan)
-        #= active at the stop its tick joined (_nextSampleStop): at or after it within its round-off, before the next =#
-        p.sampleActive[id] = k >= 0 && 0.0 <= ts - t <= w && ts < next
-      end
-      #= the relations literal at the instant (H = 0): one whose crossing function is 0 there (a
-         threshold the tick reaches, `time >= pulseStart + 0.2` at 1) changes with it, as
-         OpenModelica takes that state event together with the time event =#
-      local _hyst = p.hyst[1]
-      p.hyst[1] = 0.0
-      try
-        _eventAt!(integrator, true)
-      finally
-        p.hyst[1] = _hyst
-      end
-      fill!(p.sampleActive, false)
-      _logDiscretes!(p, t)
-      DifferentialEquations.derivative_discontinuity!(integrator, true)
-      #= the stop after this one =#
-      stops[1] = t
-      stops[2] = next
-      next < tspan[2] && DifferentialEquations.add_tstop!(integrator, next)
-      return nothing
-    end
-
-    #= Tick k of sample(st, dt) and its round-off w (SAMPLE_EPS of the largest magnitude in st + k dt): at the start
-       or stop time when within w of it (sample(-0.9, 0.3): 0). =#
-    function _sampleTick(st, dt, k, tspan)
-      local tk = st + k * dt
-      local w = SAMPLE_EPS * max(1.0, abs(st), abs(k * dt), abs(tk))
-      local ts = abs(tk - tspan[1]) <= w ? Float64(tspan[1]) : abs(tk - tspan[2]) <= w ? Float64(tspan[2]) : tk
-      return (ts, w)
-    end
-
-    #= The stop of p's samples after the stop `after` (NaN: the first one, at or after the start time); Inf where no
-       tick is left in tspan. Ticks within round-off of each other are one instant, a tick joining the stop before it
-       (3 * 0.2 and 2 * 0.3; sample(-100, 0.1) and sample(0, 0.1) near 0): affectSample! activates each sample at the
-       stop its tick joined. One stop at a time, each from the samples' ticks next to the last: a table of the ticks
-       over tspan took all memory where the period is far below the span (MSL Spice3 Inverter: V_pulse's
-       sample(TD, PER) of period 2e-12 s, its problem built over 1 s for the start check, 5e11 ticks). =#
-    function _nextSampleStop(p, after, tspan)
-      local next = Inf
-      local initial = isnan(after)
-      local from = initial ? Float64(tspan[1]) : after
-      for (st, dt) in zip(p.state.sampleStart, p.state.sampleInterval)
-        (isfinite(st) && isfinite(dt)) || error("array model: sample start and interval must be finite")
-        dt > 0 || error("array model: sample interval must be positive")
-        local k = max(0.0, ceil((from - st) / dt) - 1)
-        while true
-          local (ts, w) = _sampleTick(st, dt, k, tspan)
-          ts > tspan[2] && break
-          if initial ? ts >= tspan[1] : ts - after > w
-            next = min(next, ts)
-            break
-          end
-          k + 1 > k || error(string("array model: sample interval ", dt, " below the round-off of the time ", from))
-          k += 1
-        end
-      end
-      return next
-    end
-
-    #= The samples' stops as a callback: the first stop at the start of a solve (a tick at the start time handled
-       there), then each from the one before (affectSample!), a solver stop where within tspan. =#
-    function _sampleStart!(c, u, t, integrator)
-      local stops = integrator.p.state.sampleStops
-      local tspan = integrator.sol.prob.tspan
-      resize!(stops, 2)
-      stops[1] = -Inf
-      stops[2] = _nextSampleStop(integrator.p, NaN, tspan)
-      if stops[2] == t
-        affectSample!(integrator)
-      elseif stops[2] < tspan[2]
-        DifferentialEquations.add_tstop!(integrator, stops[2])
-      end
-      return nothing
-    end
-
-    _sampleDue(u, t, integrator) = t == integrator.p.state.sampleStops[2]
-
-    function affect!(integrator)
-      if _atSampleInstant(integrator.p, integrator.t, integrator.sol.prob.tspan)
-        DifferentialEquations.derivative_discontinuity!(integrator, false)
-        return nothing
-      end
-      _eventAt!(integrator)
-      _logDiscretes!(integrator.p, integrator.t)
-      DifferentialEquations.derivative_discontinuity!(integrator, true)
-      return nothing
-    end
-
-    #= After a step: whether a relation has another value than the stored one. A crossing
-       right after an event (the ball leaving the floor it was reinitialized just below) has
-       no sign change the root finder sees; it is caught here, at the end of the step. =#
-    function relationsChanged(u, t, integrator)
-      local p = integrator.p
-      local rel0 = copy(p.rel); local w0 = copy(p.wcond); local e0 = copy(p.evv)
-      #= the discrete values too: this evaluation runs the lifted clusters of discrete equations (and computes the
-         discrete unknowns) with the relations as they are now; left in place, pre() at the event that follows was
-         the value after it (`when sample() then bs := pre(b)` of `b = time >= 0.2` at the tick at 0.2) =#
-      local d0 = copy(p.d)
-      local du = similar(u)
-      if CROSSINGS_ONLY
-        crossings!(du, p.abuf, u, p, t, $(NO_CROSSINGS), true)
-      else
-        local a = similar(u, $nAlg)
-        equations!(du, a, u, p, t, $(NO_CROSSINGS), true)
-        whens!(du, a, u, p, t, $(NO_CROSSINGS), true, false)
-      end
-      local changed = rel0 != p.rel || e0 != p.evv
-      p.rel .= rel0; p.wcond .= w0; p.evv .= e0; p.d .= d0
-      return changed
-    end
+    #= the event iteration and callbacks, the asserts during a solve, the initial system: one method for every model
+       (arrayEvents.jl, arrayAsserts.jl, arrayInitialization.jl), over the model's code =#
+    $(_driverBindings()...)
+    const CODE = $(ArrayModelCode)(equations!, whens!, crossings!, delayNow!, initialResiduals!, initialAlgorithms!,
+                                   checkAsserts, USES_LEFT, CROSSINGS_ONLY, $(hasTerminate), $(nCross > 0), N_DELAYS,
+                                   N_SAMPLES, RELATION_SLOT, TIME_SLOT, RELATION_INSTANCE, INIT_UNKNOWNS, INIT_PARAMS,
+                                   N_INIT, INIT_ROWS, INIT_REDUNDANT, INIT_REDUNDANT_TEXTS, INIT_LOOP_PLACES, INIT_READS,
+                                   $(clusterPre), ASSERTS)
 
     #= The parameters and discrete state of a simulation over `tspan` (before the initialization). =#
     function modelParameters(tspan = (0.0, 1.0); parameters::AbstractDict = Dict{String, Any}())
@@ -3494,7 +2897,7 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
                            Matrix{Float64}[copy(G) for G in LOOP_GUESSES],
                            $(LoopWork){Float64}[$(LoopWork){Float64}(size(G, 1)) for G in LOOP_GUESSES],
                            $(InitialPass)(false, zeros(N_INIT_LOOPS), zeros(N_INIT_LOOPS)),
-                           $(ArrayRuntimeState)(N_SAMPLES, strings, N_DELAYS), @__MODULE__)
+                           $(ArrayRuntimeState)(N_SAMPLES, strings, N_DELAYS), @__MODULE__, CODE)
     end
 
     #= The problem and its event callbacks, as getMTKProblem returns them. =#
@@ -4096,5 +3499,9 @@ function _bindingCode(g::Gen, b::ParameterBinding)
     return nothing
   end
 end
+
+include("arrayEvents.jl")
+include("arrayAsserts.jl")
+include("arrayInitialization.jl")
 
 end #= module ArrayODEGen =#

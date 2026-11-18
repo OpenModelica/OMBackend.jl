@@ -281,6 +281,12 @@ const ARRAY_PATH_FULL = CodeGeneration.ArrayODEGen.FULL
 const ARRAY_ODE_MODELS = Set{String}()
 
 """
+The array ODE modules evaluated (model => (the module, the hash of its code)): a translate of the model whose code is
+the same keeps the module instead of evaluating it again (`_keptArrayModule`).
+"""
+const ARRAY_MODULES = Dict{String, Tuple{Module, UInt64}}()
+
+"""
 The models (canonical names) the last translate lowered with their arrays kept until the simulation code
 (`reducedArrayModel`: the index reduced in array form where above one; OMBACKEND_ARRAY_INDEX_REDUCTION).
 """
@@ -352,6 +358,7 @@ function clearCaches!(; models::Bool=true,
                       empty!(IMTKGen.REDUCED_SYSTEMS); empty!(IMTKGen.PRISTINE_P);
                       empty!(CodeGeneration.DAE_REINIT);
                       empty!(Runtime.RECOMPILED_MODES);
+                      empty!(ARRAY_MODULES);
                       Cache.clear!();
                       push!(cleared, "models"))
   implementations && (empty!(CodeGeneration.MODELICA_FUNCTION_IMPLS); empty!(CodeGeneration.MODELICA_FUNCTION_OWNERS);
@@ -385,6 +392,7 @@ function forgetModel(modelName::String)::Nothing
   for name in unique((modelName, cname))
     delete!(COMPILED_MODELS_MTK, name)
     delete!(COMPILED_MODELS_DEJL, name)
+    delete!(ARRAY_MODULES, name)
     #= else a simulate by name took it for a translated array model and found no code (MSL SignConvention after
        a coverage worker forgot it: "DE-mode model ... is not compiled") =#
     delete!(ARRAY_ODE_MODELS, name)
@@ -849,14 +857,33 @@ end
 "The array ODE module `modelCode` of the model `modelName` cached as a DE-mode model, recorded in ARRAY_ODE_MODELS."
 function _registerArrayODEModule!(modelName::String, modelCode::Expr)::Nothing
   dumpGeneratedCode(modelName, modelCode)
-  #= evaluated again at the next simulate: a module of this name may be another path's =#
-  COMPILED_MODELS_DEJL[modelName] = (modelCode, true, hash(modelCode))
+  local codeHash::UInt64 = hash(modelCode)
+  #= evaluated again at the next simulate, unless the module evaluated from the same code is the one defined (a
+     module of this name may be another path's) =#
+  COMPILED_MODELS_DEJL[modelName] = (modelCode, !_keptArrayModule(modelName, modelCode, codeHash), codeHash)
   Cache.store!(modelName, () -> modelCode)
   #= and the ModelingToolkit path's build goes: its module is replaced, and its code (the same
      for a model without arrays) would reuse the build at its next translate =#
   IMTKGen.forgetBuild(modelName)
   push!(ARRAY_ODE_MODELS, modelName)
   return nothing
+end
+
+"""
+    _keptArrayModule(modelName, modelCode, codeHash) -> Bool
+
+Whether the array module evaluated last for `modelName` (ARRAY_MODULES) is kept for the code `modelCode` (hash
+`codeHash`): the same code, and that module still the one defined (no other path's replaced it). A translate of an
+unchanged model (a model of a file simulated again) then does not compile its module again. Not for code that makes
+external objects (tables): `_registerArrayODEModule!` frees the model's objects (`forgetBuild`), and the module makes
+them at its evaluation.
+"""
+function _keptArrayModule(modelName::String, modelCode::Expr, codeHash::UInt64)::Bool
+  local previous::Union{Nothing, Tuple{Module, UInt64}} = get(ARRAY_MODULES, modelName, nothing)
+  (previous === nothing || previous[2] != codeHash) && return false
+  local sym::Symbol = Symbol(modelName)
+  (_modelDefined(sym) && _modelModule(sym) === previous[1]) || return false
+  return !_calls(modelCode, CodeGeneration._externalObjectRef)
 end
 
 """
@@ -893,6 +920,7 @@ function _evalModelDE(modelName::String, modelCode::Expr)
   @BACKEND_PERFLOG "[backendAPI] evaluate the DE-mode module" (@eval $modelCode)
   local (code, _, h) = COMPILED_MODELS_DEJL[modelName]
   COMPILED_MODELS_DEJL[modelName] = (code, false, h)
+  modelName in ARRAY_ODE_MODELS && (ARRAY_MODULES[modelName] = (_modelModule(Symbol(modelName)), h))
   return nothing
 end
 
