@@ -1334,6 +1334,105 @@ function _usedLocals(paramLocals::Vector{Any}, code::Union{Expr, Symbol})::Vecto
   return Any[l for l in paramLocals if _localName(l) in used]
 end
 
+"Whether `x` is the code of a class of one column (`_oneColumn`, `_loopCode`): a `let` without bindings."
+_isOneColumn(@nospecialize(x::Any))::Bool =
+  x isa Expr && x.head === :let && x.args[1] isa Expr && (x.args[1]::Expr).head === :block && isempty((x.args[1]::Expr).args)
+
+"Whether `x` is the operator of a subscript's integer arithmetic."
+_isIndexArithmetic(x::Expr)::Bool = x.head === :call && length(x.args) >= 2 && x.args[1] in (:+, :-, :*)
+
+"""
+    _indexShape!(ints, x, inIndex) -> shape
+
+The shape of the code `x`: the integer literals of its subscripts (`a[2569]`, `P[1, 2]`, `a[13821 + (_col - 1)]`, the
+operands of their `+`, `-`, `*`) replaced by `:_INT` and pushed to `ints` in order, line numbers dropped. Other literals
+(an exponent, a function's argument) stay in the shape: their values decide the code's types or methods.
+"""
+function _indexShape!(ints::Vector{Int}, @nospecialize(x::Any), inIndex::Bool)::Any
+  inIndex && x isa Int && (push!(ints, x); return :_INT)
+  x isa Expr || return x
+  local args::Vector{Any} = Any[]
+  if x.head === :ref
+    push!(args, _indexShape!(ints, x.args[1], false))
+    for y in @view x.args[2:end]; push!(args, _indexShape!(ints, y, true)); end
+  elseif inIndex && _isIndexArithmetic(x)
+    push!(args, x.args[1])
+    for y in @view x.args[2:end]; push!(args, _indexShape!(ints, y, true)); end
+  else
+    for y in x.args; y isa LineNumberNode || push!(args, _indexShape!(ints, y, false)); end
+  end
+  return Expr(x.head, args...)
+end
+
+"""
+    _withIndexInts(x, subs, at, inIndex)
+
+`x` with its subscripts' integer literals (in `_indexShape!`'s order) replaced by `subs`; `at` counts them.
+"""
+function _withIndexInts(@nospecialize(x::Any), subs::Vector{Any}, at::Base.RefValue{Int}, inIndex::Bool)::Any
+  inIndex && x isa Int && return subs[at[] += 1]
+  x isa Expr || return x
+  if x.head === :ref
+    return Expr(:ref, _withIndexInts(x.args[1], subs, at, false),
+                Any[_withIndexInts(y, subs, at, true) for y in @view x.args[2:end]]...)
+  elseif inIndex && _isIndexArithmetic(x)
+    return Expr(x.head, x.args[1], Any[_withIndexInts(y, subs, at, true) for y in @view x.args[2:end]]...)
+  end
+  return Expr(x.head, Any[_withIndexInts(y, subs, at, false) for y in x.args]...)
+end
+
+"""
+    _rollRuns(stmts) -> stmts
+
+Consecutive classes of one column (`_isOneColumn`) whose code differs only in its subscripts' integer literals
+(`_indexShape!`) as one loop over them, in their order: a literal the same in all of them stays, one that varies is
+affine in the loop's counter `_run` or read from a table of its values. The rows of an array split into classes of one
+element each (MSL EngineV6: 9,889 of them, 204k of its 411k nodes, in runs of up to 216) are then compiled once per run.
+A run whose loop would not be smaller stays as it is. For `equations!` and `invariants!` only (`ColdCode`): in the
+solver's steps the tables' reads cost more than the code saves (EngineV6's solve 3.15 -> 3.70 s with all functions
+rolled).
+"""
+function _rollRuns(stmts::Vector{Any})::Vector{Any}
+  local out::Vector{Any} = Any[]
+  local i::Int = 1
+  while i <= length(stmts)
+    local st::Any = stmts[i]
+    if !_isOneColumn(st)
+      push!(out, st)
+      i += 1
+      continue
+    end
+    local firstInts::Vector{Int} = Int[]
+    local shape::Any = _indexShape!(firstInts, (st::Expr).args[2], false)
+    local cols::Vector{Vector{Int}} = Vector{Int}[firstInts]
+    local j::Int = i
+    while j < length(stmts) && _isOneColumn(stmts[j + 1])
+      local ints::Vector{Int} = Int[]
+      _indexShape!(ints, (stmts[j + 1]::Expr).args[2], false) == shape || break
+      push!(cols, ints)
+      j += 1
+    end
+    local m::Int = j - i + 1
+    if m < 2 || isempty(firstInts) || (m - 1) * _nodeCount(st) < 64
+      append!(out, @view stmts[i:j])
+      i = j + 1
+      continue
+    end
+    local V::Matrix{Int} = reduce(hcat, cols)
+    local subs::Vector{Any} = Any[]
+    for r::Int in axes(V, 1)
+      local (a::Int, b::Int) = (V[r, 1], V[r, 2] - V[r, 1])
+      push!(subs, all(c::Int -> V[r, c] == a + b * (c - 1), 1:m) ?
+                  (b == 0 ? a : :($a + $b * _run)) : :($(V[r, :])[_run + 1]))
+    end
+    push!(out, :(for _run in 0:$(m - 1)
+                   $(_withIndexInts((st::Expr).args[2], subs, Base.RefValue{Int}(0), false))
+                 end))
+    i = j + 1
+  end
+  return out
+end
+
 """
     _splitStatements(name, args, passed, paramLocals, stmts; fired) -> (defs, stmts)
 
@@ -2553,13 +2652,13 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
   local paramsType = ArrayModelParameters
   #= the large functions' statements in functions of bounded size (_splitStatements) =#
   local (eqDefs::Vector{Expr}, eqStmts::Vector{Any}) =
-    _splitStatements(:equations!, Symbol[:du, :a, :u, :p, :t, :z, :mode, :fire], Symbol[], paramLocals, body; fired = true)
+    _splitStatements(:equations!, Symbol[:du, :a, :u, :p, :t, :z, :mode, :fire], Symbol[], paramLocals, _rollRuns(body); fired = true)
   local (rhsDefs::Vector{Expr}, rhsStmts::Vector{Any}) =
     _splitStatements(:RHS!, Symbol[:du, :u, :p, :t], Symbol[:a, :z, :mode, :fire], paramLocals, rhsBody; fired = true)
   local (condDefs::Vector{Expr}, condStmts::Vector{Any}) =
     _splitStatements(:crossings!, Symbol[:du, :a, :u, :p, :t, :z, :mode], Symbol[:fire], paramLocals, condBody; fired = true)
   local (invDefs::Vector{Expr}, invStmts::Vector{Any}) =
-    _splitStatements(:invariants!, Symbol[:a, :p], Symbol[], paramLocals, invariantBody; fired = false)
+    _splitStatements(:invariants!, Symbol[:a, :p], Symbol[], paramLocals, _rollRuns(invariantBody); fired = false)
   local blockSplits::Vector{Tuple{Vector{Expr}, Vector{Any}}} =
     Tuple{Vector{Expr}, Vector{Any}}[_splitStatements(Symbol("BLOCK_", k, "!"), Symbol[:res, :y, :du, :a, :u, :p, :t, :z, :mode, :fire],
                                                       Symbol[], paramLocals, code.args; fired = false)
