@@ -264,6 +264,39 @@ function _precompileWarmupIR()::Nothing
   return nothing
 end
 
+"The residual of `_precompileWarmupArrayHelpers`'s initial system: z = (1, 2), two blocks."
+function _precompileResidual!(res::AbstractVector, z::AbstractVector)::Nothing
+  res[1] = z[1] - 1.0
+  res[2] = z[2] - 2.0 * z[1]
+  return nothing
+end
+
+"`_precompileResidual!` as NonlinearSolve calls it (`newtonInitialSolve`), with its parameters."
+_precompileResidual!(res::AbstractVector, z::AbstractVector, ::Any)::Nothing = _precompileResidual!(res, z)
+
+"""
+    _precompileWarmupArrayHelpers() -> Nothing
+
+The array code's helpers that every array model calls with its own functions (`@nospecialize`: compiled once, for
+`Function`), into the image: the initial system's solve (`sortedInitialSolve`, `scaledTrustRegionSolve`: NonlinearSolve's
+TrustRegion over `_ScaledResidual`; `newtonInitialSolve`), the asserts' step-start state (`_withDiscreteState`) and the relation search of
+an event iteration. Without them, a process's first model with asserts or an initial system compiled them (PID_Controller
+0.14 s, 2026-11-18).
+"""
+function _precompileWarmupArrayHelpers()::Nothing
+  local AG::Module = CodeGeneration.ArrayODEGen
+  for reads::Union{Nothing, Vector{Vector{Int}}} in (nothing, [[1], [1, 2]])
+    AG.sortedInitialSolve(_precompileResidual!, [0.0, 0.0], [1.0, 1.0], reads)
+  end
+  AG.newtonInitialSolve(_precompileResidual!, [0.0, 0.0])
+  local P::DataType = AG.ArrayModelParameters
+  local V::DataType = Vector{Float64}
+  precompile(AG._withDiscreteState, (Function, P, Tuple{V, V, Vector{Bool}, V}))
+  precompile(AG._searchRelations!, (Function, Function, V, V, V, P, Float64, Bool, Vector{Bool}, V, BitVector, Vector{Int},
+                                    BitVector))
+  return nothing
+end
+
 @setup_workload begin
   @compile_workload begin
     #= Escape hatch for fast dev precompiles. A workload failure must never break
@@ -281,6 +314,11 @@ end
         catch err
           @warn "[OMBackend] DirectRHS precompile warmup skipped" eventful exception = (err, catch_backtrace())
         end
+      end
+      try
+        _precompileWarmupArrayHelpers()
+      catch err
+        @warn "[OMBackend] array helpers precompile warmup skipped" exception = (err, catch_backtrace())
       end
       try
         Base.CoreLogging.with_logger(_precompileWarmupIR, Base.CoreLogging.NullLogger())

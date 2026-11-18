@@ -542,12 +542,18 @@ function _restoreStart!(p::ArrayModelParameters)::Nothing
 end
 
 """
+The combination of duplicate entries of a Jacobian's sparsity pattern (`sparse`): the first. One function for every model
+(a closure in the generated code compiled `sparse!` again for each model).
+"""
+_keepFirst(x::Float64, ::Float64)::Float64 = x
+
+"""
     _withDiscreteState(f, p, s)
 
 `f()` with the discrete state of `p` set to `s` (`_discreteState`; the step start's, where an event ended the step), restored
 after; with the state as it is where `s` holds none (before the first step).
 """
-function _withDiscreteState(f::Function, p::ArrayModelParameters, s::Tuple{Vector{Float64}, Vector{Float64}, Vector{Bool}, Vector{Float64}})
+function _withDiscreteState(@nospecialize(f::Function), p::ArrayModelParameters, s::Tuple{Vector{Float64}, Vector{Float64}, Vector{Bool}, Vector{Float64}})
   (length(s[1]) == length(p.d) && length(s[3]) == length(p.rel)) || return f()
   local now::Tuple{Vector{Float64}, Vector{Float64}, Vector{Bool}, Vector{Float64}} = _discreteState(p)
   p.d .= s[1]; p.dpre .= s[2]; p.rel .= s[3]; p.evv .= s[4]
@@ -901,7 +907,24 @@ bearing friction: `initial() and w_relfric < 0` at w = -5e-32 started it Backwar
   return op(x, y)
 end
 
+"""
+    CrossingOut(z)
+
+Where `equations!`, `whens!` and `crossings!` of an array model write their crossing functions: `z`, the event
+callback's output (a view, or a vector), or nowhere (`nothing`, `NO_CROSSINGS`). One type for all three: a model's
+functions compile once; with `nothing` or a view as their argument they compiled twice (MSL PID_Controller's
+`equations!` 5,400 and 5,700 statements, 2026-11-18).
+"""
+struct CrossingOut
+  z::Union{Nothing, SubArray{Float64, 1, Vector{Float64}, Tuple{UnitRange{Int}}, true}, Vector{Float64}}
+end
+
+"No crossing functions written (`CrossingOut`)."
+const NO_CROSSINGS = CrossingOut(nothing)
+
 "A relation of the hysteresis `band`, evaluated literally where `literal` (`_rel`, `_timeRel`)."
+@inline _relationAt(z::CrossingOut, p, mode::Bool, k::Int, x, y, op, literal::Bool, band::Float64) =
+  _relationAt(z.z, p, mode, k, x, y, op, literal, band)
 @inline function _relationAt(z, p, mode::Bool, k::Int, x, y, op, literal::Bool, band::Float64)
   #= as Float64: the difference of two native Integers (an opaque function's result) wraps around beyond 2^63 =#
   local zc = (op === (>) || op === (>=)) ? float(y) - float(x) : float(x) - float(y)
@@ -924,6 +947,7 @@ crossing comes 2e-6 before the mod's: PersonalityAspects).
 """
 _evInterval(kind::Symbol, v) = kind === :floor ? (v, v + 1) : kind === :ceil ? (v - 1, v) :
                                v > 0 ? (v, v + 1) : v < 0 ? (v - 1, v) : (-1.0, 1.0)
+@inline _evfn(z::CrossingOut, p, mode::Bool, k::Int, kind::Symbol, q) = _evfn(z.z, p, mode, k, kind, q)
 @inline function _evfn(z, p, mode::Bool, k::Int, kind::Symbol, q)
   local v = p.evv[k]
   local eps = p.hyst[1] * (1 + _finiteAbs(q))
@@ -2266,7 +2290,7 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
   local initAlgCode = Any[]
   for (k::Int, body::Any) in enumerate(initAlgBody)
     initAlgRefresh[k] &&
-      push!(initAlgCode, Expr(:block, initAlgWriteBack..., :(equations!(du, a, u, p, t, nothing, true))))
+      push!(initAlgCode, Expr(:block, initAlgWriteBack..., :(equations!(du, a, u, p, t, $(NO_CROSSINGS), true))))
     push!(initAlgCode, body)
   end
   local paramLocals = Any[]
@@ -2313,7 +2337,7 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
                              if nm in g.structural || nm in startFixed]
   local ruleExprs = [:(($(QuoteNode(sym)), $(deps), $(code === nothing ? :(nothing) : code))) for (sym, deps, code) in rules]
   local jacProto = pattern === nothing ? :(nothing) :
-    :(Symbolics.SparseArrays.sparse($(pattern[1]), $(pattern[2]), ones($(length(pattern[1]))), $nStates, $nStates, (x, y) -> x))
+    :(Symbolics.SparseArrays.sparse($(pattern[1]), $(pattern[2]), ones($(length(pattern[1]))), $nStates, $nStates, $(_keepFirst)))
   local paramsType = ArrayModelParameters
   #= the large functions' statements in functions of bounded size (_splitStatements) =#
   local (eqDefs::Vector{Expr}, eqStmts::Vector{Any}) =
@@ -2556,7 +2580,7 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
       local a = zeros($nAlg); local du = similar(u)
       for i in from:m
         local (ti, id, which) = log[i]
-        equations!(du, a, u, p, ti, nothing, false)
+        equations!(du, a, u, p, ti, $(NO_CROSSINGS), false)
         objectCall!(du, a, u, p, ti, nothing, false, false, id, which)
       end
       p.state.objectAt = m
@@ -2645,7 +2669,7 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
       local du = similar(u); local a = similar(u, $nAlg)
       p.checking[1] = true
       try
-        equations!(du, a, u, p, t, nothing, false)
+        equations!(du, a, u, p, t, $(NO_CROSSINGS), false)
       finally
         p.checking[1] = false
       end
@@ -2662,7 +2686,7 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
         function assertCrossings!(out, u, t, integrator)
           local p = integrator.p
           local du = similar(u); local a = similar(u, $nAlg)
-          equations!(du, a, u, p, t, nothing, false)
+          equations!(du, a, u, p, t, $(NO_CROSSINGS), false)
           $(paramLocals...)
           @inbounds begin
             $(crossBody...)
@@ -2722,7 +2746,7 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
     #= The present values of the delay() calls' arguments and delay times at (u, t), into the run's delay state. =#
     function delayNow!(u, p, t)
       local du = similar(u); local a = similar(u, $nAlg)
-      equations!(du, a, u, p, t, nothing, false)
+      equations!(du, a, u, p, t, $(NO_CROSSINGS), false)
       $(paramLocals...)
       local _now = p.state.delays.now; local _times = p.state.delays.times
       @inbounds begin
@@ -2806,7 +2830,7 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
         p.pass.x .= view(z, (nR + 1):length(z))
         p.pass.on = true
         try
-          equations!(duz, az, uz, p, t, nothing, false)
+          equations!(duz, az, uz, p, t, $(NO_CROSSINGS), false)
         finally
           p.pass.on = false
         end
@@ -2832,10 +2856,10 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
       local first = nothing
       local seen = Tuple{Vector{Bool}, Vector{Float64}}[]
       for _ in 1:20
-        equations!(du, a, setUnknowns!(u, z), p, t, nothing, true)
+        equations!(du, a, setUnknowns!(u, z), p, t, $(NO_CROSSINGS), true)
         local rel0 = copy(p.rel); local e0 = copy(p.evv)
         if (rel0, e0) in seen
-          equations!(du, a, setUnknowns!(u, first), p, t, nothing, true)
+          equations!(du, a, setUnknowns!(u, first), p, t, $(NO_CROSSINGS), true)
           return u
         end
         push!(seen, (rel0, e0))
@@ -2843,23 +2867,21 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
         if ok
           z = zs
           first === nothing && (first = copy(z))
-          equations!(du, a, setUnknowns!(u, z), p, t, nothing, true)
+          equations!(du, a, setUnknowns!(u, z), p, t, $(NO_CROSSINGS), true)
           (p.rel == rel0 && p.evv == e0) && return u
           continue
         end
-        local prob = NonlinearSolve.NonlinearProblem(NonlinearSolve.NonlinearFunction(residual), z)
-        local sol = NonlinearSolve.solve(prob, NonlinearSolve.NewtonRaphson(autodiff = ADTypes.AutoFiniteDiff());
-                                         abstol = 1e-10, reltol = 1e-10)
+        local sol = $(newtonInitialSolve)(residual, Vector{Float64}(z))
         #= no solution: refused as the MTK path refuses it (OpenModelica fails there too) =#
         DifferentialEquations.SciMLBase.successful_retcode(sol) ||
           $(_OMBACKEND.unsupported)("fixed start values or initial equations that the initialization cannot hold",
                                     string("the initial system (", sol.retcode, ")"))
         z = copy(sol.u)
         first === nothing && (first = copy(z))
-        equations!(du, a, setUnknowns!(u, z), p, t, nothing, true)
+        equations!(du, a, setUnknowns!(u, z), p, t, $(NO_CROSSINGS), true)
         (p.rel == rel0 && p.evv == e0) && return u
       end
-      equations!(du, a, setUnknowns!(u, first), p, t, nothing, true)
+      equations!(du, a, setUnknowns!(u, first), p, t, $(NO_CROSSINGS), true)
       return u
     end
 
@@ -2868,7 +2890,7 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
        one that is not. =#
     function checkRedundantInitial(u, p, t)
       local du = similar(u); local a = similar(u, $nAlg)
-      equations!(du, a, u, p, t, nothing, false)
+      equations!(du, a, u, p, t, $(NO_CROSSINGS), false)
       local res = zeros(N_INIT)
       initialResiduals!(res, du, a, u, p, t)
       for (k, r) in enumerate(INIT_REDUNDANT)
@@ -2883,7 +2905,7 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
     #= The asserts of the initial equations, once after the initialization. =#
     function checkInitialAsserts(u, p, t)
       local du = similar(u); local a = similar(u, $nAlg)
-      equations!(du, a, u, p, t, nothing, false)
+      equations!(du, a, u, p, t, $(NO_CROSSINGS), false)
       $(paramLocals...)
       @inbounds begin
         $(initAssertBody...)
@@ -3069,7 +3091,7 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
                               zeros($nAlg), copy(p.aleft), p.tgradAfter, p.tgradBefore, p.blocks, $(_rootsAt)(p, t, right), p.loopWork, p.pass, p.state,
                               p.model)
       POSITIONS_OBJECTS && k > 0 && replayObjects!(u, q, times[k])
-      equations!(similar(u), a, u, q, t, nothing, false)
+      equations!(similar(u), a, u, q, t, $(NO_CROSSINGS), false)
       return a
     end
 
@@ -3083,8 +3105,8 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
       for pass in 1:50
         local relBefore = copy(p.rel); local dBefore = copy(p.d)
         local rBefore = copy(p.ureinit); local wBefore = copy(p.wnew); local eBefore = copy(p.evv)
-        equations!(du, a, u, p, t, nothing, true, fire)
-        whens!(du, a, u, p, t, nothing, true, fire)
+        equations!(du, a, u, p, t, $(NO_CROSSINGS), true, fire)
+        whens!(du, a, u, p, t, $(NO_CROSSINGS), true, fire)
         (relBefore == p.rel && dBefore == p.d && rBefore == p.ureinit && wBefore == p.wnew && eBefore == p.evv) &&
           return true
         pass > 25 && (flips .|= relBefore .!= p.rel)
@@ -3166,7 +3188,7 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
       #= the algebraic variables' left limit: the equations with the relations and discrete values of before the
          event (`left`; a crossing computed it already, before its relations changed: `affectCrossing!`) =#
       if USES_LEFT && left
-        equations!(du, a, u, p, t, nothing, false)
+        equations!(du, a, u, p, t, $(NO_CROSSINGS), false)
         p.aleft .= a
       end
       for _ in 1:50
@@ -3214,10 +3236,10 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
     function conditions!(out, u, t, integrator)
       local p = integrator.p
       local du = similar(u)
-      CROSSINGS_ONLY && return crossings!(du, p.abuf, u, p, t, out, false)
+      CROSSINGS_ONLY && return crossings!(du, p.abuf, u, p, t, $(CrossingOut)(out), false)
       local a = similar(u, $nAlg)
-      equations!(du, a, u, p, t, out, false)
-      whens!(du, a, u, p, t, out, false, false)
+      equations!(du, a, u, p, t, $(CrossingOut)(out), false)
+      whens!(du, a, u, p, t, $(CrossingOut)(out), false, false)
       return nothing
     end
 
@@ -3235,7 +3257,7 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
       local t = integrator.t
       if p.state.leftLimit[1] == t
         local u = integrator.u
-        equations!(similar(u), similar(u, $nAlg), u, p, t, nothing, false)
+        equations!(similar(u), similar(u, $nAlg), u, p, t, $(NO_CROSSINGS), false)
       end
       $(_logRoots!)(p, t)
       return nothing
@@ -3294,13 +3316,13 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
       local ul = tl < t ? integrator(tl) : copy(integrator.uprev)
       local du = similar(ul); local a = similar(ul, $nAlg)
       local before::Vector{Bool} = copy(p.rel)
-      equations!(du, a, ul, p, tl, nothing, true)
-      whens!(du, a, ul, p, tl, nothing, true, false)
+      equations!(du, a, ul, p, tl, $(NO_CROSSINGS), true)
+      whens!(du, a, ul, p, tl, $(NO_CROSSINGS), true, false)
       p.wcond .= p.wnew
       #= the algebraic variables' left limit at t, with the relations of before the crossing: pre(u) of
          u = if time < T then ... is u before the switch (MSL DemonstrateContinuousSignalExtrema's pulse edges) =#
       if USES_LEFT
-        equations!(du, a, integrator.u, p, t, nothing, false)
+        equations!(du, a, integrator.u, p, t, $(NO_CROSSINGS), false)
         p.aleft .= a
       end
       local timed::Bool = false
@@ -3435,11 +3457,11 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
       local d0 = copy(p.d)
       local du = similar(u)
       if CROSSINGS_ONLY
-        crossings!(du, p.abuf, u, p, t, nothing, true)
+        crossings!(du, p.abuf, u, p, t, $(NO_CROSSINGS), true)
       else
         local a = similar(u, $nAlg)
-        equations!(du, a, u, p, t, nothing, true)
-        whens!(du, a, u, p, t, nothing, true, false)
+        equations!(du, a, u, p, t, $(NO_CROSSINGS), true)
+        whens!(du, a, u, p, t, $(NO_CROSSINGS), true, false)
       end
       local changed = rel0 != p.rel || e0 != p.evv
       p.rel .= rel0; p.wcond .= w0; p.evv .= e0; p.d .= d0
@@ -3728,10 +3750,10 @@ did not change in the sweeps. MSL IdealizedOpAmpLimited's `if V0*v_in > vps then
 V0*v_in` in SignalGenerator's comparator loop: at the fold the lower limit and the linear branch each gave the other,
 the upper limit (the jump to +15 V) is the solution.
 """
-function _searchRelations!(equations!::F, whens!::W, du::AbstractVector, a::AbstractVector, u::AbstractVector,
+function _searchRelations!(@nospecialize(equations!::Function), @nospecialize(whens!::Function), du::AbstractVector, a::AbstractVector, u::AbstractVector,
                            p::ArrayModelParameters, t::Real, fire::Bool, rel0::Vector{Bool}, d0::Vector{Float64},
                            flips::BitVector, instance::Vector{Int},
-                           relation::BitVector)::Bool where {F <: Function, W <: Function}
+                           relation::BitVector)::Bool
   local slots::Vector{Int} =
     sort!(union(findall(flips), _literalChanges!(equations!, whens!, du, a, u, p, t, fire, rel0, d0)))
   _searchCombinations!(equations!, whens!, du, a, u, p, t, fire, rel0, d0, slots) && return true
@@ -3748,9 +3770,9 @@ The combinations of the relations `slots` for `_searchRelations!`, fewest change
 gives itself back left in place (true), else the relations and discrete values `rel0` and `d0` restored (false); none
 tried for none or more than 12 slots.
 """
-function _searchCombinations!(equations!::F, whens!::W, du::AbstractVector, a::AbstractVector, u::AbstractVector,
+function _searchCombinations!(@nospecialize(equations!::Function), @nospecialize(whens!::Function), du::AbstractVector, a::AbstractVector, u::AbstractVector,
                               p::ArrayModelParameters, t::Real, fire::Bool, rel0::Vector{Bool}, d0::Vector{Float64},
-                              slots::Vector{Int})::Bool where {F <: Function, W <: Function}
+                              slots::Vector{Int})::Bool
   local trace::Bool = _OMBACKEND.envSwitch("OMBACKEND_ARRAY_TRACE")
   trace && println("[arraycode] relation search at t = ", t, ": relations ", slots)
   (isempty(slots) || length(slots) > 12) && return false
@@ -3768,8 +3790,8 @@ function _searchCombinations!(equations!::F, whens!::W, du::AbstractVector, a::A
     try
       for _ in 1:6
         local dBefore::Vector{Float64} = copy(p.d)
-        equations!(du, a, u, p, t, nothing, false, fire)
-        whens!(du, a, u, p, t, nothing, false, false)
+        equations!(du, a, u, p, t, NO_CROSSINGS, false, fire)
+        whens!(du, a, u, p, t, NO_CROSSINGS, false, false)
         if dBefore == p.d
           stable = true
           break
@@ -3779,8 +3801,8 @@ function _searchCombinations!(equations!::F, whens!::W, du::AbstractVector, a::A
       p.state.forced = false
     end
     (stable && all(isfinite, a) && all(isfinite, du)) || continue
-    equations!(du, a, u, p, t, nothing, true, fire)
-    whens!(du, a, u, p, t, nothing, true, fire)
+    equations!(du, a, u, p, t, NO_CROSSINGS, true, fire)
+    whens!(du, a, u, p, t, NO_CROSSINGS, true, fire)
     trace && println("[arraycode]   combination ", candidate[slots], " gives ", p.rel[slots], "; others changed: ",
                      setdiff(findall(p.rel .!= candidate), slots))
     p.rel == candidate && return true
@@ -3798,9 +3820,9 @@ differs from theirs: those within their hysteresis band (`_relationAt`). The equ
 discrete equations (`whens!`: a Boolean `regular = x >= 6`) evaluated once; the relations, discrete values,
 event-generating functions' values, when-conditions and reinit values are restored.
 """
-function _literalChanges!(equations!::F, whens!::W, du::AbstractVector, a::AbstractVector, u::AbstractVector,
+function _literalChanges!(@nospecialize(equations!::Function), @nospecialize(whens!::Function), du::AbstractVector, a::AbstractVector, u::AbstractVector,
                           p::ArrayModelParameters, t::Real, fire::Bool, rel0::Vector{Bool},
-                          d0::Vector{Float64})::Vector{Int} where {F <: Function, W <: Function}
+                          d0::Vector{Float64})::Vector{Int}
   local hyst::Float64 = p.hyst[1]
   local (evv::Vector{Float64}, wnew::Vector{Bool}, ureinit::Vector{Float64}) =
     (copy(p.evv), copy(p.wnew), copy(p.ureinit))
@@ -3809,8 +3831,8 @@ function _literalChanges!(equations!::F, whens!::W, du::AbstractVector, a::Abstr
   p.hyst[1] = 0.0
   local changed::Vector{Int} = Int[]
   try
-    equations!(du, a, u, p, t, nothing, true, fire)
-    whens!(du, a, u, p, t, nothing, true, fire)
+    equations!(du, a, u, p, t, NO_CROSSINGS, true, fire)
+    whens!(du, a, u, p, t, NO_CROSSINGS, true, fire)
     changed = findall(p.rel .!= rel0)
   finally
     p.hyst[1] = hyst

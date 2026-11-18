@@ -43,6 +43,25 @@ is not structurally regular, or that is one block, is solved whole.
 =#
 
 """
+    _ScaledResidual(residual!, scale, rows)
+
+`scaledTrustRegionSolve`'s residual: `residual!` of the unknowns times `scale`, each row times `rows`. `residual!` is a
+field of abstract type: the problem has one type for every model, so NonlinearSolve's solve compiles once (into the
+package image) and not again for each model's residual.
+"""
+struct _ScaledResidual
+  residual!::Function
+  scale::Vector{Float64}
+  rows::Vector{Float64}
+end
+
+function (r::_ScaledResidual)(res::AbstractVector, w::AbstractVector, ::Any)::Nothing
+  r.residual!(res, w .* r.scale)
+  res .*= r.rows
+  return nothing
+end
+
+"""
     scaledTrustRegionSolve(residual!, z0, scale) -> (ok, z, retcode)
 
 The solution of `residual!(res, z) = 0` from `z0`, as OpenModelica scales its nonlinear systems: each unknown by
@@ -51,7 +70,7 @@ LightningImpulse: T10 ~ 4e-7 and tau ~ 1e-5 beside eta ~ 1), each residual by it
 solved in a trust region (OpenModelica's hybrid dogleg): undamped Newton ran to LightningImpulse's degenerate root
 (tau1 = tau2, eta = 0).
 """
-function scaledTrustRegionSolve(residual!::Function, z0::Vector{Float64},
+function scaledTrustRegionSolve(@nospecialize(residual!::Function), z0::Vector{Float64},
                                 scale::Vector{Float64})::Tuple{Bool, Vector{Float64}, Any}
   local r0::Vector{Float64} = similar(z0)
   local rp::Vector{Float64} = similar(z0)
@@ -65,15 +84,40 @@ function scaledTrustRegionSolve(residual!::Function, z0::Vector{Float64},
     rows .= max.(rows, abs.(rp .- r0) ./ h)
   end
   rows .= map(r -> (r > 0 && isfinite(r)) ? 1 / r : 1.0, rows)
-  local scaledResidual::Function = function (res, w, _)
-    residual!(res, w .* scale)
-    res .*= rows
-    return nothing
-  end
-  local prob = NonlinearSolve.NonlinearProblem(NonlinearSolve.NonlinearFunction(scaledResidual), z0 ./ scale)
+  local prob = NonlinearSolve.NonlinearProblem(NonlinearSolve.NonlinearFunction{true}(_ScaledResidual(residual!, scale, rows)),
+                                               z0 ./ scale)
   local sol = NonlinearSolve.solve(prob, NonlinearSolve.TrustRegion(autodiff = ADTypes.AutoFiniteDiff());
                                    abstol = 1e-10, reltol = 1e-10)
   return (NonlinearSolve.SciMLBase.successful_retcode(sol), sol.u .* scale, sol.retcode)
+end
+
+"""
+    _ErasedResidual(residual!)
+
+A residual `residual!(res, z, p)` behind a field of abstract type: the problem has one type for every model
+(`newtonInitialSolve`).
+"""
+struct _ErasedResidual
+  residual!::Function
+end
+
+function (r::_ErasedResidual)(res::AbstractVector, z::AbstractVector, p::Any)::Nothing
+  r.residual!(res, z, p)
+  return nothing
+end
+
+"""
+    newtonInitialSolve(residual!, z0) -> solution
+
+The initial system `residual!(res, z, p) = 0` solved by Newton from `z0`, with finite differences: an array model's
+initialization where the scaled trust region (`sortedInitialSolve`) found no solution. Its problem is one type for every
+model (`_ErasedResidual`): NonlinearSolve's solve compiles once, into the package image; over the model's own closure
+it was inferred again for each model, run or not (PID_Controller 0.18 s, 2026-11-18).
+"""
+function newtonInitialSolve(@nospecialize(residual!::Function), z0::Vector{Float64})
+  local prob = NonlinearSolve.NonlinearProblem(NonlinearSolve.NonlinearFunction{true}(_ErasedResidual(residual!)), z0)
+  return NonlinearSolve.solve(prob, NonlinearSolve.NewtonRaphson(autodiff = ADTypes.AutoFiniteDiff());
+                              abstol = 1e-10, reltol = 1e-10)
 end
 
 """
@@ -84,7 +128,7 @@ structure, `nothing`: from finite differences), each by `scaledTrustRegionSolve`
 before it known; solved whole from `z0` where it has one block, is not structurally regular, or a block has no
 solution.
 """
-function sortedInitialSolve(residual!::Function, z0::Vector{Float64}, scale::Vector{Float64},
+function sortedInitialSolve(@nospecialize(residual!::Function), z0::Vector{Float64}, scale::Vector{Float64},
                             reads::Union{Nothing, Vector{Vector{Int}}})::Tuple{Bool, Vector{Float64}, Any}
   local blocks::Union{Nothing, Vector{Tuple{Vector{Int}, Vector{Int}}}} = initialBlocks(residual!, z0, scale, reads)
   if blocks !== nothing
@@ -117,7 +161,7 @@ branch of an if-expression read, as OpenModelica's matching; where it has none `
 connected components of the rows (Tarjan: a row's block after the blocks of the unknowns it reads). `nothing` for a
 system without a perfect matching, without an incidence, or of one block.
 """
-function initialBlocks(residual!::Function, z::Vector{Float64}, scale::Vector{Float64},
+function initialBlocks(@nospecialize(residual!::Function), z::Vector{Float64}, scale::Vector{Float64},
                        structure::Union{Nothing, Vector{Vector{Int}}}
                        )::Union{Nothing, Vector{Tuple{Vector{Int}, Vector{Int}}}}
   local n::Int = length(z)
@@ -143,7 +187,7 @@ Per residual row, the unknowns it reads: the rows that change when one unknown m
 at two generic points beside it (a value that is not defined at the start values, a reading that cancels at one point).
 A row counts at the points where it is finite; `nothing` where a row is finite at none of them.
 """
-function _initialIncidence(residual!::Function, z::Vector{Float64},
+function _initialIncidence(@nospecialize(residual!::Function), z::Vector{Float64},
                            scale::Vector{Float64})::Union{Nothing, Vector{Vector{Int}}}
   local n::Int = length(z)
   local depends::BitMatrix = falses(n, n)
