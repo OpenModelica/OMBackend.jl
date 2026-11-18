@@ -95,7 +95,7 @@ function lowerArraySystem(model::IR.Model)::SIM_CODE
     haskey(derivativeKey, key) && haskey(indexed, derivativeKey[key]) && (ht[derivativeKey[key]] = indexed[derivativeKey[key]])
   end
   local lowered::Function = (eq::IR.Equation) ->
-    arrayEquation(names, IR.mapEquation!((x::IR.Expression) -> elementReference(x, variables), deepcopy(eq)))
+    arrayEquation(names, IR.mapEquation!((x::IR.Expression) -> elementReference(x, variables), IR.copyEquation(eq)))
   local equations::Vector{Equation} = Equation[lowered(eq) for eq in partition.equations]
   local initialEquations::Vector{Equation} = Equation[lowered(eq) for eq in partition.initialEquations]
   local functions::Vector{ModelicaFunction} = try

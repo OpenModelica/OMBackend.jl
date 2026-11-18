@@ -341,6 +341,25 @@ end
     @test !zero(_irEquationOf(model.continuous[1].equations, :x).rhs)
   end
 
+  @testset "copyEquation: the copy mapped in place, the original kept" begin
+    #= if c then x = y; else x = 2; end if: the folding maps a copy (`IR.copyEquation`, not `deepcopy`) =#
+    local ref = (n::Symbol) -> _IRM.CREF(_IRM.ComponentRef(n), _IRM.T_REAL())
+    local eq = (l::_IRM.Expression, r::_IRM.Expression) -> _IRM.SCALAR_EQUATION(l, r, _IRM.T_REAL(), _IRM.NO_SOURCE, _IRM.DEFAULT_ATTRIBUTES)
+    local inner::_IRM.SCALAR_EQUATION = eq(ref(:x), ref(:y))
+    local two::_IRM.REAL = _IRM.REAL(2.0)
+    local original::_IRM.IF_EQUATION =
+      _IRM.IF_EQUATION(_IRM.EquationBranch[_IRM.EquationBranch(ref(:c), _IRM.Equation[inner])], _IRM.Equation[eq(ref(:x), two)],
+                       _IRM.NO_SOURCE, _IRM.DEFAULT_ATTRIBUTES)
+    local copied::_IRM.Equation = _IRM.copyEquation(original)
+    #= new equations, shared expressions =#
+    @test copied !== original && copied.branches[1].equations[1] !== inner
+    @test copied.branches[1].condition === original.branches[1].condition && copied.elseEquations[1].rhs === two
+    #= y replaced by 1 in the copy only =#
+    _IRM.mapEquation!((@nospecialize(e::_IRM.Expression)) -> (e isa _IRM.CREF && e.cref.name === :y) ? _IRM.REAL(1.0) : e, copied)
+    @test copied.branches[1].equations[1].rhs == _IRM.REAL(1.0)
+    @test inner.rhs isa _IRM.CREF && inner.rhs.cref.name === :y && original.branches[1].equations[1] === inner
+  end
+
   @testset "an algorithm's record overwritten field: one equation per variable" begin
     #= p := initPair(k); p.b := p.a + 1: p.b's equation is the later assignment's only (two made the
        system structurally singular, MSL Spice3's Graetz) =#

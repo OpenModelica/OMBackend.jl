@@ -1842,6 +1842,23 @@ entities); the equations of its branches and bodies too. Returns `eq`.
 mapEquation!(@nospecialize(f), @nospecialize(eq::Equation))::Equation = _mapFields(_MapExp(f), eq)
 
 """
+    copyEquation(eq)
+
+A copy of `eq` that `mapEquation!` can change without changing `eq`: `eq` and the equations of
+its branches and bodies as new objects (the entities a traversal sets in place), its expressions
+and statements shared (values: a traversal rebuilds them). A `deepcopy` copied every expression
+node (EngineV6's index reduction: 0.12 s, 0.12 GB per plan).
+"""
+copyEquation(@nospecialize(eq::Equation))::Equation = first(traverseFields(_shallowCopy(eq), _copyNested, nothing))
+
+"`copyEquation` as a traversal's `recur`: a nested equation copied, an expression or a statement kept."
+_copyNested(@nospecialize(x::Equation), a::Nothing)::Tuple{Equation, Nothing} = (copyEquation(x), a)
+_copyNested(@nospecialize(x::Union{Expression, Statement}), a::Nothing)::Tuple{Union{Expression, Statement}, Nothing} = (x, a)
+
+"A new object of `x`'s (mutable) type with `x`'s field values."
+@generated _shallowCopy(x::T) where {T} = :($T($((:(getfield(x, $i)) for i in 1:fieldcount(T))...)))
+
+"""
     foreachRootExp(f, x::Union{Statement, Equation})
 
 Call `f` on each root expression of a statement or an equation (its sides, conditions,

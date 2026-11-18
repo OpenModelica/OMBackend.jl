@@ -79,6 +79,11 @@ function constantEquation(e::Exp, ht::HT)::Union{Nothing, Symbol, Tuple{Symbol, 
   return unknown1 ? (:constant, n1, e.exp2, e.op === OP_ADD) : (:constant, n2, e.exp1, e.op === OP_ADD)
 end
 
+"Whether the residual `e` is `a - b` or `a + b` of two references or elements (what `constantEquation` reads, or a
+substitution can make it read)."
+_referencePair(e::Exp)::Bool =
+  e isa BINARY && (e.op === OP_SUB || e.op === OP_ADD) && e.exp1 isa Union{EXP_CREF, ASUB} && e.exp2 isa Union{EXP_CREF, ASUB}
+
 """
     propagateConstants(simCode)
 
@@ -104,11 +109,16 @@ function propagateConstants(simCode::SIM_CODE)::SIM_CODE
   local replacements = Replacements()
   local eliminatedBy = OrderedDict{Int, String}()
   local trivial = Set{Int}()
-  local residuals = simCode.residualEquations
+  #= the residuals `a - b`, `a + b` of references (`_referencePair`), in their order: the only ones a replacement can
+     make constant (it puts a reference or its negation where a reference was); these substituted each round, not all
+     (MSL EngineV6: 9873 residuals, 0.41 s and 0.59 GB per run of the pass) =#
+  local at::Vector{Int} = Int[i for (i, eq) in enumerate(simCode.residualEquations) if _referencePair(eq.exp)]
+  local residuals::Vector{RESIDUAL_EQUATION} = simCode.residualEquations[at]
   local changed = true
   while changed
     changed = false
-    for (i, eq) in enumerate(residuals)
+    for (k, eq) in enumerate(residuals)
+      local i::Int = at[k]
       (haskey(eliminatedBy, i) || i in trivial) && continue
       local c = constantEquation(eq.exp, ht)
       c === nothing && continue

@@ -414,7 +414,7 @@ replaces a free one of the representative. Of an Integer, Boolean or enumeration
 `start`, `fixed`, `min`, `max` (`not start` of a negated Boolean; a negated enumeration gives
 none); a representative without attributes of its own takes the alias's.
 """
-function mergeAliasAttributes(rep::SimVarAttributes, repType::SType, eliminated::SIMVAR, negated::Bool)::SimVarAttributes
+function mergeAliasAttributes(rep::SimVarAttributes, @nospecialize(repType::SType), eliminated::SIMVAR, negated::Bool)::SimVarAttributes
   local e = eliminated.attributes
   attributesGiven(eliminated.elementType, e) || return rep
   local t = eliminated.elementType

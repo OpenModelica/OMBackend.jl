@@ -40,6 +40,19 @@
    call without derivative annotation inlined (Evaluation/inline.jl). =#
 
 """
+    ArrayVariables(variable)
+
+The `variable` of the seeds of an arrays-kept model (`arraySeeds`): it knows an array variable as a whole, so a
+reference to an element it does not know by name (`x[i]`, `c[i].T`) is that element of the array's derivative
+(`arrayElementDerivative`).
+"""
+struct ArrayVariables
+  variable::Function
+end
+
+(a::ArrayVariables)(name::Symbol)::Union{Nothing, IR.Expression} = a.variable(name)
+
+"""
     Seeds
 
 What differentiation replaces the leaves by: `variable(name)` the derivative of a reference to
@@ -51,17 +64,24 @@ functions whose bodies are being differentiated (a recursive call is not inlined
 derivative inputs (`derivativeFunctionCall`; solving for derivative unknowns only, not the choice
 of states, whose Jacobian it would give entries it cannot tell from 0).
 """
-struct Seeds{V}
+struct Seeds{V <: Union{Function, ArrayVariables}}
   variable::V
   time::Float64
   functions::Dict{Symbol, IR.ModelicaFunction}
   active::Vector{Symbol}
   derivativeCalls::Bool
+  #= two types of seeds, not one per closure: the differentiation's methods compile once for all callers' functions
+     (`Seeds{Function}`) and once for an arrays-kept model's (`Seeds{ArrayVariables}`), into the package image. Typed
+     by the closure, EngineV6 compiled `derivativeOf` again for two closures no workload had (0.2 s). =#
+  Seeds(variable::Function, time::Float64, functions::Dict{Symbol, IR.ModelicaFunction}, active::Vector{Symbol} = Symbol[],
+        derivativeCalls::Bool = false) = new{Function}(variable, time, functions, active, derivativeCalls)
+  Seeds(variable::ArrayVariables, time::Float64, functions::Dict{Symbol, IR.ModelicaFunction},
+        active::Vector{Symbol} = Symbol[], derivativeCalls::Bool = false) =
+    new{ArrayVariables}(variable, time, functions, active, derivativeCalls)
 end
 
-Seeds(variable::V, time::Float64, functions::Dict{Symbol, IR.ModelicaFunction}) where {V} = Seeds(variable, time, functions, Symbol[], false)
-Seeds(variable::V, time::Float64, functions::Dict{Symbol, IR.ModelicaFunction}, active::Vector{Symbol}) where {V} =
-  Seeds(variable, time, functions, active, false)
+"The derivative `seeds` give the variable `name` (`nothing`: none, its derivative 0 or found otherwise)."
+seedOf(seeds::Seeds, name::Symbol)::Union{Nothing, IR.Expression} = seeds.variable(name)
 
 builtin(name::Symbol, args::IR.Expression...)::IR.Expression = IR.CALL(name, IR.Expression[args...], IR.T_REAL(), IR.BUILTIN_CALL)
 "`e` with its scalar arithmetic folded throughout (`foldScalar`, bottom-up)."
@@ -115,23 +135,10 @@ end
 
 derivativeOf(::Union{IR.INTEGER, IR.REAL, IR.BOOLEAN, IR.STRING, IR.ENUM_LITERAL}, ::Seeds)::IR.Expression = ZERO
 
-"""
-    ArrayVariables(variable)
-
-The `variable` of the seeds of an arrays-kept model (`arraySeeds`): it knows an array variable as a whole, so a
-reference to an element it does not know by name (`x[i]`, `c[i].T`) is that element of the array's derivative
-(`arrayElementDerivative`).
-"""
-struct ArrayVariables{F}
-  variable::F
-end
-
-(a::ArrayVariables)(name::Symbol) = a.variable(name)
-
 function derivativeOf(e::IR.CREF, seeds::Seeds)::IR.Expression
   e.cref.name === :time && return real(seeds.time)
   e.ty isa Union{IR.T_ARRAY, IR.T_RECORD} && return wholeDerivative(e, seeds)
-  local d = seeds.variable(e.cref.name)
+  local d = seedOf(seeds, e.cref.name)
   return d === nothing ? arrayElementDerivative(e, seeds) : d
 end
 
@@ -144,7 +151,7 @@ function wholeDerivative(e::IR.CREF, seeds::Seeds{<:ArrayVariables})::IR.Express
        an array without one, by literal subscripts its elements' derivatives (a record's array field whose elements are
        variables, `frame_a.R.w`: theirs; a parameter's: 0), by others zeros where its elements have no derivative (a
        parameter's), NotHandled where they do =#
-    local array = seeds.variable(unsubscriptedName(e.cref))
+    local array = seedOf(seeds, unsubscriptedName(e.cref))
     if array === nothing
       local sizes::Vector{Int} = knownSizes(e.ty, "a part of the array $(unsubscriptedName(e.cref))")
       local subscripts::Vector{IR.Subscript} = allSubscripts(e.cref)
@@ -154,7 +161,7 @@ function wholeDerivative(e::IR.CREF, seeds::Seeds{<:ArrayVariables})::IR.Express
       end
       local probe::IR.ComponentRef = withIteratorsAsOne(e.cref)
       local probeElement::Symbol = IR.appendSubscripts(probe, IR.Subscript[IR.INDEX(IR.INTEGER(1)) for _ in sizes]).name
-      seeds.variable(probeElement) === nothing ||
+      seedOf(seeds, probeElement) === nothing ||
         throw(NotHandled("the derivative of a part of an array ($(e.cref.name)) whose elements are variables of their own"))
       local zeros::Union{Nothing, IR.Expression} = zeroOf(e)
       zeros === nothing && throw(NotHandled("the derivative of a part of an array ($(e.cref.name)) of a size not known"))
@@ -164,7 +171,7 @@ function wholeDerivative(e::IR.CREF, seeds::Seeds{<:ArrayVariables})::IR.Express
       throw(NotHandled("the derivative of a part of an array ($(e.cref.name)), its array's derivative $(IR.toString(array))"))
     return IR.CREF(IR.withLastSubscripts(array.cref, allSubscripts(e.cref)), e.ty)
   end
-  local d = seeds.variable(e.cref.name)
+  local d = seedOf(seeds, e.cref.name)
   return d === nothing ? wholeDerivative(e.cref, e.ty, seeds) : d
 end
 
@@ -186,10 +193,10 @@ arrayElementDerivative(::IR.CREF, ::Seeds)::IR.Expression = ZERO
 
 function arrayElementDerivative(e::IR.CREF, seeds::Seeds{<:ArrayVariables})::IR.Expression
   IR.hasSubscripts(e.cref) || return ZERO
-  local array = seeds.variable(unsubscriptedName(e.cref))
+  local array = seedOf(seeds, unsubscriptedName(e.cref))
   if array === nothing
     #= an element of an array split along its inner dimensions: the slice's (`slicedCref`) =#
-    local sliced::Union{Nothing, IR.ComponentRef} = slicedCref(e.cref, (n::Symbol) -> seeds.variable(n) !== nothing)
+    local sliced::Union{Nothing, IR.ComponentRef} = slicedCref(e.cref, (n::Symbol) -> seedOf(seeds, n) !== nothing)
     sliced === nothing || return derivativeOf(IR.CREF(sliced, e.ty), seeds)
     #= an element by subscripts of an array that is no variable but whose elements are (a record's array field,
        `frame_a.R.w[\$i1]`): the array of its elements' derivatives (by name, 0 for a parameter's) at the subscripts =#
@@ -226,7 +233,7 @@ function wholeDerivative(cref::IR.ComponentRef, ty::IR.ModelicaType, seeds::Seed
     return elementsDerivative(cref, sizes, Int[], IR.elementType(ty), seeds)
   end
   ty isa IR.T_REAL || return ZERO
-  local d::Union{Nothing, IR.Expression} = seeds.variable(cref.name)
+  local d::Union{Nothing, IR.Expression} = seedOf(seeds, cref.name)
   return d === nothing ? ZERO : d
 end
 
@@ -511,8 +518,8 @@ function readsSeeded(e::IR.Expression, seeds::Seeds)::Bool
         true
       end
     end
-    seeds.variable(x.cref.name) !== nothing && return true
-    return IR.hasSubscripts(x.cref) && seeds.variable(unsubscriptedName(x.cref)) !== nothing
+    seedOf(seeds, x.cref.name) !== nothing && return true
+    return IR.hasSubscripts(x.cref) && seedOf(seeds, unsubscriptedName(x.cref)) !== nothing
   end
 end
 

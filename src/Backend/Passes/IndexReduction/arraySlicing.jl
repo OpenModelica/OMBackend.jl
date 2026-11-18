@@ -341,7 +341,7 @@ end
 An equation reading the split arrays `family` by their slices (`slicedReference`); its for-equations whose iterators
 subscript an inner dimension unrolled first (`unrollIterators`).
 """
-function slicedEquation(eq::IR.Equation, family::Dict{Symbol, Vector{Int}},
+function slicedEquation(@nospecialize(eq::IR.Equation), family::Dict{Symbol, Vector{Int}},
                         variables::IR.VariableSet)::IR.Equation
   local iterators::Set{Symbol} = Set{Symbol}()
   local reads::Bool = false

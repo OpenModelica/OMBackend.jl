@@ -138,7 +138,7 @@ hasSubModels(sc::SIM_CODE)::Bool = !isempty(sc.subModels)
 hasFrontendModel(sc::SIM_CODE)::Bool = sc.frontendModel !== nothing
 
 "Whether `e` reads an unknown (`isUnknownVarKind`)."
-function hasUnknownCref(e::Exp, ht::HT)::Bool
+function hasUnknownCref(@nospecialize(e::Exp), ht::HT)::Bool
   for n in crefNames!(OrderedSet{String}(), e)
     local entry = get(ht, n, nothing)
     (entry !== nothing && isUnknownVarKind(last(entry).varKind)) && return true

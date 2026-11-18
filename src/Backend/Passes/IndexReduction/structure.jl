@@ -292,7 +292,7 @@ for an if-equation one per equation of a branch, row k reading the k-th equation
 algorithm reads and writes. An assert gives none. Array, record and for-equations, which the
 scalarized pipeline has expanded, are not handled.
 """
-function equationReads(eq::IR.Equation, resolve::F, functions::Dict{Symbol, IR.ModelicaFunction})::Vector{Union{Nothing, Vector{Symbol}}} where {F}
+function equationReads(@nospecialize(eq::IR.Equation), resolve::F, functions::Dict{Symbol, IR.ModelicaFunction})::Vector{Union{Nothing, Vector{Symbol}}} where {F}
   if eq isa IR.SCALAR_EQUATION && eq.lhs isa IR.TUPLE
     #= `(cc, m_dCap) = diodeNoBypassCode(...)`: a row per continuous variable its targets name (a record
        target's fields), each reading what the equation reads (as an algorithm's) =#

@@ -319,7 +319,7 @@ subscripts `index` so far: the reference to an element variable, an array litera
 dimensions selected by several indices).
 """
 function selectedElements(array::Symbol, index::Vector{Int}, selection::Vector{Union{Int, Vector{Int}}}, E::Elements,
-                          element::IR.ModelicaType)::IR.Expression
+                          @nospecialize(element::IR.ModelicaType))::IR.Expression
   local d = length(index) + 1
   if d > length(selection)
     local sizes = E.sizes[array]
@@ -517,7 +517,7 @@ end
 subscript in turn; `cos({a, b})[2]` is `cos(b)`, `der({a, b})[2]` is `der(b)`, `(not {a, b})[2]` is `not b`: an
 element-wise operator, `isElementwise`, also where it is left inside the picked element); subscripted where it is not.
 """
-function pickElement(e::IR.Expression, subscripts::Vector{IR.Subscript}, ty::IR.ModelicaType,
+function pickElement(@nospecialize(e::IR.Expression), subscripts::Vector{IR.Subscript}, @nospecialize(ty::IR.ModelicaType),
                      E::Elements)::IR.Expression
   local index::Union{Nothing, Vector{Int}} = IR.literalIndices(subscripts)
   if e isa IR.ARRAY_CONSTRUCTOR && index !== nothing
@@ -741,7 +741,7 @@ array of a component array, the value of each component), an `ArrayValue`; anoth
 as written). A dimension of the value without a literal size (`fill(0.0, n)` typed `Real[n]`) is the variable's.
 NotHandled for an array value of other dimensions.
 """
-function elementValue(a::IR.Expression, v::IR.Variable, E::Elements)::ElementValue
+function elementValue(@nospecialize(a::IR.Expression), v::IR.Variable, E::Elements)::ElementValue
   local sizes = E.sizes[v.name]
   local ty = IR.typeOf(a)
   local lead::Int = length(sizes)
@@ -829,7 +829,7 @@ valueAt(v::ArrayValue, index::Vector{Int}, E::Elements)::IR.Expression =
 valueAt(v::ComponentValue, index::Vector{Int}, E::Elements)::IR.Expression = checkedValue(componentElement(v, index, E), E)
 
 "`value`, scalarized for an element; NotHandled where it is not (`valueAt`)."
-function checkedValue(value::IR.Expression, E::Elements)::IR.Expression
+function checkedValue(@nospecialize(value::IR.Expression), E::Elements)::IR.Expression
   local dangling = E.passesFollow ? nothing : danglingReference(value, E)
   dangling === nothing || throw(NotHandled("an attribute reading $(dangling) by a subscript that is not constant"))
   IR.anyExp(x -> x isa IR.CALL && isElementwise(x), value) &&
@@ -1393,7 +1393,7 @@ end
 The element equations of the `i`-th equation `eq` (`scalarEquations!`) onto `out` and their origins onto `origins`;
 taken from `cache` where it has them (`ScalarCache`), else put there.
 """
-function scalarEquationsOf!(out::Vector{IR.Equation}, origins::Vector{EquationOrigin}, eq::IR.Equation, i::Int, E::Elements,
+function scalarEquationsOf!(out::Vector{IR.Equation}, origins::Vector{EquationOrigin}, @nospecialize(eq::IR.Equation), i::Int, E::Elements,
                             cache::Union{Nothing, ScalarCache})::Nothing
   if cache === nothing
     scalarEquations!(out, origins, eq, EquationOrigin(i), NO_ITERATORS, E)

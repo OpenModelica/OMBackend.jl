@@ -212,7 +212,7 @@ function withKnownValuesAndConstants(model::IR.Model, partition::IR.Partition;
     end
     return foldScalar(e)
   end
-  local equations = IR.Equation[deepcopy(eq) for eq in partition.equations]
+  local equations::Vector{IR.Equation} = IR.Equation[IR.copyEquation(eq) for eq in partition.equations]
   local readers = Dict{Symbol, Vector{Int}}()
   for (i, eq) in enumerate(equations)
     IR.mapEquation!((@nospecialize(e::IR.Expression)) -> substitute(e, i), eq)
