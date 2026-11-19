@@ -140,4 +140,5 @@ const SCALARIZED_REFERENCES = Dict{String, Vector{Float64}}(
   "RecordData.Mixture | cp | (0.0, 1.0) | " => [1485.0],
   "RecordArrayCall.M | d, x | (0.0, 1.0) | abstol = 1.0e-10, reltol = 1.0e-8" => [2.701511529340699, 4.207354924163454],
   "TwoTables | yAnd, yXor | (0.0, 1.0) | " => [4.0, 3.0],
+  "SegLine.TwoLines | line1.i[1], line1.v[3], line2.i[4], load.v | (0.0, 0.1) | abstol = 1.0e-10, reltol = 1.0e-8" => [-0.04078042562568606, -0.9817406067626024, -0.09648962991575984, -0.9648962991575983],
 )

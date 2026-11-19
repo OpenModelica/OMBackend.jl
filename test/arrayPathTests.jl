@@ -3577,4 +3577,105 @@ end DivideInLoop;
     @test _values(sol, ["count"]) == [2.0]
     @test _values(sol, ["w"])[1] ≈ sum(k * exp(-0.6k) for k in 1:3) + exp(-0.6) + exp(-3.6) rtol = 1e-8
   end
+
+  @testset "A slice of a rolled component's inner array: the slices' elements" begin
+    #= MSL LightningSegmentedTransmissionLine: two OLines rolled into line1|line2, its initial equation
+       `line2.i[2:N + 1] = zeros(N)` read `L[2:N + 1].i` of the split array (a TypeError, the MTK fallback before) =#
+    local lines = Modelica"""
+      package SegLine
+        connector Pin
+          Real v;
+          flow Real i;
+        end Pin;
+        partial model TwoPin
+          Pin p, n;
+          Real v, i;
+        equation
+          v = p.v - n.v;
+          0 = p.i + n.i;
+          i = p.i;
+        end TwoPin;
+        model Resistor
+          extends TwoPin;
+          parameter Real R = 1;
+        equation
+          v = R * i;
+        end Resistor;
+        model Inductor
+          extends TwoPin;
+          parameter Real L = 1e-3;
+        equation
+          L * der(i) = v;
+        end Inductor;
+        model Capacitor
+          extends TwoPin;
+          parameter Real C = 1e-3;
+        equation
+          C * der(v) = i;
+        end Capacitor;
+        model Line "MSL OLine's structure"
+          parameter Integer N = 3;
+          Pin p1, p2, p3;
+          Real v[N] = C.v;
+          Real i[N + 1] = R.i;
+        protected
+          Resistor R[N + 1](each R = 0.1);
+          Inductor L[N + 1](each L = 1e-3);
+          Capacitor C[N](each C = 1e-3);
+        equation
+          connect(p1, R[1].p);
+          for i in 1:N loop
+            connect(R[i].n, L[i].p);
+            connect(L[i].n, C[i].p);
+            connect(C[i].n, p3);
+            connect(L[i].n, R[i + 1].p);
+          end for;
+          connect(R[N + 1].n, L[N + 1].p);
+          connect(L[N + 1].n, p2);
+        end Line;
+        model Ground
+          Pin p;
+        equation
+          p.v = 0;
+        end Ground;
+        model Source
+          extends TwoPin;
+        equation
+          v = sin(50 * time);
+        end Source;
+        model CurrentSource
+          extends TwoPin;
+        equation
+          i = 10 * time * exp(-100 * time);
+        end CurrentSource;
+        model TwoLines
+          parameter Integer N = 3;
+          Line line1(N = N), line2(N = N);
+          Source source;
+          CurrentSource strike;
+          Resistor load(R = 10);
+          Ground ground;
+        initial equation
+          line1.v = zeros(N);
+          line1.i = zeros(N + 1);
+          line2.v = zeros(N);
+          line2.i[2:N + 1] = zeros(N);
+        equation
+          connect(source.p, line1.p1);
+          connect(line1.p2, strike.n);
+          connect(strike.n, line2.p1);
+          connect(ground.p, strike.p);
+          connect(line2.p2, load.p);
+          connect(source.n, ground.p);
+          connect(load.n, ground.p);
+          connect(line1.p3, ground.p);
+          connect(line2.p3, ground.p);
+        end TwoLines;
+      end SegLine;
+      """
+    local (s::Vector{Float64}, a::Vector{Float64}, _) =
+      _bothWaysOf(lines, "SegLine.TwoLines", ["line1.i[1]", "line1.v[3]", "line2.i[4]", "load.v"];
+                  tspan = (0.0, 0.1), reltol = 1e-8, abstol = 1e-10)
+    @test a ≈ s rtol = 1e-6
+  end
 end
