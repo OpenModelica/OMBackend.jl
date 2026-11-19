@@ -47,12 +47,30 @@ import ..@VSS_DEBUG
 
 import ModelingToolkit
 import Setfield
+import DiffEqBase
 
 using DataStructures
 using ModelingToolkit
 using DifferentialEquations
 #= SciMLBase's integrators, return codes, NoInit and remake (as ModelingToolkit has them) =#
 import ModelingToolkit.SciMLBase: DEIntegrator, ReturnCode, NoInit, remake
+
+"""
+The solver verbosity of OMBackend's solves: DiffEqBase's default, with the message of a first step estimate below
+machine epsilon (`dt_epsilon`) off. After an event that changed the equations OMBackend asks for a new first step
+(`auto_dt_reset!`, CodeGeneration's `_autoDtReset!`); the estimate is often that small then, and OrdinaryDiffEqCore
+takes its default of 1e-6 s, the restart OMBackend wants, with a warning each time: 70,547 warnings, 93% of the lines
+of an MSL 3.2.3 coverage log (2026-11-19).
+"""
+const SOLVER_VERBOSITY = DiffEqBase.DEVerbosity(dt_epsilon = DiffEqBase.SciMLLogging.Silent())
+
+"""
+    solverVerbosity(kwargs) -> NamedTuple
+
+The `verbose` keyword of a solve whose caller gave the keywords `kwargs`: `SOLVER_VERBOSITY`, none where `kwargs` has
+its own.
+"""
+solverVerbosity(kwargs::Base.Pairs)::NamedTuple = haskey(kwargs, :verbose) ? (;) : (; verbose = SOLVER_VERBOSITY)
 
 abstract type AbstractOMSolution end
 
@@ -300,7 +318,7 @@ function solve(omProblem::OM_ProblemStructural, tspan, alg; kwargs...)
   local symsOfInitialMode = getSyms(problem)
   local activeModeName = omProblem.activeModeName
   #= Create integrator =#
-  integrator = init(problem, alg; kwargs...)
+  integrator = init(problem, alg; solverVerbosity(kwargs)..., kwargs...)
   add_tstop!(integrator, tspan[2])
   local oldSols = Any[]
   #= Run the integrator=#
@@ -400,7 +418,7 @@ function solve(omProblem::OM_ProblemStructural, tspan, alg; kwargs...)
               warn_initialize_determined = false,
               callback = CallbackSet(cb.systemSpecificCallbacks, omProblem.callbackConditions...)
             )
-            integrator = init(daeProb, alg; force_dtmin = true, kwargs...)
+            integrator = init(daeProb, alg; force_dtmin = true, solverVerbosity(kwargs)..., kwargs...)
             dispatchedToDAEInit = true
             @VSS_DEBUG @info "VSS transfer: re-ran MTK DAE init" n_inherited=length(u0Dict) u_after=integrator.u
           catch err
@@ -421,6 +439,7 @@ function solve(omProblem::OM_ProblemStructural, tspan, alg; kwargs...)
                             alg;
                             force_dtmin = true,
                             u0 = newU0,
+                            solverVerbosity(kwargs)...,
                             kwargs...)
           reinit!(integrator, newU0; t0 = i.t, reset_dt = true)
         end
@@ -574,7 +593,7 @@ solutions of the modes, in order.
 """
 function solve(omProblem::OM_ProblemRecompilation, tspan::Tuple, alg; kwargs...)::Vector{Any}
   local problem::ODEProblem = omProblem.problem
-  local integrator::DEIntegrator = init(problem, alg; kwargs...)
+  local integrator::DEIntegrator = init(problem, alg; solverVerbosity(kwargs)..., kwargs...)
   local solutions::Vector{Any} = Any[]
   while true
     #= In the latest world: a recompiled mode's functions are newer than this solve. Once per mode, not per step: a
@@ -688,7 +707,7 @@ function _switchMode(change::AbstractStructuralChange, problem::ODEProblem, inte
   @VSS_DEBUG @info "[solve OM_ProblemRecompilation] new u0" newU0 anyNaN = any(isnan, newU0)
   #= In the latest world, as the steps: init runs the new mode's callbacks' initialization (a table's time events). =#
   #= the solver options (`kwargs`: tolerances) go to init; reinit! takes none of them =#
-  local newIntegrator::DEIntegrator = Base.invokelatest(init, newProblem, alg; force_dtmin = true, kwargs...)
+  local newIntegrator::DEIntegrator = Base.invokelatest(init, newProblem, alg; force_dtmin = true, solverVerbosity(kwargs)..., kwargs...)
   Base.invokelatest(reinit!, newIntegrator, newU0; t0 = tChange, tf = last(tspan), reset_dt = true)
   #= The structural event may trigger again in this step: reset after it. =#
   newIntegrator.dt = min(newIntegrator.dt, 1e-6)
@@ -990,7 +1009,7 @@ end
 function solve(omProblem::OM_Problem, tspan, alg; kwargs...)
   local problem = omProblem.problem
   #= Create integrator =#
-  integrator = init(problem, alg, stop_at_next_tstop = true, kwargs...)
+  integrator = init(problem, alg; stop_at_next_tstop = true, solverVerbosity(kwargs)..., kwargs...)
   add_tstop!(integrator, tspan[2])
   for i in integrator
   end

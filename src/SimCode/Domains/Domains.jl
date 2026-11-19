@@ -50,7 +50,7 @@ The domain and causal levels of the simulation code (2026-11-01): what the array
     Jacobian's pattern, the initialization's matching (`InitialMatching`), the rows the right-hand side and the
     relations need and the time-invariant ones.
 
-CodeGeneration's ArrayODEGen emits the module from them.
+CodeGeneration's ArrayPreserveDE emits the module from them.
 """
 module Domains
 

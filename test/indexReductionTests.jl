@@ -818,9 +818,9 @@ end
         local cn::String = OMBackend.canonicalName("IndexReduction." * name)
         @test cn in OMBackend.ARRAY_REDUCED_MODELS
         @test isapprox(kept, scalarized; atol = 1e-8, rtol = 1e-8)
-        #= explicit once its derivatives are solved: array code (ArrayODEGen), the pendulums' dynamic state sets too
+        #= explicit once its derivatives are solved: array code (ArrayPreserveDE), the pendulums' dynamic state sets too
            (a set's switch: the selection and the states at once) =#
-        @test cn in OMBackend.ARRAY_ODE_MODELS
+        @test cn in OMBackend.ARRAY_PRESERVE_DE_MODELS
       end
       #= a loop with two roots read after the run: Q solved from the set's states and Q * Q = 1 (Q[4] = +-sqrt). The
          run ends at Q[4] < 0; a read at t = 0 starts its Newton from the roots logged there (`_rootsAt`), not from
@@ -841,7 +841,7 @@ end
          array literal) =#
       @test _irArraySimulate("EachStartArray", ["phi1[1]", "phi1[3]", "phi2[2]"], 1.0; kept = true) ≈ fill(0.6, 3)
       @test OMBackend.canonicalName("IndexReduction.EachStartArray") in OMBackend.ARRAY_REDUCED_MODELS
-      @test OMBackend.canonicalName("IndexReduction.EachStartArray") in OMBackend.ARRAY_ODE_MODELS
+      @test OMBackend.canonicalName("IndexReduction.EachStartArray") in OMBackend.ARRAY_PRESERVE_DE_MODELS
       #= rolled components with their auxiliaries: the results of the scalarized model =#
       local damped::Vector{String} = ["a.phi1", "b.w1", "c.w1", "c.damping"]
       local dampedScalarized::Vector{Float64} = _irArraySimulate("SeparateDampedPairs", damped, 3.0; kept = false)
@@ -853,7 +853,7 @@ end
       let (fm, functions) = _irArrayFlat("PendulumsFirstForceLaw")
         local reduced::_IRM.Model = OMBackend.reducedArrayModel(fm; functionList = functions)
         local names::Vector{Symbol} = Symbol[v.name for v in reduced.variables]
-        @test OMBackend.generateReducedArrayODETargetCode(OMBackend.canonicalName(fm.name), reduced) !== nothing
+        @test OMBackend.generateReducedArrayPreserveDETargetCode(OMBackend.canonicalName(fm.name), reduced) !== nothing
         @test Symbol[v.name for v in reduced.variables] == names
       end
       #= no arrays to keep, of index above one: reduced in the array form all the same, for the array code (a
@@ -861,7 +861,7 @@ end
       let (fm, functions) = _irArrayFlat("RigidInertias")
         local rigid::String = OMBackend.canonicalName(fm.name)
         @test OMBackend.translateReducedArrays(fm; functionList = functions) !== nothing
-        @test rigid in OMBackend.ARRAY_ODE_MODELS
+        @test rigid in OMBackend.ARRAY_PRESERVE_DE_MODELS
         local inertias::Vector{String} = ["phi1", "w1", "phi2", "tau"]
         @test isapprox(_irArraySimulate("RigidInertias", inertias, 2.0; kept = true),
                        _irArraySimulate("RigidInertias", inertias, 2.0; kept = false); atol = 1e-8, rtol = 1e-8)
@@ -874,12 +874,12 @@ end
       #= the array code off: the reduced model scalarized, the same results =#
       local inertia::Vector{String} = ["phi1[1]", "phi2[4]", "w2[3]", "tau[2]"]
       local arrayCode::Vector{Float64} = _irArraySimulate("InertiaArray", inertia, 2.0; kept = true)
-      OMBackend.ARRAY_ODE_GENERATION[] = false
+      OMBackend.ARRAY_PRESERVE_DE_GENERATION[] = false
       try
         @test isapprox(_irArraySimulate("InertiaArray", inertia, 2.0; kept = true), arrayCode; atol = 1e-8, rtol = 1e-8)
-        @test !(OMBackend.canonicalName("IndexReduction.InertiaArray") in OMBackend.ARRAY_ODE_MODELS)
+        @test !(OMBackend.canonicalName("IndexReduction.InertiaArray") in OMBackend.ARRAY_PRESERVE_DE_MODELS)
       finally
-        OMBackend.ARRAY_ODE_GENERATION[] = true
+        OMBackend.ARRAY_PRESERVE_DE_GENERATION[] = true
       end
       #= rigid pairs: phi1[i] = i (t - sin t) / 3 =#
       @test arrayCode[1] ≈ (2.0 - sin(2.0)) / 3 rtol = 1e-8
@@ -887,12 +887,12 @@ end
          Newton in the array code =#
       local prefer::Vector{String} = ["x[1]", "y[2]", "vx[3]", "F[1]"]
       local preferKept::Vector{Float64} = _irArraySimulate("PendulumsPrefer", prefer, 2.0; kept = true)
-      @test OMBackend.canonicalName("IndexReduction.PendulumsPrefer") in OMBackend.ARRAY_ODE_MODELS
+      @test OMBackend.canonicalName("IndexReduction.PendulumsPrefer") in OMBackend.ARRAY_PRESERVE_DE_MODELS
       @test isapprox(preferKept, _irArraySimulate("PendulumsPrefer", prefer, 2.0; kept = false); atol = 1e-8, rtol = 1e-8)
       local kept = _irArraySimulate("BoundaryArray", ["x[1]", "x[3]"], 1.0; kept = true)
       #= x split, y kept: array code, the values of x as BoundaryArray's, y[j] = exp(-j t) =#
       local withArray::Vector{Float64} = _irArraySimulate("BoundaryWithArray", ["x[1]", "x[3]", "y[2]", "y[4]"], 1.0; kept = true)
-      @test OMBackend.canonicalName("IndexReduction.BoundaryWithArray") in OMBackend.ARRAY_ODE_MODELS
+      @test OMBackend.canonicalName("IndexReduction.BoundaryWithArray") in OMBackend.ARRAY_PRESERVE_DE_MODELS
       @test withArray ≈ [exp(-1), 0.5 * exp(-1), exp(-2), exp(-4)] rtol = 1e-6
       @test !(OMBackend.canonicalName("IndexReduction.BoundaryArray") in OMBackend.ARRAY_REDUCED_MODELS)
       @test kept ≈ [exp(-1), 0.5 * exp(-1)] rtol = 1e-4
@@ -901,26 +901,26 @@ end
          w1[i]' = drive[i] / 3, drive[i] = i (2 sin(t) + 1) before 0.5, 3 i after =#
       local recordNames::Vector{String} = ["phi1[1]", "w1[3]", "tau[2]", "drive[2]", "sum1", "weighted[2]"]
       local records::Vector{Float64} = _irArraySimulate("RecordsArray", recordNames, 1.0; kept = true)
-      @test OMBackend.canonicalName("IndexReduction.RecordsArray") in OMBackend.ARRAY_ODE_MODELS
+      @test OMBackend.canonicalName("IndexReduction.RecordsArray") in OMBackend.ARRAY_PRESERVE_DE_MODELS
       @test isapprox(records, _irArraySimulate("RecordsArray", recordNames, 1.0; kept = false); atol = 1e-8, rtol = 1e-8)
       #= separately declared components rolled (OMBACKEND_ROLL_COMPONENTS, on by default): array code, the elements
          under their own names, as scalarized; phi1 = k (t - sin(t)) / 3 =#
       local pairNames::Vector{String} = ["a.phi1", "b.phi1", "c.phi1", "c.tau", "total"]
       local rolledPairs::Vector{Float64} = _irArraySimulate("SeparatePairs", pairNames, 1.0; kept = true)
-      @test OMBackend.canonicalName("IndexReduction.SeparatePairs") in OMBackend.ARRAY_ODE_MODELS
+      @test OMBackend.canonicalName("IndexReduction.SeparatePairs") in OMBackend.ARRAY_PRESERVE_DE_MODELS
       @test isapprox(rolledPairs, _irArraySimulate("SeparatePairs", pairNames, 1.0; kept = false); atol = 1e-8, rtol = 1e-8)
       @test rolledPairs[[1, 2, 3, 5]] ≈ (1 - sin(1)) / 3 .* [1, 2, 3, 6] rtol = 1e-7
       #= a semiLinear chain through a rolled pipe into an ambient (MSL DryAir2), the flow 0 at the start: MLS 3.7.2.5's
          rule per element, the chain's middle enthalpy not solved through the flow (NaN); h1 = 1 - exp(-t^2/2),
          h2 = 1 - (1 + t^2/2) exp(-t^2/2), the ambient's port at h2 =#
       local chainValues::Vector{Float64} = _irArraySimulate("SemiLinearChain", ["v1.h", "v2.h", "amb.port.h"], 1.0; kept = true)
-      @test OMBackend.canonicalName("IndexReduction.SemiLinearChain") in OMBackend.ARRAY_ODE_MODELS
+      @test OMBackend.canonicalName("IndexReduction.SemiLinearChain") in OMBackend.ARRAY_PRESERVE_DE_MODELS
       @test chainValues ≈ [1 - exp(-0.5), 1 - 1.5 * exp(-0.5), 1 - 1.5 * exp(-0.5)] rtol = 1e-7
       #= a when-equation in rolled components: in the array code after index reduction (the OMJLIR front half), over
          the instances; each crossing at k (t - sin(t)) / 3 = 0.01, counted once =#
       local timedNames::Vector{String} = ["a.tCross", "b.tCross", "c.tCross", "a.crossings", "c.crossings"]
       local timed::Vector{Float64} = _irArraySimulate("SeparateTimedPairs", timedNames, 1.0; kept = true)
-      @test OMBackend.canonicalName("IndexReduction.SeparateTimedPairs") in OMBackend.ARRAY_ODE_MODELS
+      @test OMBackend.canonicalName("IndexReduction.SeparateTimedPairs") in OMBackend.ARRAY_PRESERVE_DE_MODELS
       local crossing::Function = (k::Int) -> begin
         local (lo::Float64, hi::Float64) = (0.01, 1.0)
         for _ in 1:60

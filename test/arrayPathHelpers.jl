@@ -23,5 +23,5 @@ function _translateProgram(program, model::String; scalarized::Bool)::String
   return OMBackend.canonicalName(model)
 end
 
-_arrayPathTaken(name) = name in OMBackend.ARRAY_ODE_MODELS
+_arrayPathTaken(name) = name in OMBackend.ARRAY_PRESERVE_DE_MODELS
 _values(sol, names) = [OMBackend.getVariableValues(sol, n)[end] for n in names]

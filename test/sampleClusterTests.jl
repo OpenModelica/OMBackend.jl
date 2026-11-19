@@ -25,6 +25,6 @@ end
   @test late(0.5; idxs = :y) == 1.0
   #= the array code: its initial arms in the order of what they read (the section ran first and read u's start) =#
   local lateA = _sampleClusterSolution("SampleClusters.LateSection", 1.0; scalarized = false)
-  @test OMBackend.canonicalName("SampleClusters.LateSection") in OMBackend.ARRAY_ODE_MODELS
+  @test OMBackend.canonicalName("SampleClusters.LateSection") in OMBackend.ARRAY_PRESERVE_DE_MODELS
   @test [OMBackend.getVariableValues(lateA, v)[end] for v in ("delaySignal", "t_next", "y")] == [1.0, -1.0, 1.0]
 end

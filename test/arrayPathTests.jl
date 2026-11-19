@@ -59,7 +59,7 @@ end
   @testset "Decay, n = 1000: loops kept" begin
     local name = _arrayPathTranslate("ArrayPath.Decay"; scalarized = false)
     @test _arrayPathTaken(name)
-    local stats = OMBackend.CodeGeneration.ArrayODEGen.LAST_STATS[]
+    local stats = OMBackend.CodeGeneration.ArrayPreserveDE.LAST_STATS[]
     @test stats.states == 1000 && stats.batches == 1
     local sol = OMBackend.simulateModel(name; tspan = (0.0, 1.0))
     @test sol.retcode == ReturnCode.Success
@@ -70,10 +70,10 @@ end
   @testset "Chain: connections, algebraic variables, as scalarized" begin
     local (s, a, sol) = _bothWays("ArrayPath.Chain", ["c[1].T", "c[5].T", "c[10].T", "c[2].p.Q", "g[1].a.T"])
     @test maximum(abs.(s .- a)) < 1e-6
-    local loops = OMBackend.CodeGeneration.ArrayODEGen.LAST_STATS[].batches
+    local loops = OMBackend.CodeGeneration.ArrayPreserveDE.LAST_STATS[].batches
     #= the code does not grow with n =#
     _arrayPathTranslate("ArrayPath.Chain1000"; scalarized = false)
-    @test OMBackend.CodeGeneration.ArrayODEGen.LAST_STATS[].batches == loops
+    @test OMBackend.CodeGeneration.ArrayPreserveDE.LAST_STATS[].batches == loops
     #= symbolic indexing: states and observed (algebraic) variables =#
     @test sol[Symbol("c[1].T")][end] ≈ a[1]
     @test sol(1.0; idxs = Symbol("c[2].p.Q")) ≈ a[4] atol = 1e-8
@@ -327,7 +327,7 @@ end
   end
 
   @testset "A block solve's equations at its solution after a fresh Jacobian" begin
-    local AG::Module = OMBackend.CodeGeneration.ArrayODEGen
+    local AG::Module = OMBackend.CodeGeneration.ArrayPreserveDE
     local SA::Module = OMBackend.CodeGeneration.Symbolics.SparseArrays
     local c::Vector{Float64} = [1.0, 2.0]
     local S::SA.SparseMatrixCSC{Float64, Int} = SA.sparse([1, 2], [1, 2], [1.0, 1.0], 2, 2)
@@ -344,7 +344,7 @@ end
      between -6e-10 and 5e-9: a relation on it flipped in every pass of an event iteration (MSL
      ThyristorBridge2mPulse_DC_Drive's commutating thyristors) =#
   @testset "A block solve from its own solution keeps it" begin
-    local AG::Module = OMBackend.CodeGeneration.ArrayODEGen
+    local AG::Module = OMBackend.CodeGeneration.ArrayPreserveDE
     local SA::Module = OMBackend.CodeGeneration.Symbolics.SparseArrays
     local S::SA.SparseMatrixCSC{Float64, Int} = SA.sparse(ones(1, 1))
     local s::AG.BlockSolver = AG.BlockSolver(S, AG.columnColors(S), [0.0])
@@ -388,7 +388,7 @@ end
   end
 
   @testset "A linear block solved directly: one Jacobian per call" begin
-    local AG::Module = OMBackend.CodeGeneration.ArrayODEGen
+    local AG::Module = OMBackend.CodeGeneration.ArrayPreserveDE
     local SA::Module = OMBackend.CodeGeneration.Symbolics.SparseArrays
     local S::SA.SparseMatrixCSC{Float64, Int} = SA.sparse(ones(2, 2))
     local s::AG.BlockSolver = AG.BlockSolver(S, AG.columnColors(S), [0.0, 0.0], true)
@@ -490,7 +490,7 @@ end
   end
 
   @testset "Emission: slots of one value folded" begin
-    local AG::Module = OMBackend.CodeGeneration.ArrayODEGen
+    local AG::Module = OMBackend.CodeGeneration.ArrayPreserveDE
     local row::Expr = :(a[2569 + (s5 - 1)] = P[s1, s2] * u[3 + (_col - 1) * 2 + 1] + s1 * 0.5)
     local x::Any = AG._foldSlots(row, Dict{Symbol, Int}(:s5 => 1, :s1 => 1, :s2 => 2, :_col => 3))
     @test x == :(a[2569] = P[1, 2] * u[8] + 1 * 0.5)
@@ -524,7 +524,7 @@ end
     @test maximum(abs.(ss .- as)) < 1e-8
     local name::String = OMBackend.canonicalName("InvariantRows")
     #= n's row once in the module: in invariants!, not in equations! =#
-    @test count("sqrt(", string(OMBackend.COMPILED_MODELS_DEJL[name][1])) == 1
+    @test count("sqrt(", string(OMBackend.COMPILED_MODELS_ARRAY_PRESERVE_DE[name][1])) == 1
     #= another solve, another k: its own invariant values (x(1) = exp(-2/3) > 0.5: y stays n[1]) =#
     local again = OMBackend.resimulateModel(name; tspan = (0.0, 1.0), reltol = 1e-10, abstol = 1e-12,
                                             parameters = Dict{String, Any}("k" => 1.0))
@@ -595,6 +595,37 @@ end
     @test maximum(abs.(s .- a)) < 1.0e-12
   end
 
+  @testset "The restart after a tick: no warning of a first step below machine epsilon" begin
+    #= After each tick the array code asks for a new first step (_restartStep!, auto_dt_reset!); where the estimate is
+       below machine epsilon OrdinaryDiffEqCore takes 1e-6 s, the restart wanted, and warned each time (dt_epsilon:
+       70,547 warnings, 93% of the lines of an MSL 3.2.3 coverage log). OMBackend's solves turn that message off
+       (Runtime.SOLVER_VERBOSITY); a caller's own `verbose` still gives it. =#
+    local ticks = Modelica"""
+      model SampledInput "a state driven by a sampled input: an event each 0.01 s"
+        Real x(start = 1, fixed = true);
+        discrete Real y(start = 0, fixed = true);
+      equation
+        der(x) = -x + y;
+        when sample(0, 0.01) then
+          y = pre(y) + 1;
+        end when;
+      end SampledInput;
+      """
+    local name::String = _translateProgram(ticks, "SampledInput"; scalarized = false)
+    @test _arrayPathTaken(name)
+    local warnings::Vector{Int} = Int[]
+    for kwargs::NamedTuple in ((;), (; verbose = OMBackend.Runtime.DiffEqBase.DEVerbosity()))
+      local logger::Test.TestLogger = Test.TestLogger(min_level = Base.CoreLogging.Warn)
+      local sol = Base.CoreLogging.with_logger(logger) do
+        OMBackend.simulateModel(name; tspan = (0.0, 0.1), kwargs...)
+      end
+      @test sol.retcode == ReturnCode.Success
+      push!(warnings, count(r -> occursin("Initial timestep too small", string(r.message)), logger.logs))
+    end
+    @test warnings[1] == 0
+    @test warnings[2] >= 5
+  end
+
   @testset "Algebraic loops: per element by Newton, through the elements as a DAE" begin
     local tight::NamedTuple = (reltol = 1e-10, abstol = 1e-10)
     #= an equation nonlinear in its unknown; a nonlinear loop of two per element =#
@@ -603,9 +634,9 @@ end
     (s, a, _) = _bothWays("ArrayPath.LocalLoops", ["x[1]", "y[2]", "w[4]"]; tight...)
     @test isapprox(a, s; atol = 1e-9)
     #= one solve for the family of blocks: the code does not grow with n =#
-    local batches::Int = OMBackend.CodeGeneration.ArrayODEGen.LAST_STATS[].batches
+    local batches::Int = OMBackend.CodeGeneration.ArrayPreserveDE.LAST_STATS[].batches
     @test _arrayPathTaken(_arrayPathTranslate("ArrayPath.LocalLoops1000"; scalarized = false))
-    @test OMBackend.CodeGeneration.ArrayODEGen.LAST_STATS[].batches == batches
+    @test OMBackend.CodeGeneration.ArrayPreserveDE.LAST_STATS[].batches == batches
     #= a tridiagonal loop through all the elements: solved in the right-hand side (blockSolve!), the solver sees the
        states only =#
     local (s2::Vector{Float64}, a2::Vector{Float64}, sol::OMBackend.DifferentialEquations.SciMLBase.AbstractODESolution) = _bothWays("ArrayPath.CoupledLoop", ["x[1]", "v[2]", "x[20]", "v[10]"]; tight...)
@@ -930,7 +961,7 @@ end DivideInLoop;
        iteration did not settle"): the combination that gives itself back is searched for, fewest changes first
        (`_searchRelations!`). Here two relations: (true, false) and (false, true) give each other, (false, false)
        gives (true, false), (true, true) itself =#
-    local generation::Module = OMBackend.CodeGeneration.ArrayODEGen
+    local generation::Module = OMBackend.CodeGeneration.ArrayPreserveDE
     local p = solStick.prob.p
     fill!(p.rel, false)
     p.rel[1] = true
@@ -996,7 +1027,7 @@ end DivideInLoop;
        Newton's method does not contract with it and the loop's unknowns were NaN (MSL ThyristorBridge2mPulse_R: both
        thyristors of a commutating pair conducting for a pass of the event iteration; DtNaN). `blockSolve!` then
        takes differences over a step of the unknowns' size, exact for a linear loop =#
-    local generation::Module = OMBackend.CodeGeneration.ArrayODEGen
+    local generation::Module = OMBackend.CodeGeneration.ArrayPreserveDE
     local A::Matrix{Float64} = [1.0 1.0; 1.0 1.0 + 1e-10]
     local b::Vector{Float64} = A * [1.0, 2.0]
     local solver = generation.BlockSolver(generation._SPARSE.sparse(ones(2, 2)), [1, 2], [0.0, 0.0])
@@ -1010,7 +1041,7 @@ end DivideInLoop;
     #= the root of a difference at zero (a pipe's flow at equal pressures): each full Newton step lands as far on
        the other side, and the loop's unknowns were NaN (MSL Fluid EmptyTanks did not start). `blockSolve!` then
        shortens the steps until the residuals fall (`_blockDamped!`) =#
-    local generation::Module = OMBackend.CodeGeneration.ArrayODEGen
+    local generation::Module = OMBackend.CodeGeneration.ArrayPreserveDE
     local root = (x::Float64) -> sign(x) * sqrt(abs(x))
     local residual! = (res, y, du, a, u, p, t, z, mode, fire) ->
       (res[1] = root(y[1] - y[2]); res[2] = y[1] + y[2] - 3.0; a .= y; nothing)
@@ -1051,7 +1082,7 @@ end DivideInLoop;
        crosses the limit, its derivative 2/3 of the true one. Newton's steps then leave the linear window, and the
        damped ones fall short (MSL DifferentialAmplifier Unstable at 8 ms). `blockSolve!` then takes differences
        over sqrt(eps) of each unknown's own size (`_differenceStep`) =#
-    local generation::Module = OMBackend.CodeGeneration.ArrayODEGen
+    local generation::Module = OMBackend.CodeGeneration.ArrayPreserveDE
     local limiter! = (res, y, du, a, u, p, t, z, mode, fire) ->
       (res[1] = clamp(1.0e9 * (y[1] - 1.6e-3), -10.0, 10.0) - y[2]; res[2] = y[2] - 9.9; a .= y; nothing)
     local arguments::Tuple = (zeros(1), zeros(2), zeros(1), nothing, 0.0, nothing, false, false)
@@ -1365,7 +1396,7 @@ end DivideInLoop;
       @test OMBackend.translateReducedArrays(fm; functionList = OMFrontend.cacheToFunctionList(cache)) !== nothing
       @test _arrayPathTaken(name)
       if whenModel
-        OMBackend.ARRAY_ODE_GENERATION[] = false
+        OMBackend.ARRAY_PRESERVE_DE_GENERATION[] = false
         try
           @test OMBackend.translateReducedArrays(fm; functionList = OMFrontend.cacheToFunctionList(cache)) !== nothing
           @test name in OMBackend.BACKEND_SCALARIZED_MODELS
@@ -1377,7 +1408,7 @@ end DivideInLoop;
             @test occursin("backend scalarization: switched off", OMBackend.scalarizedFallbackReason(name))
           end
         finally
-          OMBackend.ARRAY_ODE_GENERATION[] = true
+          OMBackend.ARRAY_PRESERVE_DE_GENERATION[] = true
         end
       end
       _arrayPathTranslate(model; scalarized = false)
@@ -1645,7 +1676,7 @@ end DivideInLoop;
     catch e
       e
     end
-    @test err isa OMBackend.CodeGeneration.ArrayODEGen.ModelicaSubscriptError && err.index == 3 && err.size == 2
+    @test err isa OMBackend.CodeGeneration.ArrayPreserveDE.ModelicaSubscriptError && err.index == 3 && err.size == 2
   end
 
   @testset "the plan's folds in the committed model, if-equations in for-equations, time events, sample stops" begin
@@ -2121,7 +2152,7 @@ end DivideInLoop;
     local (ss, as, _) = _bothWaysOf(scaled, "ScaledStates", ["p", "x[1]", "x[2]"])
     @test isapprox(as, ss; rtol = 1e-5)
     @test 0.016 < as[2] < 0.017
-    local G = OMBackend.CodeGeneration.ArrayODEGen
+    local G = OMBackend.CodeGeneration.ArrayPreserveDE
     #= columns that share no row in one group, greedy in the columns' order =#
     local band = G._SPARSE.sparse([1, 2, 2, 3, 3, 4], [1, 1, 2, 2, 3, 4], ones(6), 4, 4)
     @test G.columnGroups(band) == [[1, 3, 4], [2]]
@@ -2488,7 +2519,7 @@ end DivideInLoop;
     #= reltol 1e-9: the array route crosses the 6 kinks in t without events (smooth(0, ...)); at reltol 1e-8 its error
        there depends on the step path, 2e-8 to 1.1e-6 against an exact reference (4.3e-10 at reltol 1e-9) =#
     local (ss, as, _) = _bothWaysOf(streams, "ReversingStreams", ["x[1]", "x[2]"]; reltol = 1e-9, abstol = 1e-11)
-    @test OMBackend.CodeGeneration.ArrayODEGen.LAST_STATS[].relations == 0
+    @test OMBackend.CodeGeneration.ArrayPreserveDE.LAST_STATS[].relations == 0
     @test maximum(abs.(ss .- as)) < 1e-6
   end
 
@@ -3497,12 +3528,12 @@ end DivideInLoop;
     OMBackend.simulateModel(name; tspan = (0.0, 1.0))
     local evaluated::Module = OMBackend._modelModule(Symbol(name))
     _translateProgram(decay("2.0"), "KeptDecay"; scalarized = false)
-    @test !OMBackend.modelWasCompiledAgainDE(name)
+    @test !OMBackend.modelWasCompiledAgainArrayPreserveDE(name)
     local sol = OMBackend.simulateModel(name; tspan = (0.0, 1.0), reltol = 1e-8, abstol = 1e-10)
     @test OMBackend._modelModule(Symbol(name)) === evaluated
     @test _values(sol, ["x[1]", "x[2]"]) ≈ [exp(-1.0), exp(-2.0)] rtol = 1e-6
     _translateProgram(decay("3.0"), "KeptDecay"; scalarized = false)
-    @test OMBackend.modelWasCompiledAgainDE(name)
+    @test OMBackend.modelWasCompiledAgainArrayPreserveDE(name)
     sol = OMBackend.simulateModel(name; tspan = (0.0, 1.0), reltol = 1e-8, abstol = 1e-10)
     @test OMBackend._modelModule(Symbol(name)) !== evaluated
     @test _values(sol, ["x[1]", "x[2]"]) ≈ [exp(-1.0), exp(-3.0)] rtol = 1e-6

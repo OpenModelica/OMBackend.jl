@@ -1026,7 +1026,8 @@ function ODE_MODE_MTK_PROGRAM_GENERATION(simCode::SC.SIM_CODE, modelName::String
       global LATEST_SOLVE_TRIPLE = (_problemForSolver, _solver, nothing)
       local _initKw = OMBackend.CodeGeneration.defaultInitializeKwargs(_problemForSolver, kwargs,
                                                                        $(_modelHasTableClusters(simCode)))
-      local _tolKw = OMBackend.CodeGeneration.defaultToleranceKwargs(_problemForSolver, kwargs)
+      local _tolKw = (; OMBackend.CodeGeneration.defaultToleranceKwargs(_problemForSolver, kwargs)...,
+                      OMBackend.Runtime.solverVerbosity(kwargs)...)
       OMBackend.CodeGeneration._resetRHSError!()
       #= a terminate() the initial algorithm reached: the solve ends at its start =#
       local _sol = $(_initialTerminates(simCode) ?

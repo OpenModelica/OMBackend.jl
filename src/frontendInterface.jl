@@ -94,7 +94,7 @@ A flat model with arrays kept lowered with its arrays, through the passes (`runP
 its array equations as for-equations), its index reduced in array form where above one, its states
 committed in array form (`Passes.IndexReduction.reduceIndexArrays!`; a model without arrays to keep of
 index 1 the same, `commitIndexOne!`, for the array code only): what the array code
-(`generateReducedArrayODETargetCode`) or the scalarized form (`scalarizedReducedModel`) is made from.
+(`generateReducedArrayPreserveDETargetCode`) or the scalarized form (`scalarizedReducedModel`) is made from.
 `nothing` where the array form does not take the model (switched off, no arrays to keep and of index
 above one, of index 1 with clocked partitions, of index above one with an if-expression that reads a
 for-equation's iterator, what it does not handle or the lowering does not support: logged; another
@@ -107,7 +107,7 @@ function reducedArrayModel end
                            observedFilter, checkSimCode) -> Union{Nothing, Tuple}
 
 `translate` of a flat model with arrays kept: its index reduced in array form (`reducedArrayModel`), to the
-array code (`generateReducedArrayODETargetCode`), else the reduced model scalarized (`scalarizedReducedModel`);
+array code (`generateReducedArrayPreserveDETargetCode`), else the reduced model scalarized (`scalarizedReducedModel`);
 where the array form does not take it, or what it made does not translate or build, the model scalarized by the
 backend before the scalar passes (`backendScalarizedModel`, recorded in BACKEND_SCALARIZED_MODELS). `nothing`
 where none of these takes the model (OM's translate then throws `ARRAY_PRESERVING_CODEGEN_NOT_SUPPORTED` with the

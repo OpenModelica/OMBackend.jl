@@ -145,28 +145,3 @@ function filterAliasObservations(simCode::SIM_CODE)::SIM_CODE
   return update(simCode; aliasMap = filter(keep, simCode.aliasMap))
 end
 
-"""
-    deSimulationCode(model)
-
-The simulation code the DifferentialEquations.jl code generator takes (DEMode): the MTK path's
-first passes (no Complex lowering, observation-only or dead parameters, function evaluation,
-folds), no observed equations.
-"""
-function deSimulationCode(model::IR.Model)::SIM_CODE
-  local simCode = runSimCodePass("flattenRecordCallSites", fromOMJLIR(model), flattenRecordCallSites)
-  return runPasses(simCode, [
-    "resolveIfExpInBindings" => resolveIfExpInBindings!,
-    "pruneConstantConditions" => pruneConstantConditions,
-    "foldParameterClosure" => foldParameterClosure,
-    "inlinePreOfConstantParameters" => inlinePreOfConstantParameters,
-    "propagateConstants" => propagateConstants,
-    "demoteDeadStates" => demoteDeadStates,
-    "eliminateAliasVariables" => eliminateAliasVariables,
-    "eliminateRHSEquivalentEquations" => eliminateRHSEquivalentEquations,
-    "simplifySemiLinear" => simplifySemiLinear,
-    "removeRedundantEquations" => removeRedundantEquations,
-    "eliminateConstantParameters" => eliminateConstantParameters,
-    "eliminateFrozenStates" => eliminateFrozenStates,
-    "demoteDeadStates" => demoteDeadStates,
-    "pruneConstantConditions" => pruneConstantConditions])
-end

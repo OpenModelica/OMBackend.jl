@@ -33,7 +33,7 @@
 *
 */ =#
 
-#= The event iteration and the event callbacks of the array models (ArrayODEGen): one method for every model, over its
+#= The event iteration and the event callbacks of the array models (ArrayPreserveDE): one method for every model, over its
    parameters `p` and the model's code they hold (`p.code`, ArrayModelCode). They were generated into each model's
    module, and compiled again with each (BouncingBall: 0.3 s of its first simulate). The module binds their names to
    them (`_eventFunctionNames`). =#

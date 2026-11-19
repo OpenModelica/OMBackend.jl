@@ -128,7 +128,7 @@ end
 The registries of OMBackend's modules (their mutable Dict and Set constants and their Refs), with copies of their
 contents: the workloads restore them (`_restoreRegistries!`), so that their models' builds, generated code, function
 implementations, run directories and array-code records are not kept in the image (their models' modules are). Base's
-`Set` is an immutable struct over a mutable Dict: a registry, though `ismutable` is false (ARRAY_ODE_MODELS and
+`Set` is an immutable struct over a mutable Dict: a registry, though `ismutable` is false (ARRAY_PRESERVE_DE_MODELS and
 ARRAY_REDUCED_MODELS kept the workload's models before, 2026-11-09).
 """
 function _registries(mod::Module = @__MODULE__, found::Vector{Pair{Any, Any}} = Pair{Any, Any}[])::Vector{Pair{Any, Any}}
@@ -246,7 +246,7 @@ end
     _precompileIRModel(model::Function, name::String, arrayCode::Bool) -> Nothing
 
 The OMJLIR model `model(name)` translated as OMJL's `translate` does after a frontend's lowering, by the array code
-(`reducedArrayModel`, `generateReducedArrayODETargetCode`; `arrayCode`) or through the passes and `translate`, then
+(`reducedArrayModel`, `generateReducedArrayPreserveDETargetCode`; `arrayCode`) or through the passes and `translate`, then
 built and simulated as OMJL's `simulate` does, with the default solver and with the DAE fallback: the build and the
 solves of both routes compile into OMBackend's image without a frontend.
 """
@@ -254,7 +254,7 @@ function _precompileIRModel(model::Function, name::String, arrayCode::Bool)::Not
   local mode::BackendMode = DEFAULT_BACKEND_MODE[]
   if arrayCode
     local reduced::Union{Nothing, OMJLIR.Model} = reducedArrayModel(() -> model(name), name)
-    (reduced !== nothing && generateReducedArrayODETargetCode(name, reduced) !== nothing) ||
+    (reduced !== nothing && generateReducedArrayPreserveDETargetCode(name, reduced) !== nothing) ||
       error("$(name): no array code ($(get(ARRAY_PATH_REASONS, name, "-")))")
   else
     translate(Passes.runPasses!(model(name)); BackendMode = mode, warnMissingStartValues = nothing,
@@ -306,7 +306,7 @@ relation search of an event iteration. Without them, a process's first model wit
 0.14 s, 2026-11-18).
 """
 function _precompileWarmupArrayHelpers()::Nothing
-  local AG::Module = CodeGeneration.ArrayODEGen
+  local AG::Module = CodeGeneration.ArrayPreserveDE
   for reads::Union{Nothing, Vector{Vector{Int}}} in (nothing, [[1], [1, 2]])
     AG.sortedInitialSolve(_precompileResidual!, [0.0, 0.0], [1.0, 1.0], reads)
   end

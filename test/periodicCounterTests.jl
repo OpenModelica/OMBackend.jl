@@ -1,5 +1,5 @@
 #= MSL 4.1 Trapezoid's period counter, `when time >= (pre(count) + 1)*period + startTime`, on the array code's path
-   (ArrayODEGen's affectCrossing!): its relation is located at its hysteresis band's edge, and at reltol 1e-6 the event's
+   (ArrayPreserveDE's affectCrossing!): its relation is located at its hysteresis band's edge, and at reltol 1e-6 the event's
    left limit (1e-10*(1 + |t|) back) lay exactly on its threshold, where the exact-zero rule made it true already; the
    when took its rising edge before the event and never fired (MSL OpAmps.Differentiator's source stayed in its first
    period). The left limit lies beyond the band now. The counter steps at t = 0.065 + k*0.1. Models/PeriodicCounters.mo. =#
@@ -14,7 +14,7 @@ import OMFrontend
                                                       scalarize = false)
   OMBackend.translate(fm; functionList = OMFrontend.cacheToFunctionList(cache), scalarized = false)
   local name = OMBackend.canonicalName(model)
-  @test name in OMBackend.ARRAY_ODE_MODELS
+  @test name in OMBackend.ARRAY_PRESERVE_DE_MODELS
   local sol = OMBackend.simulateModel(name; tspan = (0.0, 1.0), reltol = 1.0e-6)
   @test string(sol.retcode) == "Success"
   @test [sol(t; idxs = :signalSource_count) for t in (0.06, 0.07, 0.17, 0.97)] == [0.0, 1.0, 2.0, 10.0]

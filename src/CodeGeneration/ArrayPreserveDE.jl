@@ -34,7 +34,7 @@
 */ =#
 
 #=
-Array-preserving code generation (experimental, 2026-10-05).
+arrayPreserveDE: array-preserving DifferentialEquations.jl code generation (2026-10-05; named so 2026-11-19).
 
 For the simulation code of a model with its arrays kept (the frontend's `scalarize = false`, OMJLIR, then
 SimCode.lowerArraySystem; its variables and equations the classes of its domain level, SimCode.Domains, whose causal
@@ -77,7 +77,7 @@ generated code grows with the number of equation classes, not with the array siz
 What the front half does not (yet) handle it reports with the reason, and the caller scalarizes
 (SimCode/Domains/translate.jl's header lists it).
 =#
-module ArrayODEGen
+module ArrayPreserveDE
 
 import ModelingToolkit
 import ..CodeGeneration: stripBeginBlocks, ModelicaAssertionError, solveStoppedAtStart, _autoDtReset!, _finiteFirstStep!,
@@ -85,6 +85,7 @@ import ..CodeGeneration: stripBeginBlocks, ModelicaAssertionError, solveStoppedA
 import ..CodeGeneration: DelayState, delayedValue, emptyDelayHistories!, startDelayHistories!, recordDelayStepEnd!,
   recordDelayJumps!, delayJumpsDue!
 import ...Passes
+import ...Runtime: solverVerbosity
 import ...SimCode
 import ...SimCode.Domains: DomainSystem, InstanceTable, EqClass, EvFn, Gen, IR, Lit, LoopBlocks, NotSupported, Op, Pre,
   Ref, Rel, SAssert, SAssign, SBreak, SCall, SFor, SIf, SPreStart, SWhen, SWhile, Slot, Stmt, TimeIR, TornBlock, VarInfo,
@@ -3379,7 +3380,8 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
                       abstol = $(DEFAULT_ABSTOL), kwargs...)
       local (ode, callbacks) = $(Symbol(modelName, "Model"))(tspan; parameters = parameters)
       local prob = $(_problemFor)(ode, solver)
-      local initKw = (; $(_initializeKwargs)(prob, kwargs, abstol)..., $(_stepKwargs)(kwargs, tspan, N_RELATIONS)...)
+      local initKw = (; $(_initializeKwargs)(prob, kwargs, abstol)..., $(_stepKwargs)(kwargs, tspan, N_RELATIONS)...,
+                      $(solverVerbosity)(kwargs)...)
       OMBackend.CodeGeneration._resetRHSError!()
       local sol = $(hasTerminate ?
                     :(prob.p.state.terminated === nothing ?
@@ -3780,13 +3782,13 @@ function _stmtHasOp(st::Stmt, op::Symbol)::Bool
 end
 
 """
-    generateArrayODECode(sc::SimCode.SIM_CODE, modelName) -> (modelName, moduleExpr) or (nothing, reason)
+    generateArrayPreserveDECode(sc::SimCode.SIM_CODE, modelName) -> (modelName, moduleExpr) or (nothing, reason)
 
 The array-preserving module of the simulation code of a model with its arrays kept (`SimCode.lowerArraySystem`),
 through its domain level (`SimCode.Domains.domainSystem`) and causal level (`SimCode.Domains.causalSchedule!`); or
 `nothing` and the reason the model is outside the supported scope.
 """
-function generateArrayODECode(sc::SimCode.SIM_CODE, modelName::String)
+function generateArrayPreserveDECode(sc::SimCode.SIM_CODE, modelName::String)
   try
     local (functionDefs::Vector{Any}, _) = _functionDefinitions(sc.functions)
     local ds::DomainSystem = domainSystem(sc)
@@ -3854,4 +3856,4 @@ include("arrayEvents.jl")
 include("arrayAsserts.jl")
 include("arrayInitialization.jl")
 
-end #= module ArrayODEGen =#
+end #= module ArrayPreserveDE =#

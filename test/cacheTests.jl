@@ -67,9 +67,9 @@ import OMFrontend
     local sol = OMBackend.simulateModel("SampleClusters_FlipFlop"; tspan = (0.0, 1.2))
     @test string(sol.retcode) == "Success"
     #= a forgotten model is no translated array model either (a simulate by name looked for its code) =#
-    push!(OMBackend.ARRAY_ODE_MODELS, "Forgotten_ArrayModel")
+    push!(OMBackend.ARRAY_PRESERVE_DE_MODELS, "Forgotten_ArrayModel")
     OMBackend.forgetModel("Forgotten_ArrayModel")
-    @test !("Forgotten_ArrayModel" in OMBackend.ARRAY_ODE_MODELS)
+    @test !("Forgotten_ArrayModel" in OMBackend.ARRAY_PRESERVE_DE_MODELS)
   finally
     C.clear!()
     append!(C.MODELS, savedModels)

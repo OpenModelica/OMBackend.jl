@@ -58,7 +58,7 @@ function _precompileTranslateAndSimulate(scode::OMFrontend.SCode.Program, name::
                                          simulate::Bool)::Nothing
   local mode::OMBackend.BackendMode = DEFAULT_BACKEND_MODE[]
   _precompileTranslate(scode, name, mode)
-  (canonicalName(name) in ARRAY_ODE_MODELS) == arrayCode ||
+  (canonicalName(name) in ARRAY_PRESERVE_DE_MODELS) == arrayCode ||
     error("$(name): $(arrayCode ? "no array code" : "array code") ($(get(ARRAY_PATH_REASONS, canonicalName(name), "-")))")
   simulate || return nothing
   _precompileTranslate(scode, name, mode)

@@ -199,13 +199,6 @@ end
 @enum BackendMode begin
   MTK_MODE = 3
   #=
-    Direct DifferentialEquations.jl emission. Builds an `ODEProblem` with an
-    in-place RHS `f!(du, u, p, t)` that indexes `u`, `du`, and `p` by integer
-    position. Bypasses ModelingToolkit entirely. Initial scope: pure ODE
-    (no algebraic constraints), no VSS / structural transitions.
-  =#
-  DEMode = 4
-  #=
     In-backend MTK path. Same module/codegen as MTK_MODE, but additionally
     constructs the System and runs structural_simplify in the backend at
     translate time and dumps the post-simplify System. Simulate reuses the
@@ -235,9 +228,10 @@ const COMPILED_MODELS_MTK = Dict{String, Tuple{Expr, Bool, UInt64}}()
 
 
 """
-DEJL (DifferentialEquations.jl) models that have been compiled one time.
+The arrayPreserveDE modules translated (CodeGeneration.ArrayPreserveDE): model => (its code, whether it changed since
+it was evaluated, the hash of its code).
 """
-const COMPILED_MODELS_DEJL = Dict{String, Tuple{Expr, Bool, UInt64}}()
+const COMPILED_MODELS_ARRAY_PRESERVE_DE = Dict{String, Tuple{Expr, Bool, UInt64}}()
 
 "How many times each model's code was dumped in this process (`dumpGeneratedCode`)."
 const CODE_DUMP_COUNT = Dict{String, Int}()
@@ -263,22 +257,22 @@ function dumpGeneratedCode(modelName::String, code::Expr)::Nothing
 end
 
 """
-Array-preserving code generation for flat models translated with `scalarized = false`
-(experimental): the OMJLIR model lowered with its arrays kept (`reducedArrayModel`) gets a
-DifferentialEquations.jl module that keeps the loops (CodeGeneration.ArrayODEGen); other models are
-scalarized as before. Toggle with `OMBackend.ARRAY_ODE_GENERATION[] = false`.
+arrayPreserveDE, the array-preserving code generation for flat models translated with `scalarize = false`: the
+OMJLIR model lowered with its arrays kept (`reducedArrayModel`) gets a DifferentialEquations.jl module that keeps the
+loops (CodeGeneration.ArrayPreserveDE); other models are scalarized and go the ModelingToolkit route. Toggle with
+`OMBackend.ARRAY_PRESERVE_DE_GENERATION[] = false`.
 """
-const ARRAY_ODE_GENERATION = Ref{Bool}(true)
+const ARRAY_PRESERVE_DE_GENERATION = Ref{Bool}(true)
 
 """
 `true`: the array-preserving code generation also takes models with events (relations,
 when, sample, initial()), asserts and initial equations (experimental). `false` (the default):
 those go the ModelingToolkit path, whose event and initialization semantics they keep.
 """
-const ARRAY_PATH_FULL = CodeGeneration.ArrayODEGen.FULL
+const ARRAY_PATH_FULL = CodeGeneration.ArrayPreserveDE.FULL
 
-#= The models whose current translation is an array ODE module (simulated as DE-mode modules). =#
-const ARRAY_ODE_MODELS = Set{String}()
+"The models whose current translation is an arrayPreserveDE module."
+const ARRAY_PRESERVE_DE_MODELS = Set{String}()
 
 """
 The array ODE modules evaluated (model => (the module, the hash of its code)): a translate of the model whose code is
@@ -391,11 +385,11 @@ function forgetModel(modelName::String)::Nothing
   Runtime.forgetRecompiledModes!(cname)
   for name in unique((modelName, cname))
     delete!(COMPILED_MODELS_MTK, name)
-    delete!(COMPILED_MODELS_DEJL, name)
+    delete!(COMPILED_MODELS_ARRAY_PRESERVE_DE, name)
     delete!(ARRAY_MODULES, name)
     #= else a simulate by name took it for a translated array model and found no code (MSL SignConvention after
-       a coverage worker forgot it: "DE-mode model ... is not compiled") =#
-    delete!(ARRAY_ODE_MODELS, name)
+       a coverage worker forgot it: "... model ... is not compiled") =#
+    delete!(ARRAY_PRESERVE_DE_MODELS, name)
     delete!(ARRAY_REDUCED_MODELS, name)
     delete!(MODEL_RUN_DIRS, name)
   end
@@ -422,7 +416,7 @@ function translate(model::OMJLIR.Model;
   resetFallbacks!()
   warnMissingStartValues === nothing || (WARN_MISSING_START_VALUES[] = warnMissingStartValues)
   try
-    delete!(ARRAY_ODE_MODELS, canonicalName(model.name))
+    delete!(ARRAY_PRESERVE_DE_MODELS, canonicalName(model.name))
     delete!(ARRAY_REDUCED_MODELS, canonicalName(model.name))
     return withLogRunDir(runId) do
       generateTargetCode(model; BackendMode, eliminateNonDynamic, observedFilter, checkSimCode)
@@ -444,26 +438,14 @@ function lowerOMCFlatModel end
 function generateTargetCode(model::OMJLIR.Model; BackendMode::OMBackend.BackendMode,
                             eliminateNonDynamic::Union{Nothing, Bool, SimCode.EliminationOptions},
                             observedFilter::Union{Nothing, Vector{String}, Vector{Regex}}, checkSimCode::Bool)
-  if BackendMode == DEMode
-    #= Direct DifferentialEquations.jl path: a subset of the MTK path's SimCode passes (not,
-       e.g., the Complex lowering, the function evaluation, the folds, the initial values),
-       no observed-equation work, the DE emitter. =#
-    local simCode = SimCode.codeView(SimCode.deSimulationCode(model))
-    (SimCode.hasStructuralTransitions(simCode) || SimCode.hasSubModels(simCode)) &&
-      error("DEMode does not support structural transitions / VSS at this time. Re-run with mode = OMBackend.MTK_MODE.")
-    _checkSimCodeBeforeCodegen(simCode, checkSimCode)
-    return _translationResult(generateDETargetCode(simCode))
-  elseif BackendMode == MTK_MODE || BackendMode == IMTK_MODE
-    local simCode = mtkSimCode(model; eliminateNonDynamic, observedFilter)
-    _checkSimCodeBeforeCodegen(simCode, checkSimCode)
-    local genCode = if BackendMode == IMTK_MODE
-      @BACKEND_PERFLOG "[backendAPI] generateIMTKTargetCode" generateIMTKTargetCode(simCode)
-    else
-      @BACKEND_PERFLOG "[backendAPI] generateMTKTargetCode" generateMTKTargetCode(simCode)
-    end
-    return _translationResult(genCode)
+  local simCode = mtkSimCode(model; eliminateNonDynamic, observedFilter)
+  _checkSimCodeBeforeCodegen(simCode, checkSimCode)
+  local genCode = if BackendMode == IMTK_MODE
+    @BACKEND_PERFLOG "[backendAPI] generateIMTKTargetCode" generateIMTKTargetCode(simCode)
+  else
+    @BACKEND_PERFLOG "[backendAPI] generateMTKTargetCode" generateMTKTargetCode(simCode)
   end
-  error("Unsupported BackendMode: $BackendMode. Valid modes are: MTK_MODE, IMTK_MODE, DEMode")
+  return _translationResult(genCode)
 end
 
 """
@@ -637,24 +619,24 @@ function _arrayReductionStep(f::Function, name::String, decline::Function;
 end
 
 """
-    generateReducedArrayODETargetCode(name, reduced) -> Union{Nothing, Tuple{String, Expr}}
+    generateReducedArrayPreserveDETargetCode(name, reduced) -> Union{Nothing, Tuple{String, Expr}}
 
 The array ODE module of the model `name` (canonical) whose index was reduced in array form (`reduced`,
 `reducedArrayModel`; not changed): its derivative unknowns solved in array form
 (`Passes.IndexReduction.solvedInArrays`), in the array code's form (`Passes.arrayCodeForm!`), lowered into its
-simulation code (`SimCode.lowerArraySystem`), from which ArrayODEGen generates it; cached as a DE-mode
-model (`_registerArrayODEModule!`), recorded in ARRAY_ODE_MODELS and ARRAY_REDUCED_MODELS.
-`nothing` where it is outside the array code's scope (ARRAY_ODE_GENERATION off, tunable parameters,
+simulation code (`SimCode.lowerArraySystem`), from which ArrayPreserveDE generates it; cached as an arrayPreserveDE
+model (`_registerArrayPreserveDEModule!`), recorded in ARRAY_PRESERVE_DE_MODELS and ARRAY_REDUCED_MODELS.
+`nothing` where it is outside the array code's scope (ARRAY_PRESERVE_DE_GENERATION off, tunable parameters,
 an algebraic loop left, ...): the reason logged and recorded (`declineArrayPath!`, "array code after
 index reduction"), and the caller scalarizes the reduced model.
 """
-function generateReducedArrayODETargetCode(name::String, reduced::OMJLIR.Model)::Union{Nothing, Tuple{String, Expr}}
+function generateReducedArrayPreserveDETargetCode(name::String, reduced::OMJLIR.Model)::Union{Nothing, Tuple{String, Expr}}
   local decline::Function = (reason::String) -> begin
     @info "[backendAPI] array code after index reduction not taken for $(name): $(reason)"
     declineArrayPath!(name, "array code after index reduction", reason)
     nothing
   end
-  ARRAY_ODE_GENERATION[] || return decline("switched off (OMBackend.ARRAY_ODE_GENERATION)")
+  ARRAY_PRESERVE_DE_GENERATION[] || return decline("switched off (OMBackend.ARRAY_PRESERVE_DE_GENERATION)")
   isempty(TUNABLE_PARAMETERS[]) || return decline("withTunableParameters (the ModelingToolkit path's tunable sets)")
   local reduction::Module = Passes.IndexReduction
   local (modelName::Union{Nothing, String}, modelCode::Union{String, Expr}) = try
@@ -666,7 +648,7 @@ function generateReducedArrayODETargetCode(name::String, reduced::OMJLIR.Model):
     local (solved::OMJLIR.Model, _) = @BACKEND_PERFLOG "[backendAPI] solvedInArrays" reduction.solvedInArrays(working)
     Passes.arrayCodeForm!(solved)
     local sc::SimCode.SIM_CODE = @BACKEND_PERFLOG "[backendAPI] array simulation code" SimCode.lowerArraySystem(solved)
-    @BACKEND_PERFLOG "[backendAPI] array code (after index reduction)" CodeGeneration.ArrayODEGen.generateArrayODECode(sc, name)
+    @BACKEND_PERFLOG "[backendAPI] array code (after index reduction)" CodeGeneration.ArrayPreserveDE.generateArrayPreserveDECode(sc, name)
   catch err
     isFatal(err) && rethrow()
     err isa reduction.NotHandled && return decline(sprint(showerror, err))
@@ -676,11 +658,11 @@ function generateReducedArrayODETargetCode(name::String, reduced::OMJLIR.Model):
     return decline("an error: $(first(sprint(showerror, err), 300))")
   end
   modelName === nothing && return decline(string(modelCode))
-  _registerArrayODEModule!(name, modelCode)
+  _registerArrayPreserveDEModule!(name, modelCode)
   local failure::Union{Nothing, String} = _arrayStartFailure(name, modelCode)
   if failure !== nothing
-    delete!(ARRAY_ODE_MODELS, name)
-    delete!(COMPILED_MODELS_DEJL, name)
+    delete!(ARRAY_PRESERVE_DE_MODELS, name)
+    delete!(COMPILED_MODELS_ARRAY_PRESERVE_DE, name)
     return decline(failure)
   end
   push!(ARRAY_REDUCED_MODELS, name)
@@ -691,7 +673,7 @@ end
     _arrayStartFailure(name, modelCode) -> Union{Nothing, String}
 
 Why the array model `name` does not start, `nothing` where it does: a model with an algebraic loop (a large one,
-`ArrayODEGen.blockSolve!`, or a family solved by a generated Newton) has its problem built once at the translate, as
+`ArrayPreserveDE.blockSolve!`, or a family solved by a generated Newton) has its problem built once at the translate, as
 the ModelingToolkit routes are taken only where they build (`_translateKept`). Its loops are solved by Newton from
 the start values, and a kinematic loop's Jacobian is singular there (MSL MultiBody Fourbar1: rank 2 of 12 with the
 rotation matrices at their zero starts): the simulation ended in "the initial system: the algebraic loop ... has no
@@ -699,7 +681,7 @@ solution", with no route left to take. Not while a package image is generated (n
 for a model without a loop.
 """
 function _arrayStartFailure(name::String, modelCode::Expr)::Union{Nothing, String}
-  (_calls(modelCode, CodeGeneration.ArrayODEGen.blockSolve!) || _calls(modelCode, CodeGeneration.ArrayODEGen.loopFamilySolve!)) ||
+  (_calls(modelCode, CodeGeneration.ArrayPreserveDE.blockSolve!) || _calls(modelCode, CodeGeneration.ArrayPreserveDE.loopFamilySolve!)) ||
     return nothing
   ccall(:jl_generating_output, Cint, ()) == 1 && return nothing
   try
@@ -819,8 +801,8 @@ end
 The generated code of a model for writing it out: the array path's module for an array
 model, else the MTK path's code.
 """
-_writtenModel(modelName) = modelName in ARRAY_ODE_MODELS && haskey(COMPILED_MODELS_DEJL, modelName) ?
-  COMPILED_MODELS_DEJL[modelName][1] : getCompiledModel(modelName)
+_writtenModel(modelName) = modelName in ARRAY_PRESERVE_DE_MODELS && haskey(COMPILED_MODELS_ARRAY_PRESERVE_DE, modelName) ?
+  COMPILED_MODELS_ARRAY_PRESERVE_DE[modelName][1] : getCompiledModel(modelName)
 
 function getCompiledModel(modelName)
   haskey(COMPILED_MODELS_MTK, modelName) ||
@@ -828,39 +810,18 @@ function getCompiledModel(modelName)
   return COMPILED_MODELS_MTK[modelName][1]
 end
 
-"""
-`generateDETargetCode(simCode::SimCode.SIM_CODE)`
-  Generates code interfacing DifferentialEquations.jl directly (DEMode).
-  Produces an in-place ODEProblem with the RHS indexed by integer position.
-  Caches the result in COMPILED_MODELS_DEJL so simulateModel can pick it up.
-"""
-function generateDETargetCode(simCode::SimCode.SIM_CODE)::Tuple{String, Expr}
-  (modelName::String, modelCode::Expr) = CodeGeneration.DEGen.generateDECode(simCode)
-  local codeHash = hash(modelCode)
-  if haskey(COMPILED_MODELS_DEJL, modelName)
-    local previousHash = COMPILED_MODELS_DEJL[modelName][3]
-    local changeDetected = previousHash != codeHash
-    COMPILED_MODELS_DEJL[modelName] = (modelCode, changeDetected, codeHash)
-  else
-    local moduleAlreadyExists = _modelDefined(Symbol(modelName))
-    COMPILED_MODELS_DEJL[modelName] = (modelCode, moduleAlreadyExists, codeHash)
-  end
-  Cache.store!(canonicalName(modelName), () -> modelCode)
-  return (modelName, modelCode)
-end
-
-"The array ODE module `modelCode` of the model `modelName` cached as a DE-mode model, recorded in ARRAY_ODE_MODELS."
-function _registerArrayODEModule!(modelName::String, modelCode::Expr)::Nothing
+"The arrayPreserveDE module `modelCode` of the model `modelName` cached, recorded in ARRAY_PRESERVE_DE_MODELS."
+function _registerArrayPreserveDEModule!(modelName::String, modelCode::Expr)::Nothing
   dumpGeneratedCode(modelName, modelCode)
   local codeHash::UInt64 = hash(modelCode)
   #= evaluated again at the next simulate, unless the module evaluated from the same code is the one defined (a
      module of this name may be another path's) =#
-  COMPILED_MODELS_DEJL[modelName] = (modelCode, !_keptArrayModule(modelName, modelCode, codeHash), codeHash)
+  COMPILED_MODELS_ARRAY_PRESERVE_DE[modelName] = (modelCode, !_keptArrayModule(modelName, modelCode, codeHash), codeHash)
   Cache.store!(modelName, () -> modelCode)
   #= and the ModelingToolkit path's build goes: its module is replaced, and its code (the same
      for a model without arrays) would reuse the build at its next translate =#
   IMTKGen.forgetBuild(modelName)
-  push!(ARRAY_ODE_MODELS, modelName)
+  push!(ARRAY_PRESERVE_DE_MODELS, modelName)
   return nothing
 end
 
@@ -870,7 +831,7 @@ end
 Whether the array module evaluated last for `modelName` (ARRAY_MODULES) is kept for the code `modelCode` (hash
 `codeHash`): the same code, and that module still the one defined (no other path's replaced it). A translate of an
 unchanged model (a model of a file simulated again) then does not compile its module again. Not for code that makes
-external objects (tables): `_registerArrayODEModule!` frees the model's objects (`forgetBuild`), and the module makes
+external objects (tables): `_registerArrayPreserveDEModule!` frees the model's objects (`forgetBuild`), and the module makes
 them at its evaluation.
 """
 function _keptArrayModule(modelName::String, modelCode::Expr, codeHash::UInt64)::Bool
@@ -900,22 +861,25 @@ function modelEvaluated!(modelName::String)::Nothing
   return nothing
 end
 
-function getCompiledModelDE(modelName)
-  haskey(COMPILED_MODELS_DEJL, modelName) ||
-    error("DE-mode model $(modelName) is not compiled. Available DE-mode models: $(join(keys(COMPILED_MODELS_DEJL), ", "))")
-  return COMPILED_MODELS_DEJL[modelName][1]
+"The code of the arrayPreserveDE module of `modelName`."
+function getCompiledModelArrayPreserveDE(modelName::String)::Expr
+  haskey(COMPILED_MODELS_ARRAY_PRESERVE_DE, modelName) ||
+    error("arrayPreserveDE model $(modelName) is not compiled. Available arrayPreserveDE models: " *
+          join(keys(COMPILED_MODELS_ARRAY_PRESERVE_DE), ", "))
+  return COMPILED_MODELS_ARRAY_PRESERVE_DE[modelName][1]
 end
 
-modelWasCompiledAgainDE(modelName) = COMPILED_MODELS_DEJL[modelName][2]
+"Whether the arrayPreserveDE code of `modelName` changed since its module was evaluated."
+modelWasCompiledAgainArrayPreserveDE(modelName::String)::Bool = COMPILED_MODELS_ARRAY_PRESERVE_DE[modelName][2]
 
 """
-The DE-mode module of `modelName` evaluated: later calls reuse it until it changes.
+The arrayPreserveDE module of `modelName` evaluated: later calls reuse it until it changes.
 """
-function _evalModelDE(modelName::String, modelCode::Expr)
-  @BACKEND_PERFLOG "[backendAPI] evaluate the DE-mode module" (@eval $modelCode)
-  local (code, _, h) = COMPILED_MODELS_DEJL[modelName]
-  COMPILED_MODELS_DEJL[modelName] = (code, false, h)
-  modelName in ARRAY_ODE_MODELS && (ARRAY_MODULES[modelName] = (_modelModule(Symbol(modelName)), h))
+function _evalModelArrayPreserveDE(modelName::String, modelCode::Expr)::Nothing
+  @BACKEND_PERFLOG "[backendAPI] evaluate the arrayPreserveDE module" (@eval $modelCode)
+  local (code::Expr, _, h::UInt64) = COMPILED_MODELS_ARRAY_PRESERVE_DE[modelName]
+  COMPILED_MODELS_ARRAY_PRESERVE_DE[modelName] = (code, false, h)
+  ARRAY_MODULES[modelName] = (_modelModule(Symbol(modelName)), h)
   return nothing
 end
 
@@ -1013,9 +977,9 @@ function availableModels()::String
   for m in keys(COMPILED_MODELS_MTK)
     str *= "  $m\n"
   end
-  if !isempty(COMPILED_MODELS_DEJL)
-    str *= "Compiled models (DEMode):\n"
-    for m in keys(COMPILED_MODELS_DEJL)
+  if !isempty(COMPILED_MODELS_ARRAY_PRESERVE_DE)
+    str *= "Compiled models (arrayPreserveDE):\n"
+    for m in keys(COMPILED_MODELS_ARRAY_PRESERVE_DE)
       str *= "  $m\n"
     end
   end
@@ -1042,11 +1006,11 @@ function simulateModel(modelName::String;
                        kwargs...)
   modelName = canonicalName(modelName)
   local modelCode::Expr
-  #= A model translated by the array ODE path is a DE-mode module. =#
-  modelName in ARRAY_ODE_MODELS && (MODE = DEMode)
+  #= A model translated by arrayPreserveDE runs its own module, whatever the mode. =#
+  modelName in ARRAY_PRESERVE_DE_MODELS && return _simulateArrayPreserveDE(modelName, tspan, solver, overwriteCache; kwargs...)
   #= `parameters` (tunable parameter values for this run) is handled by the
      IMTK path only; elsewhere it would reach `solve` as an unknown keyword. =#
-  haskey(kwargs, :parameters) && MODE != IMTK_MODE && !(modelName in ARRAY_ODE_MODELS) &&
+  haskey(kwargs, :parameters) && MODE != IMTK_MODE &&
     error("simulateModel: `parameters` needs IMTK mode (the default), got $(MODE)")
   if MODE == MTK_MODE
     #= This does a redundant string conversion for now due to modeling toolkit being as is...=#
@@ -1097,32 +1061,32 @@ function simulateModel(modelName::String;
         @error "iMTK simulate failed" exception_type=typeof(err) mode=MODE model=modelName
       rethrow(err)
     end
-  elseif MODE == DEMode
-    try
-      modelCode = getCompiledModelDE(modelName)
-    catch err
-      println("Failed to simulate DE-mode model.")
-      println("Available models are:")
-      println(availableModels())
-      rethrow(err)
-    end
-    try
-      local needsEval = overwriteCache || !_modelDefined(Symbol(modelName)) || modelWasCompiledAgainDE(modelName)
-      if needsEval
-        _evalModelDE(modelName, modelCode)
-      end
-      #= the first simulate of a module compiles its functions =#
-      @BACKEND_PERFLOG "[backendAPI] DE-mode simulate" Base.invokelatest() do
-        local mod = getfield(OMBackend, Symbol(modelName))
-        mod.simulate(tspan, solver; kwargs...)
-      end
-    catch err
-      err isa CodeGeneration.ModelicaAssertionError ||
-        @error "Interactive evaluation failed" exception_type=typeof(err) mode=MODE model=modelName
-      rethrow(err)
-    end
   else
     error("Unsupported mode: $(MODE)")
+  end
+end
+
+"""
+    _simulateArrayPreserveDE(modelName, tspan, solver, overwriteCache; kwargs...)
+
+`simulateModel` of a model translated by arrayPreserveDE: its module evaluated where it is not yet or its code
+changed (or `overwriteCache`), then its own `simulate`.
+"""
+function _simulateArrayPreserveDE(modelName::String, tspan, solver, overwriteCache::Bool; kwargs...)
+  local modelCode::Expr = getCompiledModelArrayPreserveDE(modelName)
+  try
+    local needsEval::Bool = overwriteCache || !_modelDefined(Symbol(modelName)) ||
+      modelWasCompiledAgainArrayPreserveDE(modelName)
+    needsEval && _evalModelArrayPreserveDE(modelName, modelCode)
+    #= the first simulate of a module compiles its functions =#
+    return @BACKEND_PERFLOG "[backendAPI] arrayPreserveDE simulate" Base.invokelatest() do
+      local mod::Module = getfield(OMBackend, Symbol(modelName))
+      mod.simulate(tspan, solver; kwargs...)
+    end
+  catch err
+    err isa CodeGeneration.ModelicaAssertionError ||
+      @error "Interactive evaluation failed" exception_type=typeof(err) model=modelName
+    rethrow(err)
   end
 end
 
@@ -1148,14 +1112,14 @@ function getMTKProblem(modelName::String;
                        tspan = (0.0, 1.0),
                        overwriteCache::Bool = false)
   modelName = canonicalName(modelName)
-  local arrayModel = modelName in ARRAY_ODE_MODELS
-  local modelCode::Expr = arrayModel ? getCompiledModelDE(modelName) : getCompiledModel(modelName)
+  local arrayModel = modelName in ARRAY_PRESERVE_DE_MODELS
+  local modelCode::Expr = arrayModel ? getCompiledModelArrayPreserveDE(modelName) : getCompiledModel(modelName)
   local needsEval = overwriteCache || !_modelDefined(Symbol(modelName)) ||
-    (arrayModel ? modelWasCompiledAgainDE(modelName) : modelWasCompiledAgain(modelName))
+    (arrayModel ? modelWasCompiledAgainArrayPreserveDE(modelName) : modelWasCompiledAgain(modelName))
   if needsEval
     #= the replaced module's build and external objects go with it =#
     arrayModel || IMTKGen.forgetBuild(modelName)
-    arrayModel ? _evalModelDE(modelName, modelCode) : @eval($modelCode)
+    arrayModel ? _evalModelArrayPreserveDE(modelName, modelCode) : @eval($modelCode)
   elseif !arrayModel
     CodeGeneration.registerModelFunctions!(_modelModule(Symbol(modelName)))
   end
@@ -1316,8 +1280,8 @@ OM.OMBackend.getVariableValues(sol, "x")
 ```
 """
 function getVariableValues(sol::ODESolution, varName::String)
-  if sol.prob.p isa CodeGeneration.ArrayODEGen.ArrayModelParameters
-    local vals = CodeGeneration.ArrayODEGen.variableValues(sol, varName)
+  if sol.prob.p isa CodeGeneration.ArrayPreserveDE.ArrayModelParameters
+    local vals = CodeGeneration.ArrayPreserveDE.variableValues(sol, varName)
     vals === nothing && @warn "Did not locate a variable named '$(varName)' in the model"
     return vals
   end

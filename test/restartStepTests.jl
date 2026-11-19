@@ -12,7 +12,7 @@ check interpolated a step of 0.013 s with the restart's 2.2e-6 s, values 3000 st
      the interpolation in the middle of the step that ended at the event, and the step proposed next =#
   local ramp!(du, u, p, t) = (du[1] = 1.0; nothing)
   local rampDAE!(du, u, p, t) = (du[1] = 1.0; du[2] = u[2] - u[1]; nothing)
-  local cases = ((CG.ArrayODEGen._restartStep!, ODE.ODEProblem(ramp!, [0.0], (0.0, 1.0))),
+  local cases = ((CG.ArrayPreserveDE._restartStep!, ODE.ODEProblem(ramp!, [0.0], (0.0, 1.0))),
                  (integ -> CG._restartStepSize!(integ, Ref((NaN, 0))),
                   ODE.ODEProblem(ODE.ODEFunction(rampDAE!; mass_matrix = [1.0 0.0; 0.0 0.0]), [0.0, 0.0], (0.0, 1.0))))
   for (restart!, prob) in cases
