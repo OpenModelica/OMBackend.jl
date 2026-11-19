@@ -341,8 +341,65 @@ function toIR(g::Gen, e::SC.Exp, ctx::Ctx)::IR
     return _subscriptedIRx(g, e, ctx)
   elseif e isa SC.RSUB
     return _recordElementIRx(g, e, ctx)
+  elseif e isa SC.REDUCTION
+    return _reductionIRx(g, e, ctx)
   end
   ns("expression $(nameof(typeof(e))): $(_str(e))")
+end
+
+"""
+A reduction `sum(body for i in range)` (`product`, `min`, `max`) over iterators of known ranges: the body written out
+for each iterator value (the iterator replaced by it), the terms folded (MSL BooleanNetwork1's
+`sum(if {u[1], u[2]}[i] then 1 else 0 for i in 1:2)`). NotSupported for an array constructor (`:array`), an empty
+range, and more than `Passes.MAX_ELEMENT_TERMS` terms.
+"""
+function _reductionIRx(g::Gen, e::SC.REDUCTION, ctx::Ctx)::IR
+  local fold::Symbol = e.reducer === :sum ? :+ : e.reducer === :product ? :* :
+    e.reducer in (:min, :max) ? e.reducer : ns("the reduction $(e.reducer): $(_str(e))")
+  local terms::Vector{SC.Exp} = _reductionTerms!(SC.Exp[], g, e.body, e.iterators, ctx)
+  isempty(terms) && ns("a reduction over an empty range: $(_str(e))")
+  return foldl((a::IR, b::IR) -> Op(fold, IR[a, b]), IR[toIR(g, t, ctx) for t in terms])
+end
+
+"""
+The terms of a reduction (onto `out`): `body` for each value of the first of `iterators`, that iterator replaced by
+the value in the body and in the later iterators' ranges, for the later iterators in turn.
+"""
+function _reductionTerms!(out::Vector{SC.Exp}, g::Gen, body::SC.Exp, iterators::Vector{SC.Iterator},
+                          ctx::Ctx)::Vector{SC.Exp}
+  isempty(iterators) && return push!(out, body)
+  local it::SC.Iterator = iterators[1]
+  for v::SC.Exp in _iteratorValues(g, it.range, ctx)
+    local rest::Vector{SC.Iterator} =
+      SC.Iterator[SC.Iterator(r.name, _withIterator(r.range, it.name, v)) for r in @view iterators[2:end]]
+    _reductionTerms!(out, g, _withIterator(body, it.name, v), rest, ctx)
+    length(out) <= Passes.MAX_ELEMENT_TERMS || ns("a reduction of more than $(Passes.MAX_ELEMENT_TERMS) terms")
+  end
+  return out
+end
+
+"""
+The values of a reduction's iterator range: an Integer range of structural bounds (`1:n`, `a:s:b`) its Integers, an
+array literal its elements.
+"""
+function _iteratorValues(g::Gen, range::SC.Exp, ctx::Ctx)::Vector{SC.Exp}
+  range isa SC.ARRAY_EXP && return range.elements
+  range isa SC.RANGE || ns("an iterator range $(_str(range))")
+  local start::Int = _structuralInt(g, range.start, ctx)
+  local step::Int = range.step === nothing ? 1 : _structuralInt(g, range.step, ctx)
+  local stop::Int = _structuralInt(g, range.stop, ctx)
+  return SC.Exp[SC.ICONST(k) for k in start:step:stop]
+end
+
+"`e` with the iterator `name` replaced by `value` (not inside a nested reduction of an iterator of that name)."
+_withIterator(e::SC.Exp, name::Symbol, value::SC.Exp)::SC.Exp =
+  first(SC.traverseExpTopDown(e, _iteratorVisitor, (name, value)))
+
+function _iteratorVisitor(e::SC.Exp, arg::Tuple{Symbol, SC.Exp})::Tuple{SC.Exp, Bool, Tuple{Symbol, SC.Exp}}
+  local (name::Symbol, value::SC.Exp) = arg
+  (e isa SC.EXP_CREF && isempty(e.cref.subs) && e.cref.sym === name) && return (value, false, arg)
+  (e isa SC.REDUCTION && any(it::SC.Iterator -> it.name === name, e.iterators)) && return (e, false, arg)
+  return (e, true, arg)
 end
 
 """

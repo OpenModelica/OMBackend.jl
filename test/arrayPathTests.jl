@@ -3538,4 +3538,43 @@ end DivideInLoop;
     @test OMBackend._modelModule(Symbol(name)) !== evaluated
     @test _values(sol, ["x[1]", "x[2]"]) ≈ [exp(-1.0), exp(-3.0)] rtol = 1e-6
   end
+
+  @testset "Reductions over an inlined function's array argument" begin
+    #= MSL BooleanVectors.oneTrue (MathBoolean.Xor, BooleanNetwork1) inlined: sum(if {b1, b2, b3}[i] then 1 else 0
+       for i in 1:3), the reduction written out per iterator value (the MTK fallback before). At t = 0.6: two of
+       the three steps passed; x_k = exp(-k t) =#
+    local reductions = Modelica"""
+      package Red
+        function countTrue
+          input Boolean b[:];
+          output Integer n;
+        algorithm
+          n := sum(if b[i] then 1 else 0 for i in 1:size(b, 1));
+          annotation(Inline = true);
+        end countTrue;
+        function weighted
+          input Real v[:];
+          output Real s;
+        algorithm
+          s := sum(v[i] * i for i in 1:size(v, 1)) + max(v[i] for i in 1:size(v, 1)) + product(v[i] for i in 1:size(v, 1));
+          annotation(Inline = true);
+        end weighted;
+        model Reductions
+          Real x1(start = 1.0, fixed = true), x2(start = 1.0, fixed = true), x3(start = 1.0, fixed = true);
+          Boolean b1 = time > 0.25, b2 = time > 0.5, b3 = time > 0.75;
+          Integer count = countTrue({b1, b2, b3});
+          Real w = weighted({x1, x2, x3});
+        equation
+          der(x1) = -x1;
+          der(x2) = -2 * x2;
+          der(x3) = -3 * x3;
+        end Reductions;
+      end Red;
+      """
+    local name::String = _translateProgram(reductions, "Red.Reductions"; scalarized = false)
+    @test _arrayPathTaken(name)
+    local sol = OMBackend.simulateModel(name; tspan = (0.0, 0.6), reltol = 1e-10, abstol = 1e-12)
+    @test _values(sol, ["count"]) == [2.0]
+    @test _values(sol, ["w"])[1] ≈ sum(k * exp(-0.6k) for k in 1:3) + exp(-0.6) + exp(-3.6) rtol = 1e-8
+  end
 end
