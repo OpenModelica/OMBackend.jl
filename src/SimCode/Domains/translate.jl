@@ -1031,27 +1031,48 @@ function _argumentsIRx!(out::Vector{IR}, g::Gen, a::SC.Exp, ctx::Ctx)::Nothing
   return nothing
 end
 
+"The record literal `x` is, or that of the record constant it references (`Gen.records`); nothing for another value."
+function _recordLiteral(g::Gen, x::SC.Exp)::Union{Nothing, SC.RECORD}
+  x isa SC.RECORD && return x
+  (x isa SC.EXP_CREF && isempty(x.cref.subs)) || return nothing
+  return get(g.records, String(x.cref.sym), nothing)
+end
+
 """
     _partialApplicationIRx(g, e, ctx) -> IR
 
 A function of the model with inputs bound, an argument of a function that takes a function (`function
 f_nonlinear(p = p, h = h, X = X)`: MSL Media moist air's `T_phX` through `solveOneNonlinearEquation`, in the pipes
 and volumes of MSL Fluid): `Op(:partial, [Lit(name), Lit(free), values...])`, `free` telling of each input of the
-function, in its order, whether it is left free, `values` the bound ones' values in that order. NotSupported for a
-record input (flattened in the function) and a function of more outputs.
+function, in its order, whether it is left free, `values` the bound ones' values in that order; a bound record input
+(flattened in the function) by its fields. NotSupported for a free record input and a function of more outputs.
 """
 function _partialApplicationIRx(g::Gen, e::SC.PARTEVALFUNCTION, ctx::Ctx)::IR
   local name::String = String(e.name)
   get(g.functions, name, 0) == 1 || ns("a partial application of $(name)")
   local free::Vector{Bool} = Bool[]
   local values::Vector{IR} = IR[]
+  local bound::Int = 0
   for (input::Symbol, ty::SC.SType) in e.inputs
-    ty isa SC.TYPE_COMPLEX && ns("a partial application of $(name), whose input $(input) is a record")
     local at::Union{Nothing, Int} = findfirst(==(input), e.argNames)
+    if ty isa SC.TYPE_COMPLEX
+      #= a bound record input: its fields, each an input of the generated function (`data_MM`, ...), from a record
+         literal or a record constant (`data = Medium.data` of MSL Media's ideal gases) =#
+      at === nothing && ns("a partial application of $(name), whose input $(input) is a free record")
+      local record::Union{Nothing, SC.RECORD} = _recordLiteral(g, e.args[at])
+      record === nothing && ns("a partial application of $(name), whose input $(input) is a record: $(_str(e.args[at]))")
+      for x in record.exps
+        x isa SC.RECORD && ns("a partial application of $(name), whose input $(input) has record fields")
+        push!(free, false)
+        push!(values, _valueIRx(g, x, ctx))
+      end
+      bound += 1
+      continue
+    end
     push!(free, at === nothing)
-    at === nothing || push!(values, _valueIRx(g, e.args[at], ctx))
+    at === nothing || (push!(values, _valueIRx(g, e.args[at], ctx)); bound += 1)
   end
-  length(values) == length(e.args) || ns("a partial application of $(name): bound arguments that are no inputs")
+  bound == length(e.args) || ns("a partial application of $(name): bound arguments that are no inputs")
   return Op(:partial, IR[Lit(Symbol(name)), Lit(free), values...])
 end
 
@@ -2504,7 +2525,8 @@ function domainSystem(sc::SC.SIM_CODE)::DomainSystem
   local g::Gen = Gen(Dict{String, VarInfo}(), 0, 0, 0, Dict{String, Any}(), Dict{String, Symbol}(), Set{String}(),
                 EqClass[], EqClass[], AlgClass[], Tuple{String, String, Bool}[], WhenClass[], AssertClass[], 0, 0, 0, 0,
                 -1000, false, Dict{Int, Int}(), AlgClass[], String[], AssertClass[], functionOutputs, Dict{String, String}(),
-                Set{String}(), Tuple{String, String}[], ObjectSlot[], false, DelaySite[], false)
+                Set{String}(), Tuple{String, String}[], ObjectSlot[], false, DelaySite[], false,
+                Dict{String, SC.RECORD}())
   local stateNamesOrdered::Vector{String} = String[]; local algNamesOrdered::Vector{String} = String[]
   local discreteNamesOrdered::Vector{String} = String[]
   local u0::Vector{Float64} = Float64[]; local d0::Vector{Float64} = Float64[]; local a0::Vector{Float64} = Float64[]
@@ -2521,6 +2543,7 @@ function domainSystem(sc::SC.SIM_CODE)::DomainSystem
       g.derOf[nm] = sv.varKind.varName
       continue
     end
+    (sv.varKind isa SC.DATA_STRUCTURE && sv.varKind.bindExp isa SC.RECORD) && (g.records[nm] = sv.varKind.bindExp)
     local category::Symbol = SC.irCategory(sv)
     local dims::Vector{Int} = sv.dims
     local n::Int = isempty(dims) ? 1 : prod(dims)

@@ -350,6 +350,9 @@ mutable struct Gen
   usesLeft::Bool   #= the code reads an algebraic variable's left limit at an event (pre() of it) =#
   delays::Vector{DelaySite}   #= the delay() calls of the equations and when-equations, numbered (`_numberDelays!`) =#
   usesHomotopy::Bool   #= the code calls homotopy(): the initialization's continuation in its λ (`homotopyStart!`) =#
+  #= the record constants (DATA_STRUCTURE) whose bindings are record literals, by name: a partial application's bound
+     record input (`_partialApplicationIRx`, `data = Medium.data`) =#
+  records::Dict{String, SC.RECORD}
 end
 
 "A relation of a template by its expression and scope (the iterators' slots, the element-wise dimensions)."

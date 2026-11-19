@@ -3861,4 +3861,49 @@ end DivideInLoop;
     local sol = OMBackend.simulateModel(name; tspan = (0.0, 1.0), reltol = 1e-10, abstol = 1e-12)
     @test _values(sol, ["x", "c.i", "c.q", "g"]) ≈ exp(-1) .* [1.0, 2.0, 5.0, 3.0] rtol = 1e-9
   end
+
+  @testset "A partial application binding a record constant" begin
+    #= MSL Media's `solveOneNonlinearEquation(function f_nonlinear(data = Medium.data, ...), ...)` (Inverse_sh_T):
+       the bound record input refers to the record constant; its fields from that constant's record literal
+       (`Gen.records`). Neither route took it before. y = 2x + 3, der(x) = -x =#
+    local partial = Modelica"""
+      package PartRec
+        record Coeffs "MSL Media's data record"
+          Real a;
+          Real b;
+        end Coeffs;
+        constant Coeffs coeffs = Coeffs(a = 2, b = 3);
+        partial function Base
+          input Real u;
+          output Real y;
+        end Base;
+        function lin
+          extends Base;
+          input Coeffs c;
+        algorithm
+          y := c.a * u + c.b;
+        end lin;
+        function apply "MSL's solveOneNonlinearEquation: calls the function it is given, in a loop"
+          input Base f;
+          input Real u;
+          output Real y = 0;
+        algorithm
+          for i in 1:2 loop
+            y := y + f(u) / 2;
+          end for;
+        end apply;
+        model M
+          Real x(start = 1, fixed = true);
+          Real y;
+        equation
+          y = apply(function lin(c = coeffs), x);
+          der(x) = y - 3 * x - 3;
+        end M;
+      end PartRec;
+      """
+    local name::String = _translateProgram(partial, "PartRec.M"; scalarized = false)
+    @test _arrayPathTaken(name)
+    local sol = OMBackend.simulateModel(name; tspan = (0.0, 1.0), reltol = 1e-10, abstol = 1e-12)
+    @test _values(sol, ["x", "y"]) ≈ [exp(-1), 2 * exp(-1) + 3] rtol = 1e-9
+  end
 end
