@@ -90,7 +90,7 @@ import ...SimCode
 import ...SimCode.Domains: DomainSystem, InstanceTable, EqClass, EvFn, Gen, IR, Lit, LoopBlocks, NotSupported, Op, Pre,
   Ref, Rel, SAssert, SAssign, SBreak, SCall, SFor, SIf, SPreStart, SWhen, SWhile, Slot, Stmt, TimeIR, TornBlock, VarInfo,
   WhenClass,
-  AlgClass, DelaySite,
+  AlgClass, DelaySite, ObjectSlot,
   _affineIn, _unknownVariables, _blockFamilies, _callOfParameters, _condElements, _initAlgAssigned, _parameterAlgorithms, _paramValue!,
   _parametersOnly, _relationSlots, _relationInstances,
   _isTimeRelation, _timeRelationSlots, _continuous, _assertRows,
@@ -1760,6 +1760,34 @@ function _subscriptCode(g::Gen, info::VarInfo, name::String, subs::Vector{IR})::
   return idx
 end
 
+"""
+An array value of the elements of one Real array variable, all of them in column-major order (`_wholeArrayIRx`, a
+function's argument `f(x)`): the slice of its buffer (`u`, `du`, `a`, `p.d`; stored row-major), a copy as the array
+literal of its elements was, one expression instead of one per element (MSL RealFFT's 4000-element buffer). `nothing`
+for another array value.
+"""
+function _storageSlice(g::Gen, x::Op)::Union{Nothing, Expr}
+  local dims::Tuple = (x.args[1]::Lit).v
+  length(x.args) == 1 + prod(dims) >= 2 || return nothing
+  local first::IR = x.args[2]
+  first isa Ref || return nothing
+  local info::Union{Nothing, VarInfo} = get(g.vars, first.name, nothing)
+  (info !== nothing && info.kind in (:state, :alg, :discrete) && info.vtype == :real && Tuple(info.dims) == dims) ||
+    return nothing
+  (first.der && info.kind != :state) && return nothing
+  local k::Int = 1
+  for t in Iterators.product((1:d for d in dims)...)   #= column-major: the first index fastest =#
+    k += 1
+    local r::IR = x.args[k]
+    (r isa Ref && r.name == first.name && r.der == first.der && length(r.subs) == length(t) &&
+     all(j::Int -> r.subs[j] isa Lit && (r.subs[j]::Lit).v == t[j], eachindex(t))) || return nothing
+  end
+  local buffer::Union{Symbol, Expr} = info.kind == :state ? (first.der ? :du : :u) : info.kind == :alg ? :a : :(p.d)
+  local range::Expr = :($(info.offset + 1):$(info.offset + prod(dims)))
+  length(dims) == 1 && return :($(buffer)[$(range)])
+  return :(permutedims(reshape($(buffer)[$(range)], $(reverse(dims)...)), $(Tuple(length(dims):-1:1))))
+end
+
 function jl(g::Gen, x::IR)
   if x isa Lit
     return x.v
@@ -1773,6 +1801,8 @@ function jl(g::Gen, x::IR)
       info.vtype == :other && ns("parameter $(x.name) of a type the array path does not pass")
       local v = _paramValue!(g, x.name)
       v isa AbstractArray || return g.paramSyms[x.name]
+      #= a parameter array as a whole (a function's argument, `_valueIRx`): its value =#
+      isempty(x.subs) && return g.paramSyms[x.name]
       local (psym, pidx) = (g.paramSyms[x.name], Any[jl(g, s) for s in x.subs])
       return _discreteRead(info, all(_staticSubscript, x.subs) ? Expr(:ref, psym, pidx...) :
                                                                  Expr(:call, _checkedIndex, psym, pidx...))
@@ -1806,6 +1836,10 @@ function jl(g::Gen, x::IR)
     local k = :($(g.relBase) + (_col - 1) * $(g.relCount) + $(x.id))
     return :($(_evfn)(z, p, mode, $k, $(QuoteNode(x.kind)), $(jl(g, x.arg))))
   elseif x isa Op
+    if x.op == :arrayval
+      local slice::Union{Nothing, Expr} = _storageSlice(g, x)
+      slice === nothing || return slice
+    end
     local args = Any[jl(g, a) for a in x.args]
     x.op == :neg && return :(-$(args[1]))
     if x.op == :delay
@@ -1861,7 +1895,11 @@ function jl(g::Gen, x::IR)
     x.op == :terminate && return :(_terminate!(p, $(args[1])))
     x.op == :stringparam && return :(p.state.strings[$(x.args[1].v)])
     #= an external object: the module's constant (`_objectDefinitions`) =#
-    x.op == :object && return Symbol("OBJECT_", x.args[1].v)
+    if x.op == :object
+      length(x.args) == 2 && return Symbol("OBJECT_", x.args[1].v)
+      #= an element of an array of them at subscripts of iterators (`_objectElementRead`) =#
+      return Expr(:ref, Symbol("OBJECTS_", x.args[1].v), Any[jl(g, s) for s in x.args[4:end]]...)
+    end
     x.op == :seq && return Expr(:block, args...)
     x.op == :noEvent && return args[1]
     #= homotopy(actual, simplified): actual at λ = 1, the blend in the continuation (`homotopyStart!`) =#
@@ -3805,18 +3843,31 @@ end
 The external objects the code reads (`Gen.objects`) as the module's constants `OBJECT_k`: each made once, when the
 module is evaluated, by its constructor's call on the translated parameter values (`PARAMETER_VALUES`), and registered
 under the model with its destructor (`CodeGeneration._externalObjectRef`); the objects of the model's build before this
-one are freed first. NotSupported for a constructor call without code.
+one are freed first. The elements of an array of them also as the array `OBJECTS_k` (`k` its first element's), of the
+array's dimensions. NotSupported for a constructor call without code.
 """
 function _objectDefinitions(g::Gen, modelName::String)::Vector{Any}
   isempty(g.objects) && return Any[]
   local model::String = _OMBACKEND.canonicalName(modelName)
   local defs::Vector{Any} = Any[:($(_OMBACKEND.CodeGeneration.freeExternalObjects!)($model))]
-  for (k::Int, (nm::String, value::IR, destructor::String)) in enumerate(g.objects)
-    local rule::Any = _bindingCode(g, ParameterBinding(nm, _bindingDeps(g, g.vars[nm].var), :scalar, IR[value]))
-    rule === nothing && ns("the constructor of the external object $(nm)")
+  local arrays::Dict{String, Vector{Int}} = Dict{String, Vector{Int}}()
+  local order::Vector{String} = String[]   #= the arrays in the order of their first elements: the same code each time =#
+  for (k::Int, o::ObjectSlot) in enumerate(g.objects)
+    local rule::Any = _bindingCode(g, ParameterBinding(o.param, _bindingDeps(g, g.vars[o.param].var), :scalar, IR[o.value]))
+    rule === nothing && ns("the constructor of the external object $(o.label)")
     push!(defs, :(const $(Symbol("OBJECT_", k)) =
-                    $(_OMBACKEND.CodeGeneration._externalObjectRef)($(QuoteNode(Symbol(nm))), ($rule)(PARAMETER_VALUES),
-                                                                    $(QuoteNode(Symbol(destructor))), $model)))
+                    $(_OMBACKEND.CodeGeneration._externalObjectRef)($(QuoteNode(Symbol(o.label))), ($rule)(PARAMETER_VALUES),
+                                                                    $(QuoteNode(Symbol(o.destructor))), $model)))
+    o.label == o.param && continue
+    haskey(arrays, o.param) || push!(order, o.param)
+    push!(get!(Vector{Int}, arrays, o.param), k)
+  end
+  for nm::String in order
+    local slots::Vector{Int} = arrays[nm]
+    local dims::Vector{Int} = g.vars[nm].dims
+    local vect::Expr = Expr(:vect, Any[Symbol("OBJECT_", k) for k in slots]...)   #= row-major =#
+    push!(defs, :(const $(Symbol("OBJECTS_", slots[1])) =
+                    $(length(dims) == 1 ? vect : :(permutedims(reshape($vect, $(reverse(dims)...)), $(length(dims)):-1:1)))))
   end
   return defs
 end

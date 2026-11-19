@@ -429,8 +429,9 @@ function rolledVariable(r::RolledVariable, g::ComponentGroup, groups::Vector{Com
   local first::IR.Variable = whole ? r.whole[1]::IR.Variable : r.elements[1][sort!(collect(keys(r.elements[1])))[1]]
   local innerSizes::Vector{Int} = whole ? knownSizes(first.ty, "the variable $(first.name)") : elementSizes(r)
   local elementTy::IR.ModelicaType = IR.elementType(first.ty)
-  #= the array form has no elements of external objects (`scalarVariables`): instances that hold one (a table's
-     `tableID`, MSL RadioButtonSource's BooleanTable: Interaction1) stay components =#
+  #= instances that hold an external object (a table's `tableID`, MSL RadioButtonSource's BooleanTable: Interaction1)
+     stay components: rolled, the array of their objects would have a constructor call per instance, the array code
+     makes one call for all elements (`_objectElementRead`) =#
   elementTy isa IR.T_EXTERNAL_OBJECT &&
     throw(NotHandled("the variable $(variableLabel(r)), an external object"))
   local ty::IR.ModelicaType = IR.T_ARRAY(elementTy, IR.Dimension[IR.DIM_SIZE(d) for d in [n; innerSizes]])

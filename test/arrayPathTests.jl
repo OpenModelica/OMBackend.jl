@@ -3538,4 +3538,372 @@ end DivideInLoop;
     @test OMBackend._modelModule(Symbol(name)) !== evaluated
     @test _values(sol, ["x[1]", "x[2]"]) ≈ [exp(-1.0), exp(-3.0)] rtol = 1e-6
   end
+
+  @testset "Reductions over an inlined function's array argument" begin
+    #= MSL BooleanVectors.oneTrue (MathBoolean.Xor, BooleanNetwork1) inlined: sum(if {b1, b2, b3}[i] then 1 else 0
+       for i in 1:3), the reduction written out per iterator value (the MTK fallback before). At t = 0.6: two of
+       the three steps passed; x_k = exp(-k t) =#
+    local reductions = Modelica"""
+      package Red
+        function countTrue
+          input Boolean b[:];
+          output Integer n;
+        algorithm
+          n := sum(if b[i] then 1 else 0 for i in 1:size(b, 1));
+          annotation(Inline = true);
+        end countTrue;
+        function weighted
+          input Real v[:];
+          output Real s;
+        algorithm
+          s := sum(v[i] * i for i in 1:size(v, 1)) + max(v[i] for i in 1:size(v, 1)) + product(v[i] for i in 1:size(v, 1));
+          annotation(Inline = true);
+        end weighted;
+        model Reductions
+          Real x1(start = 1.0, fixed = true), x2(start = 1.0, fixed = true), x3(start = 1.0, fixed = true);
+          Boolean b1 = time > 0.25, b2 = time > 0.5, b3 = time > 0.75;
+          Integer count = countTrue({b1, b2, b3});
+          Real w = weighted({x1, x2, x3});
+        equation
+          der(x1) = -x1;
+          der(x2) = -2 * x2;
+          der(x3) = -3 * x3;
+        end Reductions;
+      end Red;
+      """
+    local name::String = _translateProgram(reductions, "Red.Reductions"; scalarized = false)
+    @test _arrayPathTaken(name)
+    local sol = OMBackend.simulateModel(name; tspan = (0.0, 0.6), reltol = 1e-10, abstol = 1e-12)
+    @test _values(sol, ["count"]) == [2.0]
+    @test _values(sol, ["w"])[1] ≈ sum(k * exp(-0.6k) for k in 1:3) + exp(-0.6) + exp(-3.6) rtol = 1e-8
+  end
+
+  @testset "A slice of a rolled component's inner array: the slices' elements" begin
+    #= MSL LightningSegmentedTransmissionLine: two OLines rolled into line1|line2, its initial equation
+       `line2.i[2:N + 1] = zeros(N)` read `L[2:N + 1].i` of the split array (a TypeError, the MTK fallback before) =#
+    local lines = Modelica"""
+      package SegLine
+        connector Pin
+          Real v;
+          flow Real i;
+        end Pin;
+        partial model TwoPin
+          Pin p, n;
+          Real v, i;
+        equation
+          v = p.v - n.v;
+          0 = p.i + n.i;
+          i = p.i;
+        end TwoPin;
+        model Resistor
+          extends TwoPin;
+          parameter Real R = 1;
+        equation
+          v = R * i;
+        end Resistor;
+        model Inductor
+          extends TwoPin;
+          parameter Real L = 1e-3;
+        equation
+          L * der(i) = v;
+        end Inductor;
+        model Capacitor
+          extends TwoPin;
+          parameter Real C = 1e-3;
+        equation
+          C * der(v) = i;
+        end Capacitor;
+        model Line "MSL OLine's structure"
+          parameter Integer N = 3;
+          Pin p1, p2, p3;
+          Real v[N] = C.v;
+          Real i[N + 1] = R.i;
+        protected
+          Resistor R[N + 1](each R = 0.1);
+          Inductor L[N + 1](each L = 1e-3);
+          Capacitor C[N](each C = 1e-3);
+        equation
+          connect(p1, R[1].p);
+          for i in 1:N loop
+            connect(R[i].n, L[i].p);
+            connect(L[i].n, C[i].p);
+            connect(C[i].n, p3);
+            connect(L[i].n, R[i + 1].p);
+          end for;
+          connect(R[N + 1].n, L[N + 1].p);
+          connect(L[N + 1].n, p2);
+        end Line;
+        model Ground
+          Pin p;
+        equation
+          p.v = 0;
+        end Ground;
+        model Source
+          extends TwoPin;
+        equation
+          v = sin(50 * time);
+        end Source;
+        model CurrentSource
+          extends TwoPin;
+        equation
+          i = 10 * time * exp(-100 * time);
+        end CurrentSource;
+        model TwoLines
+          parameter Integer N = 3;
+          Line line1(N = N), line2(N = N);
+          Source source;
+          CurrentSource strike;
+          Resistor load(R = 10);
+          Ground ground;
+        initial equation
+          line1.v = zeros(N);
+          line1.i = zeros(N + 1);
+          line2.v = zeros(N);
+          line2.i[2:N + 1] = zeros(N);
+        equation
+          connect(source.p, line1.p1);
+          connect(line1.p2, strike.n);
+          connect(strike.n, line2.p1);
+          connect(ground.p, strike.p);
+          connect(line2.p2, load.p);
+          connect(source.n, ground.p);
+          connect(load.n, ground.p);
+          connect(line1.p3, ground.p);
+          connect(line2.p3, ground.p);
+        end TwoLines;
+      end SegLine;
+      """
+    local (s::Vector{Float64}, a::Vector{Float64}, _) =
+      _bothWaysOf(lines, "SegLine.TwoLines", ["line1.i[1]", "line1.v[3]", "line2.i[4]", "load.v"];
+                  tspan = (0.0, 0.1), reltol = 1e-8, abstol = 1e-10)
+    @test a ≈ s rtol = 1e-6
+  end
+
+  @testset "A parameter array as a whole as a function's argument: its value" begin
+    #= MSL ComparisonPullInStroke: CombiTimeTable's 530 x 4 table given to its constructor, more elements than an
+       argument's literal takes (MAX_ELEMENT_TERMS), read as a scalar (the MTK fallback before). y = k t: x(1) = k / 2 =#
+    local tables = Modelica"""
+      package Tab
+        function interpolate "linear interpolation in the rows of a table {t, y}"
+          input Real table[:, 2];
+          input Real t;
+          output Real y;
+        protected
+          Integer i = 1;
+        algorithm
+          while i < size(table, 1) - 1 and t > table[i + 1, 1] loop
+            i := i + 1;
+          end while;
+          y := table[i, 2] + (table[i + 1, 2] - table[i, 2]) * (t - table[i, 1]) / (table[i + 1, 1] - table[i, 1]);
+          annotation(Inline = false);
+        end interpolate;
+        model TableArgument "a table of 501 x 2 = 1002 elements"
+          parameter Real k = 2;
+          parameter Real table[501, 2] = {{(i - 1) / 500, k * (i - 1) / 500} for i in 1:501};
+          Real x(start = 0, fixed = true);
+          Real y;
+        equation
+          y = interpolate(table, time);
+          der(x) = y;
+        end TableArgument;
+      end Tab;
+      """
+    local name::String = _translateProgram(tables, "Tab.TableArgument"; scalarized = false)
+    @test _arrayPathTaken(name)
+    local sol = OMBackend.simulateModel(name; tspan = (0.0, 1.0), reltol = 1e-10, abstol = 1e-12)
+    @test _values(sol, ["y", "x"]) ≈ [2.0, 1.0] rtol = 1e-8
+  end
+
+  @testset "A discrete Real array of more elements than a literal takes as a function's argument: its buffer" begin
+    #= MSL Rectifier6pulseFFT: RealFFT's 4000-element buffer given to its FFT function (the MTK fallback before), read
+       as one slice of p.d; the 2-D one reshaped to its row-major order. Last sample at 0.75 =#
+    local buffers = Modelica"""
+      package Buf
+        function ramp
+          input Integer n;
+          input Real t;
+          output Real y[n];
+        algorithm
+          for i in 1:n loop
+            y[i] := i * t;
+          end for;
+          annotation(Inline = false);
+        end ramp;
+        function grid
+          input Integer n;
+          input Real t;
+          output Real y[n, 2];
+        algorithm
+          for i in 1:n loop
+            y[i, 1] := i * t;
+            y[i, 2] := -i * t;
+          end for;
+          annotation(Inline = false);
+        end grid;
+        function total
+          input Real x[:];
+          output Real s = 0;
+        algorithm
+          for i in 1:size(x, 1) loop
+            s := s + x[i];
+          end for;
+          annotation(Inline = false);
+        end total;
+        function weighted "the rows weighted by their index, the columns by 1 and 3: the order of the elements"
+          input Real x[:, 2];
+          output Real s = 0;
+        algorithm
+          for i in 1:size(x, 1) loop
+            s := s + i * (x[i, 1] + 3 * x[i, 2]);
+          end for;
+          annotation(Inline = false);
+        end weighted;
+        model Sampled "buffers of 1100 and 600 x 2 elements"
+          parameter Integer n = 1100;
+          parameter Integer m = 600;
+          discrete Real buf[n](each start = 0, each fixed = true);
+          discrete Real mat[m, 2](each start = 0, each fixed = true);
+          Real y;
+          Real z;
+        equation
+          when sample(0, 0.25) then
+            buf = ramp(n, time);
+            mat = grid(m, time);
+          end when;
+          y = total(buf);
+          z = weighted(mat);
+        end Sampled;
+      end Buf;
+      """
+    local name::String = _translateProgram(buffers, "Buf.Sampled"; scalarized = false)
+    @test _arrayPathTaken(name)
+    local sol = OMBackend.simulateModel(name; tspan = (0.0, 0.9))
+    @test _values(sol, ["y", "z"]) ≈ [0.75 * 1100 * 1101 / 2, 0.75 * sum(-2 * i^2 for i in 1:600)] rtol = 1e-12
+  end
+
+  @testset "An array of components, each with its own external object" begin
+    #= MSL CCCV_Stack: the tableID of each cell, an array of external objects (index reduction refused it, the MTK
+       fallback before): one object per element, each by its own constructor call (its component's shift), read at
+       the element of the iterators (`_objectElementRead`) =#
+    local name::String = _arrayPathTranslate("ArrayPath.TableArray"; scalarized = false)
+    @test _arrayPathTaken(name)
+    local sol = OMBackend.simulateModel(name; tspan = (0.0, 1.0))
+    @test _values(sol, ["c[1].x", "c[2].x", "c[3].x"]) ≈ [1.0, 1.0, 0.0] atol = 1e-10
+  end
+
+  @testset "A binding of each component of a component array, reading its own record array" begin
+    #= MSL CCCV_StackRC: `c.C[3, 2] = {c.cellData.rc[1].C, c.cellData.rc[2].C}`, a binding of fewer dimensions than
+       its parameter, was written out over the leading ones (`bindingElementForm`): the third cell's elements did not
+       evaluate (the MTK fallback before). v = exp(-t / (R C)) =#
+    local cells = Modelica"""
+      package RCs
+        record RC "MSL Batteries' RCData"
+          parameter Real R;
+          parameter Real C;
+        end RC;
+        record CellData
+          parameter RC rc[2];
+        end CellData;
+        model Cell "two RC elements discharging: C dv/dt = -v / R"
+          parameter CellData cellData;
+          parameter Real C[2] = {cellData.rc[1].C, cellData.rc[2].C};
+          Real v[2](each start = 1, each fixed = true);
+        equation
+          for i in 1:2 loop
+            C[i] * der(v[i]) = -v[i] / cellData.rc[i].R;
+          end for;
+        end Cell;
+        model Cells "three cells, the first with other data"
+          parameter CellData a(rc = {RC(R = 1, C = 2), RC(R = 2, C = 3)});
+          parameter CellData b(rc = {RC(R = 1, C = 1), RC(R = 1, C = 4)});
+          Cell c[3](cellData = {a, b, b});
+        end Cells;
+      end RCs;
+      """
+    local name::String = _translateProgram(cells, "RCs.Cells"; scalarized = false)
+    @test _arrayPathTaken(name)
+    local sol = OMBackend.simulateModel(name; tspan = (0.0, 1.0), reltol = 1e-10, abstol = 1e-12)
+    @test _values(sol, ["c[1].v[1]", "c[1].v[2]", "c[2].v[1]", "c[3].v[2]"]) ≈ exp.(-1 ./ [2.0, 6.0, 1.0, 4.0]) rtol = 1e-9
+  end
+
+  @testset "A tuple equation with a record output: its fields" begin
+    #= MSL Spice3's diodes, `(D1.cc, D1.m_dCap) = diodeNoBypassCode(...)`: the record target was "unknown variable
+       D1.cc" (the MTK fallback before); its field variables from the outputs in place (`_recordTargetFields`).
+       der(x) = -x =#
+    local tuples = Modelica"""
+      package RecTuple
+        record Currents "MSL Spice3's CurrentsCapacitances"
+          Real i;
+          Real q;
+        end Currents;
+        function device "a record output before a scalar one"
+          input Real v;
+          output Currents c;
+          output Real g;
+        algorithm
+          c.i := 2 * v;
+          c.q := 5 * v;
+          g := 3 * v;
+          annotation(Inline = false);
+        end device;
+        model Cell
+          Real x(start = 1, fixed = true);
+          Currents c;
+          Real g;
+        equation
+          (c, g) = device(x);
+          der(x) = -c.i + g - 2 * x + c.q - 5 * x;
+        end Cell;
+      end RecTuple;
+      """
+    local name::String = _translateProgram(tuples, "RecTuple.Cell"; scalarized = false)
+    @test _arrayPathTaken(name)
+    local sol = OMBackend.simulateModel(name; tspan = (0.0, 1.0), reltol = 1e-10, abstol = 1e-12)
+    @test _values(sol, ["x", "c.i", "c.q", "g"]) ≈ exp(-1) .* [1.0, 2.0, 5.0, 3.0] rtol = 1e-9
+  end
+
+  @testset "A partial application binding a record constant" begin
+    #= MSL Media's `solveOneNonlinearEquation(function f_nonlinear(data = Medium.data, ...), ...)` (Inverse_sh_T):
+       the bound record input refers to the record constant; its fields from that constant's record literal
+       (`Gen.records`). Neither route took it before. y = 2x + 3, der(x) = -x =#
+    local partial = Modelica"""
+      package PartRec
+        record Coeffs "MSL Media's data record"
+          Real a;
+          Real b;
+        end Coeffs;
+        constant Coeffs coeffs = Coeffs(a = 2, b = 3);
+        partial function Base
+          input Real u;
+          output Real y;
+        end Base;
+        function lin
+          extends Base;
+          input Coeffs c;
+        algorithm
+          y := c.a * u + c.b;
+        end lin;
+        function apply "MSL's solveOneNonlinearEquation: calls the function it is given, in a loop"
+          input Base f;
+          input Real u;
+          output Real y = 0;
+        algorithm
+          for i in 1:2 loop
+            y := y + f(u) / 2;
+          end for;
+        end apply;
+        model M
+          Real x(start = 1, fixed = true);
+          Real y;
+        equation
+          y = apply(function lin(c = coeffs), x);
+          der(x) = y - 3 * x - 3;
+        end M;
+      end PartRec;
+      """
+    local name::String = _translateProgram(partial, "PartRec.M"; scalarized = false)
+    @test _arrayPathTaken(name)
+    local sol = OMBackend.simulateModel(name; tspan = (0.0, 1.0), reltol = 1e-10, abstol = 1e-12)
+    @test _values(sol, ["x", "y"]) ≈ [exp(-1), 2 * exp(-1) + 3] rtol = 1e-9
+  end
 end

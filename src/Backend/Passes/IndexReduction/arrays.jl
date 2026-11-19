@@ -897,9 +897,10 @@ function scalarVariables(variables::IR.VariableSet, E::Elements)::IR.VariableSet
       continue
     end
     local element = IR.elementType(v.ty)
-    #= clocks and external objects: variables of the scalar passes only (the array form has no element of them) =#
+    #= external objects (a table of each of an array of components: the array code makes one per element,
+       `_objectElementRead`); clocks: variables of the scalar passes only (the array form has no element of them) =#
     element isa Union{IR.T_REAL, IR.T_INTEGER, IR.T_BOOLEAN, IR.T_ENUMERATION, IR.T_STRING} ||
-      (E.passesFollow && element isa Union{IR.T_CLOCK, IR.T_EXTERNAL_OBJECT}) ||
+      element isa IR.T_EXTERNAL_OBJECT || (E.passesFollow && element isa IR.T_CLOCK) ||
       throw(NotHandled("the array $(v.name) of $(element) elements"))
     local (binding, start, fixed, nominal, low, high) =
       (elementValue(v.binding, v, E), elementValue(a.start, v, E), elementValue(a.fixed, v, E), elementValue(a.nominal, v, E),

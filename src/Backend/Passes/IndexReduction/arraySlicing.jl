@@ -352,7 +352,8 @@ function slicedEquation(@nospecialize(eq::IR.Equation), family::Dict{Symbol, Vec
     reads = true
     local subscripts::Vector{IR.Subscript} = allSubscripts(x.cref)
     for s in subscripts[min(2, end + 1):end]
-      IR.literalIndex(s) !== nothing && continue
+      #= a literal index; a slice or the whole dimension (`slicedReference` writes them out) =#
+      (IR.literalIndex(s) !== nothing || !(s isa IR.INDEX)) && continue
       IR.foreachExp(y::IR.Expression -> ((y isa IR.CREF && length(y.cref.parts) == 1 && !IR.hasSubscripts(y.cref)) && push!(iterators, y.cref.name); nothing),
                     (s::IR.INDEX).exp)
     end
@@ -415,12 +416,39 @@ function slicedReference(x::IR.Expression, family::Dict{Symbol, Vector{Int}})::I
     IR.CREF(IR.ComponentRef(IR.CrefPart[instances; sliceParts(bare, t)]), element)
   end
   if length(subscripts) == 1 + length(sizes)
-    local t::Union{Nothing, Vector{Int}} = IR.literalIndices(subscripts[2:end])
-    t === nothing && throw(NotHandled("the split array $(name) by an inner subscript not literal"))
-    return sliceRef(t)
+    local inner::Vector{IR.Subscript} = subscripts[2:end]
+    local t::Union{Nothing, Vector{Int}} = IR.literalIndices(inner)
+    t === nothing || return sliceRef(t)
+    #= literal slices or whole dimensions among them (MSL SegmentedTransmissionLine's `line.L[2:N].i`): the array
+       literal of the slices' elements, a dimension per slice =#
+    local choices::Vector{Vector{Int}} = Vector{Int}[innerValues(s, n, name) for (s, n) in zip(inner, sizes)]
+    local slicing::Vector{Bool} = Bool[!(s isa IR.INDEX) for s in inner]
+    local leaves::Vector{IR.Expression} = IR.Expression[]
+    for k::Vector{Int} in rowMajor(Int[length(c) for (c, kept) in zip(choices, slicing) if kept])
+      local at::Vector{Int} = Vector{Int}(undef, length(inner))
+      local j::Int = 0
+      for d in eachindex(inner)
+        slicing[d] ? (j += 1; at[d] = choices[d][k[j]]) : (at[d] = choices[d][1])
+      end
+      push!(leaves, sliceRef(at))
+    end
+    return nestedArray(Int[length(c) for (c, kept) in zip(choices, slicing) if kept], element, leaves)
   end
   length(subscripts) == 1 || throw(NotHandled("the split array $(name) partly subscripted"))
   return nestedArray(sizes, element, IR.Expression[sliceRef(t) for t in rowMajor(sizes)])
+end
+
+"""
+The inner indices a subscript of a split array reads (`slicedReference`): a literal index its own, a slice of a literal
+range its values, a whole dimension (of size `n`) all; NotHandled for another.
+"""
+function innerValues(s::IR.Subscript, n::Int, name::Symbol)::Vector{Int}
+  local k::Union{Nothing, Int} = IR.literalIndex(s)
+  k === nothing || return Int[k]
+  s isa IR.WHOLE && return collect(1:n)
+  local range::Union{Nothing, StepRange{Int, Int}} = s isa IR.SLICE ? literalRange(foldTree(s.exp)) : nothing
+  range === nothing && throw(NotHandled("the split array $(name) by an inner subscript not literal"))
+  return collect(range)
 end
 
 """

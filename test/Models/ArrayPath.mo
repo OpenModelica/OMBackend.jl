@@ -2827,10 +2827,23 @@ package ArrayPath
     C * der(v) = I - i1 + i2;
   end OverflowingProbe;
 
-  model RolledTables "two components each with an external object (MSL Interaction1's start and stop): not rolled, the array form has no arrays of external objects; x = k t^2: 1, 2"
+  model RolledTables "two components each with an external object (MSL Interaction1's start and stop): not rolled, a constructor call per instance; x = k t^2: 1, 2"
     TableIntegrator a(k = 1);
     TableIntegrator b(k = 2);
   end RolledTables;
+
+  model ShiftedTable "a component with a table shifted in time by its parameter: its constructor reads a field of its component"
+    parameter Real k = 1;
+    parameter Real shift = 0;
+    parameter TimeTable tableID = TimeTable("NoName", "NoName", [0, 0; 1, 2], 0.0, {2}, 1, 2, shift, 3, false, ",", 0);
+    Real x(start = 0, fixed = true);
+  equation
+    der(x) = k * timeTableValue(tableID, 1, time, 1e60, 1e60);
+  end ShiftedTable;
+
+  model TableArray "an array of components, each with its own external object (MSL CCCV_Stack's cells' tables): y = 2 (t - shift), x = k (1 - 2 shift): 1, 1, 0"
+    ShiftedTable c[3](k = {1, 2, 3}, shift = {0, 0.25, 0.5});
+  end TableArray;
 
   function timeTableNextEvent "Modelica.Blocks.Tables.Internal.getNextTimeEvent"
     input TimeTable tableID;
