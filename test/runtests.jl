@@ -351,6 +351,9 @@ TEST_GROUP == "kept" || @testset "OMBackend" begin
     end
   end
 
+  #= ── The public API: the names, documented, nothing exported ──── =#
+  include("publicAPITests.jl")
+
   #= ── 6. SimCode Exp traversal + alias substitution ────────────── =#
   include("simCodeTraverseTests.jl")
 

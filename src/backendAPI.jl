@@ -196,16 +196,35 @@ function warnMissingStartValues(enabled::Bool)
   WARN_MISSING_START_VALUES[] = enabled
 end
 
+"""
+    BackendMode
+
+How a scalar model is built: `BackendMode` of [`translate`](@ref), `MODE` of [`simulateModel`](@ref)
+(`DEFAULT_BACKEND_MODE[]` when not given). [`IMTK_MODE`](@ref) (the default) or [`MTK_MODE`](@ref). A model the
+arrays-kept path translated runs its own code in either mode.
+"""
 @enum BackendMode begin
   MTK_MODE = 3
-  #=
-    In-backend MTK path. Same module/codegen as MTK_MODE, but additionally
-    constructs the System and runs structural_simplify in the backend at
-    translate time and dumps the post-simplify System. Simulate reuses the
-    existing module interface. Implementation in CodeGeneration/IMTKGen.jl.
-  =#
   IMTK_MODE = 5
 end
+
+"""
+    IMTK_MODE
+
+The default [`BackendMode`](@ref): the backend builds the ModelingToolkit system, simplifies it and builds the problem
+at translate time, and caches the build (CodeGeneration/IMTKGen.jl). A simulate remakes the cached problem. The mode
+of tunable parameters: [`withTunableParameters`](@ref), and `parameters` of [`simulateModel`](@ref) and
+[`resimulateModel`](@ref).
+"""
+IMTK_MODE
+
+"""
+    MTK_MODE
+
+A [`BackendMode`](@ref): the generated module is evaluated, its system simplified and its problem built at the first
+simulate. No tunable parameters.
+"""
+MTK_MODE
 
 """
 Runtime-toggleable default backend mode used by `OM.translate` / `OM.simulate`
@@ -987,16 +1006,18 @@ function availableModels()::String
 end
 
 """
-  ```
-   simulateModel(modelName::String;
-                       MODE = DEFAULT_BACKEND_MODE[],
-                       tspan = (0.0, 1.0),
-                       solver = defaultSolver(),
-                       kwargs...)
-  ```
-  Simulates model interactively.
-  The solver need to be passed with a : before the name, example:
-  OMBackend.simulateModel(modelName, tspan = (0.0, 1.0), solver = :(Tsit5()));
+    simulateModel(modelName::String; MODE = DEFAULT_BACKEND_MODE[], tspan = (0.0, 1.0), solver = defaultSolver(),
+                  overwriteCache = false, kwargs...) -> ODESolution
+
+Simulate the translated model `modelName` (either name form, [`canonicalName`](@ref)) over `tspan` with `solver`
+(an OrdinaryDiffEq algorithm, `Tsit5()`; [`defaultSolver`](@ref)). `MODE` is a [`BackendMode`](@ref).
+`overwriteCache` rebuilds the problem. `parameters` (name => value; [`IMTK_MODE`](@ref) only) sets parameters kept
+tunable at translate time ([`withTunableParameters`](@ref)); the other keyword arguments go to `solve`. A violated
+`assert` throws [`ModelicaAssertionError`](@ref).
+
+```julia
+OMBackend.simulateModel("HelloWorld"; tspan = (0.0, 2.0), reltol = 1e-6)
+```
 """
 function simulateModel(modelName::String;
                        MODE = DEFAULT_BACKEND_MODE[],
@@ -1255,11 +1276,11 @@ plot(args...; kwargs...) = throw(ArgumentError(
   "OMBackend.plot needs Plots.jl: run `using Plots` (on Windows before loading OMBackend), or use OM, which loads it"))
 
 """
-  Returns the value of a variable given a solution and a string.
-```
-  getVariableValues(sol, varName::String)
-```
-Example use:
+    getVariableValues(sol::ODESolution, varName::String) -> Union{Nothing, Vector{Float64}}
+
+The values of the variable `varName` (its Modelica name, or `"time"`) at the steps of `sol`, a solution of
+[`simulateModel`](@ref). `nothing`, with a warning, where the model has no such variable.
+
 ```julia
 OM.translate("HelloWorld", "./Models/HelloWorld.mo");
 sol = OM.simulate("HelloWorld");

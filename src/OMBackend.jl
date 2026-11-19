@@ -61,6 +61,17 @@ include("$CURRENT_DIRECTORY/CodeGeneration/IMTKGen.jl")
 include("backendUtils.jl")
 #= Finally add the API=#
 include("backendAPI.jl")
+using .CodeGeneration: ModelicaAssertionError, isStepControl
+using .SimCode: EliminationOptions
+#= The public API: these names hold for all of 1.x (docs/src/api.md, test/publicAPITests.jl). Nothing is exported:
+   call them as `OMBackend.name`. Every other name is internal and may change in any release. =#
+public translate, translateReducedArrays, generateTargetCode, knownValues, BackendMode, IMTK_MODE, MTK_MODE,
+  EliminationOptions, explainIndexReduction, scalarizedFallbackReason, canonicalName
+public simulateModel, resimulateModel, getMTKProblem, defaultSolver, daeFallbackSolver, getVariableValues,
+  eventCallbacks, isStepControl, ModelicaAssertionError, plot
+public withTunableParameters, isTunable, pristineParameters
+public availableModels, printModel, modelToString, writeModelToFile, dumpGeneratedCode
+public clearCaches!, forgetModel
 #= The modules of the source, for the error policy's programming errors. =#
 _collectSourceModules!(@__MODULE__)
 #= Precompile workload: warm shared MTK/OrdinaryDiffEq build+solve instances. =#
