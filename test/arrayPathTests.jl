@@ -148,6 +148,31 @@ end
     @test_throws Exception OMBackend.resimulateModel(name; tspan = (0.0, 1.0), parameters = Dict("n" => 4))
   end
 
+  #= isTunable, pristineParameters and eventCallbacks of an array model: they read the IMTK route's build only (false,
+     nothing, nothing), while `parameters` set its parameters =#
+  @testset "Tunable parameters of an array model" begin
+    local name = _arrayPathTranslate("ArrayPath.ParamDep"; scalarized = false)
+    @test _arrayPathTaken(name)
+    @test OMBackend.isTunable(name, ["a"])
+    @test OMBackend.isTunable(name, ["a", "k[2]", "b"])
+    @test OMBackend.isTunable("ArrayPath.ParamDep", [:k])
+    @test !OMBackend.isTunable(name, ["n"])
+    @test !OMBackend.isTunable(name, ["a", "nope"])
+    #= R0 is read by a structural parameter's binding: its override is refused =#
+    local sd = _arrayPathTranslate("ArrayPath.StructuralDependency"; scalarized = false)
+    @test !OMBackend.isTunable(sd, ["R0"])
+    local p0 = OMBackend.pristineParameters(name)
+    @test p0 isa Vector{Float64}
+    @test p0 == OMBackend.getMTKProblem(name)[1].p.values
+    @test sort(p0) == [2.0, 2.0, 4.0, 6.0, 6.0]
+    #= a copy: changing it changes no later simulation =#
+    p0 .= 0.0
+    @test OMBackend.simulateModel(name; tspan = (0.0, 1.0)).u[end] ≈ exp.(-[2.0, 4.0, 6.0]) rtol = 1e-4
+    local cb = OMBackend.eventCallbacks(name)
+    @test cb !== nothing
+    @test typeof(cb) == typeof(OMBackend.getMTKProblem(name)[2])
+  end
+
   @testset "ARRAY_PATH_FULL = false: events go the ModelingToolkit path" begin
     OMBackend.ARRAY_PATH_FULL[] = false
     try

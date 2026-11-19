@@ -1041,6 +1041,42 @@ function _parameterIndex(model::Module)::Dict{String, Int}
 end
 
 """
+    areTunable(model, names) -> Bool
+
+Whether the generated array model `model` takes overrides of all `names` (`simulate(...; parameters)`, as
+`parameterValues` and `modelParameters` apply them): each the name of a parameter or element it has (Modelica's or
+canonical), not structural (`FIXED_PARAMETERS`, `FIXED_STRINGS`), and no structural parameter or one without a rule
+(that is not `START_OPAQUE`'s) reads them, also through other parameters' bindings. Each reader counts as changed, as
+for a value that changes it.
+"""
+function areTunable(model::Module, names::Vector{String})::Bool
+  local changed::Set{Symbol} = Set{Symbol}()
+  local fixedStrings::Set{Int} = model.FIXED_STRINGS
+  for name::String in names
+    local k::Int = get(model.STRING_PARAMETERS, name, 0)
+    if k != 0
+      k in fixedStrings && return false
+    elseif haskey(model.PARAMETER_NAMES, name)
+      push!(changed, model.PARAMETER_NAMES[name]::Symbol)
+    elseif haskey(model.PARAMETER_ELEMENTS, name)
+      push!(changed, first(model.PARAMETER_ELEMENTS[name])::Symbol)
+    else
+      return false
+    end
+  end
+  local opaque::Set{Symbol} = model.START_OPAQUE
+  for (sym::Symbol, deps::Vector{Symbol}, rule::Union{Nothing, Function}) in model.PARAMETER_RULES
+    (sym in changed || !any(d -> d in changed, deps)) && continue
+    if rule === nothing
+      all(d -> !(d in changed) || d in opaque, deps) && continue
+      return false
+    end
+    push!(changed, sym)
+  end
+  return !any(s -> s in changed, model.FIXED_PARAMETERS)
+end
+
+"""
     variableValues(sol, name)
 
 The values of a state, algebraic or discrete variable element (`"c[2].T"`), or a parameter, at the time

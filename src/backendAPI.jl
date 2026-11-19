@@ -1189,13 +1189,18 @@ end
 """
     isTunable(modelName, names) -> Bool
 
-Whether the compiled `modelName` (its cached build) was compiled with all
-`names` tunable (`withTunableParameters`; an array as a whole) and has them
-as parameters, so that `simulate(...; parameters)` can set them. False
-without a cached build, or after the model was compiled again with other
-tunable parameters.
+Whether `simulate(...; parameters)` of the translated `modelName` can set all `names` without a new translation.
+- A model the arrays-kept path translated: every parameter it has, by name or element (`k`, `k[2]`; Modelica's or
+  canonical names), except structural ones (array sizes, subscripts, if-equation conditions) and the parameters their
+  bindings read.
+- Another: its cached build ([`IMTK_MODE`](@ref)) was compiled with all `names` tunable
+  ([`withTunableParameters`](@ref); an array as a whole) and has them as parameters. False without a cached build, or
+  after the model was compiled again with other tunable parameters.
 """
 function isTunable(modelName::String, names)::Bool
+  local arrayModel::Union{Nothing, Module} = _arrayModelModule(canonicalName(modelName))
+  arrayModel === nothing ||
+    return Base.invokelatest(CodeGeneration.ArrayPreserveDE.areTunable, arrayModel, String[string(n) for n in names])
   local built = get(IMTKGen.BUILT, canonicalName(modelName), nothing)
   built === nothing && return false
   local prob = built[1]
@@ -1211,29 +1216,50 @@ end
 """
     eventCallbacks(modelName) -> callbacks or nothing
 
-The event callbacks of a compiled model's cached build (IMTK mode), as the
-second element of `getMTKProblem`'s result, without building the problem
-again. The problem carries them as well (`prob.kwargs[:callback]`, after any
-events of the MTK system), and a solve uses the problem's. `nothing` without a
-cached build.
+The event callbacks of a translated model, as the second element of [`getMTKProblem`](@ref)'s result.
+- A model the arrays-kept path translated: those of its problem over `(0, 1)` (it has no cached build: the problem,
+  with its initialization, is built at each call). They include the run's bookkeeping callbacks (the start state, the
+  first step).
+- Another: those of its cached build ([`IMTK_MODE`](@ref)), without building the problem again. The problem carries
+  them as well (`prob.kwargs[:callback]`, after any events of the MTK system), and a solve uses the problem's.
+  `nothing` without a cached build.
 """
 function eventCallbacks(modelName::String)
+  _arrayModelModule(canonicalName(modelName)) === nothing || return getMTKProblem(modelName)[2]
   local built = get(IMTKGen.BUILT, canonicalName(modelName), nothing)
   return built === nothing ? nothing : built[2]
 end
 
 """
-    pristineParameters(modelName) -> Vector or nothing
+    pristineParameters(modelName) -> Union{Nothing, Vector}
 
-The parameter vector the simulations of a compiled model start from. A
-simulation's solved problem (`sol.prob.p`) carries the vector as the event
-callbacks left it (if-condition switches flipped), so solving that problem
-again must start from this one. `nothing` without a cached build (IMTK mode
-caches it at translate time).
+The parameter values the simulations of a translated model start from, a copy.
+- A model the arrays-kept path translated: the values (`p.values`, `Vector{Float64}`) of its problem over `(0, 1)`,
+  after its initialization ([`getMTKProblem`](@ref) builds it at each call). Its problems' parameters are more than
+  these values (the run state): a new problem is `getMTKProblem` or `simulate(...; parameters)`, not a `remake` with
+  them.
+- Another: the parameter vector of its cached build ([`IMTK_MODE`](@ref), cached at translate time). A simulation's
+  solved problem (`sol.prob.p`) carries the vector as the event callbacks left it (if-condition switches flipped), so
+  solving that problem again must start from this one (`remake(sol.prob; p = pristineParameters(name))`). `nothing`
+  without a cached build.
 """
 function pristineParameters(modelName::String)
+  _arrayModelModule(canonicalName(modelName)) === nothing || return copy(getMTKProblem(modelName)[1].p.values)
   local p = get(IMTKGen.PRISTINE_P, canonicalName(modelName), nothing)
   return p === nothing ? nothing : deepcopy(p)
+end
+
+"""
+    _arrayModelModule(modelName) -> Union{Nothing, Module}
+
+The module of the model `modelName` (canonical) the arrays-kept path translated, evaluated where it is not yet or
+its code changed (as `getMTKProblem`); `nothing` for another model.
+"""
+function _arrayModelModule(modelName::String)::Union{Nothing, Module}
+  modelName in ARRAY_PRESERVE_DE_MODELS || return nothing
+  (!_modelDefined(Symbol(modelName)) || modelWasCompiledAgainArrayPreserveDE(modelName)) &&
+    _evalModelArrayPreserveDE(modelName, getCompiledModelArrayPreserveDE(modelName))
+  return _modelModule(Symbol(modelName))
 end
 
 """
@@ -1252,8 +1278,8 @@ _modelModule(name::Symbol)::Module = Base.invokelatest(getglobal, OMBackend, nam
     resimulateModel(modelName; solver, tspan, parameters = Dict(), kwargs...)
 
 Simulate an already compiled model again, without recompiling. `parameters`
-(name => value) sets parameters kept tunable at compile time
-(`withTunableParameters`); other keyword arguments go to the solver.
+(name => value) sets the parameters [`isTunable`](@ref) names, as for [`simulateModel`](@ref); other keyword
+arguments go to the solver.
 """
 function resimulateModel(modelName::String;
                          solver = defaultSolver(),
