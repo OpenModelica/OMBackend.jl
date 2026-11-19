@@ -41,17 +41,23 @@ function _epContinuousCallbacks(sol::EP_SOLUTION)::Vector{Any}
   return out
 end
 
+"The condition of the continuous callback `c` behind its `NotAnEvent` marker (asserts: no events)."
+function _epCondition(c)::Any
+  local condition::Any = c.condition
+  return condition isa OMBackend.CodeGeneration.NotAnEvent ? condition.f : condition
+end
+
 @testset "Event iteration compiled parts" begin
   local CG = OMBackend.CodeGeneration
   @testset "Cluster body tiered" begin
     _epTranslate("EventPerf.HalfWave")
-    local sol::EP_SOLUTION = OMBackend.simulateModel(OMBackend.canonicalName("EventPerf.HalfWave"); tspan = (0.0, 0.1))
+    local sol::EP_SOLUTION = OMBackend.simulate(OMBackend.canonicalName("EventPerf.HalfWave"); tspan = (0.0, 0.1))
     @test string(sol.retcode) == "Success"
-    @test maximum(OMBackend.getVariableValues(sol, "vC")) ≈ 1.0 atol = 1e-3
+    @test maximum(OMBackend.variableValues(sol, "vC")) ≈ 1.0 atol = 1e-3
     local e::CG.EventIteration = _epEventIteration(sol)
     @test length(e.clusters) == 1 && only(e.clusters).body isa CG.TieredBody
     foreach(c -> c.body.tier.compiled = true, e.clusters)
-    local compiled::EP_SOLUTION = OMBackend.simulateModel(OMBackend.canonicalName("EventPerf.HalfWave"); tspan = (0.0, 0.1))
+    local compiled::EP_SOLUTION = OMBackend.simulate(OMBackend.canonicalName("EventPerf.HalfWave"); tspan = (0.0, 0.1))
     @test all(c -> c.body.tier.compiled, _epEventIteration(compiled).clusters)
     @test compiled.t == sol.t && compiled.u == sol.u
     #= the event Newton's factors of the algebraic block against a fresh lu, at states along the solve =#
@@ -71,10 +77,10 @@ end
   end
   @testset "Assert crossings compiled" begin
     _epTranslate("EventPerf.Asserts")
-    local sol::EP_SOLUTION = OMBackend.simulateModel(OMBackend.canonicalName("EventPerf.Asserts"); tspan = (0.0, 1.0))
+    local sol::EP_SOLUTION = OMBackend.simulate(OMBackend.canonicalName("EventPerf.Asserts"); tspan = (0.0, 1.0))
     @test string(sol.retcode) == "Success"
-    local zc = only(filter(c -> hasfield(typeof(c.condition), :compiled), _epContinuousCallbacks(sol)))
-    local cond = zc.condition
+    local zc = only(filter(c -> hasfield(typeof(_epCondition(c)), :compiled), _epContinuousCallbacks(sol)))
+    local cond = _epCondition(zc)
     @test cond.compiled !== nothing && cond.compiled[2].count == zc.len == 5
     local SII = CG.ModelingToolkit.SymbolicIndexingInterface
     for k in eachindex(sol.t)
@@ -92,8 +98,8 @@ end
     _epTranslate("EventPerf.Eager")
     @test only(f[2] for f in OMBackend.fallbackSummary() if f[1] === :eagerFunctionCall) == 1
     @test length(CG._eagerFailures(:EventPerf_clipped).args) == 1
-    local sol::EP_SOLUTION = OMBackend.simulateModel(OMBackend.canonicalName("EventPerf.Eager"); tspan = (0.0, 2.0))
-    @test OMBackend.getVariableValues(sol, "y1")[end] == 0.0 && OMBackend.getVariableValues(sol, "y2")[end] == 1.0
+    local sol::EP_SOLUTION = OMBackend.simulate(OMBackend.canonicalName("EventPerf.Eager"); tspan = (0.0, 2.0))
+    @test OMBackend.variableValues(sol, "y1")[end] == 0.0 && OMBackend.variableValues(sol, "y2")[end] == 1.0
     OMBackend.clearCaches!()
     _epTranslate("EventPerf.Eager")
     local impl = CG.MODELICA_FUNCTION_IMPLS[:EventPerf_clipped]
