@@ -1090,33 +1090,39 @@ function reduceIndexArrays!(model::IR.Model; arrays::Bool = true)::Bool
   dropKnownZeroTerms!(model, view) && (view = scalarizeArrays(model; cache))
   exposeArrayLinearConstraints!(model, view) && (view = scalarizeArrays(model; cache))
   local partition::IR.Partition = view.model.continuous[1]
-  local written::Plan = plan(view.model, partition; indexOne = true, initialDerivatives = true)
-  #= the arrays of aliases read through representatives (`arrayAliasPlan`), the plan made again where it differentiates
-     anything: MSL EngineV6 differentiates 4974 element rows instead of 7132, translated and first simulated 5 s faster =#
-  if !isempty(written.differentiated) && envSwitch("OMBACKEND_ALIAS_SUBSTITUTION")
-    (view, written) = arrayAliasPlan(model, view, written, cache)
+  #= the arrays of aliases read through representatives (`arrayAliasPlan`) where the plan differentiates anything
+     (`differentiates`): MSL EngineV6 differentiates 4974 element rows instead of 7132, translated and first simulated
+     5 s faster. The plan as written only where that does not apply (EngineV6: a plan fewer, 0.4 s). =#
+  local aliased::Union{Nothing, Plan} = nothing
+  if envSwitch("OMBACKEND_ALIAS_SUBSTITUTION") && differentiates(view.model, partition; initialDerivatives = true)
+    (view, aliased) = arrayAliasPlan(model, view, cache)
     partition = view.model.continuous[1]
   end
+  local written::Plan = aliased !== nothing ? aliased : plan(view.model, partition; indexOne = true, initialDerivatives = true)
   #= the array form of the plan as written first: a plan it does not take is refused before the simulation code's
      values are computed for the plan again (`knownPlan`). Arrays whose elements it treats differently (slicing) are
      split into their elements, until it takes it. The element view stays (the splits keep the model's meaning), so
      its plan is kept while splitting and made again on the final view, which the array form must take too (its
-     variables' order may decide differently): MSL EngineV6, 5 rounds, planned each round, 3.6 s of 7.6. =#
+     variables' order may decide differently): MSL EngineV6, 5 rounds, planned each round, 3.6 s of 7.6. The plan made
+     again is the one committed (`knownPlan`, the simulation code's values), with its commit (EngineV6: a plan and a
+     commit fewer, 0.9 s). =#
   local splits::Int = 0
   local stale::Bool = false
+  local final::Union{Nothing, Tuple{Scalarized, Plan, ArrayCommit}} = nothing
   local arrayElements::Int = sum((length(view.elements.elements[v.name]) for v in model.variables
                                   if isContinuousArray(v) && haskey(view.elements.elements, v.name)); init = 0)
   while true
     try
       arrayCommit(model, model.continuous[1], view, written)
       stale || break
-      written = plan(view.model, partition; indexOne = true, initialDerivatives = true)
+      (view, written) = knownPlan(model, view, nothing)
+      partition = view.model.continuous[1]
       stale = false
-      arrayCommit(model, model.continuous[1], view, written)
+      final = (view, written, arrayCommit(model, model.continuous[1], view, written))
       break
     catch err
       (err isa NotHandled && needsSplit(err) && splits < 256) || rethrow()
-      splitArrays!(model, view, err.arrays, err.equations)
+      splitArrays!(model, view, err.arrays, err.equations; cache)
       splits += 1
       #= split down to no array equations, or most of the arrays' elements split: little the array form keeps, the
          scalarized path is the one (MSL EngineV6: its frames' vectors and rotations, 10877 elements split) =#
@@ -1130,7 +1136,8 @@ function reduceIndexArrays!(model::IR.Model; arrays::Bool = true)::Bool
       stale = true
     end
   end
-  return commitArrayPlan!(model, view, written)
+  final === nothing && return commitArrayPlan!(model, view, written)
+  return commitPlan!(model, final...)
 end
 
 """
@@ -1171,22 +1178,42 @@ end
 indexReduced(model::IR.Model)::Bool = any(v::IR.Variable -> v.kind isa Union{IR.DUMMY_DER, IR.DUMMY_STATE}, model.variables)
 
 """
+    knownPlan(model, view, written) -> Tuple{Scalarized, Plan}
+
+The plan of the element view `view` of `model` made with the simulation code's values (`KNOWN_VALUES`), on the model
+as the plan with these values reads it: without the terms a function's zero output takes out (`model` changed, its
+view made again). Without such values `written`, or where that is `nothing` the plan made again.
+"""
+function knownPlan(model::IR.Model, view::Scalarized, written::Union{Nothing, Plan})::Tuple{Scalarized, Plan}
+  local known::Dict{Symbol, IR.Expression} =
+    KNOWN_VALUES[] === nothing ? Dict{Symbol, IR.Expression}() : KNOWN_VALUES[](view.model)
+  if isempty(known)
+    written === nothing || return (view, written)
+    return (view, plan(view.model, view.model.continuous[1]; indexOne = true, initialDerivatives = true)::Plan)
+  end
+  local v::Scalarized = dropFunctionZeroTerms!(model, view, known) ? scalarizeArrays(model) : view
+  return (v, plan(v.model, v.model.continuous[1]; known, indexOne = true, initialDerivatives = true)::Plan)
+end
+
+"""
     commitArrayPlan!(model, view, written) -> Bool
 
 The plan `written`, made on the element view `view` of `model` and taken by its array form, made again with the
-simulation code's values (`KNOWN_VALUES`) and committed in array form (`arrayCommit`, `commitArrays!`), the
-derivative unknowns solved for; whether it reduced the index (differentiated equations).
+simulation code's values (`knownPlan`) and committed (`commitPlan!`); whether it reduced the index.
 """
 function commitArrayPlan!(model::IR.Model, view::Scalarized, written::Plan)::Bool
-  local known = KNOWN_VALUES[] === nothing ? Dict{Symbol, IR.Expression}() : KNOWN_VALUES[](view.model)
-  local p::Plan = written
-  if !isempty(known)
-    #= the model as the plan with these values reads it: without the terms a function's zero output takes out =#
-    dropFunctionZeroTerms!(model, view, known) && (view = scalarizeArrays(model))
-    p = plan(view.model, view.model.continuous[1]; known, indexOne = true, initialDerivatives = true)
-  end
+  local (v::Scalarized, p::Plan) = knownPlan(model, view, written)
+  return commitPlan!(model, v, p, arrayCommit(model, model.continuous[1], v, p))
+end
+
+"""
+    commitPlan!(model, view, p, c) -> Bool
+
+The plan `p` of the element view `view` of `model` committed in array form (`c`, its `arrayCommit`; `commitArrays!`),
+the derivative unknowns solved for; whether it reduced the index (differentiated equations).
+"""
+function commitPlan!(model::IR.Model, view::Scalarized, p::Plan, c::ArrayCommit)::Bool
   local reduced::Bool = !isempty(p.differentiated)
-  local c = arrayCommit(model, model.continuous[1], view, p)
   commitArrays!(model, model.continuous[1], c)
   applyCarried!(model.variables, p.carried)
   applyCarriedArrays!(model.variables, view.elements, p.carried)

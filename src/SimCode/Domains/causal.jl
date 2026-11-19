@@ -288,6 +288,105 @@ function _neededRows(g::Gen, el::InstanceTable, matchRow::Vector{Int}, producer:
 end
 
 """
+    _assertRows(g, el, matchRow, producer, loops, invariant, functionAsserts) -> BitVector
+
+The rows the asserts' checks during a solve compute (`assertRows!`: `checkAsserts`, `assertCrossings!`): the rows that
+give what the asserts' conditions and messages read (algebraic values, state derivatives; `_assertReads`), the
+algorithms with an assert, and where a function has an assert (`functionAsserts`) the rows that call a function; with
+the rows they need (`_neededRows`), but not the time-invariant ones (computed once per solve, `invariants!`, which ran
+the functions they call before the solve). MSL EngineV6: its 72 assert instances read 60 of the 15470 algebraic
+values; each step's two checks computed all of the equations (33 us and a buffer of 124 KB each), 36 and 91 us, now
+1.6 and 1.5 us; its solve 3.23 -> 2.73 s, 2.06 -> 0.87 GB allocated.
+"""
+function _assertRows(g::Gen, el::InstanceTable, matchRow::Vector{Int}, producer::Vector{Int}, loops::LoopBlocks,
+                     invariant::BitVector, functionAsserts::Bool)::BitVector
+  local reads::Set{Int} = Set{Int}()
+  foreach(a::AssertClass -> _assertReads!(reads, g, a), g.asserts)
+  local roots::Vector{Int} = Int[q for q in (producer[u] for u in reads) if q > 0]
+  for r in eachindex(el.class)
+    local ci::Int = el.class[r]
+    local check::Bool = ci < 0 ? any(st::Stmt -> _checks(st, functionAsserts), g.algs[-ci].body) :
+                                 functionAsserts && (_callsFunction(g.classes[ci].lhs) || _callsFunction(g.classes[ci].rhs))
+    check && push!(roots, r)
+  end
+  return _neededRows(g, el, matchRow, producer, loops, unique!(roots)) .& .!invariant
+end
+
+"""
+    _assertReads!(reads, g, a) -> Set{Int}
+
+The unknowns the assert `a` reads in its condition and message, over its instances, into `reads`: algebraic values
+and state derivatives (as `_elements` numbers them); every element of a variable read with a subscript not known here
+(`_knownSubscript`).
+"""
+function _assertReads!(reads::Set{Int}, g::Gen, a::AssertClass)::Set{Int}
+  local acc::Vector{Ref} = accesses!(accesses!(Ref[], a.cond), a.msg)
+  local idx::Vector{Int} = Int[]
+  for r::Ref in acc
+    local info::VarInfo = g.vars[r.name]
+    local base::Int = info.kind == :alg ? g.nStates + info.offset : (info.kind == :state && r.der) ? info.offset : -1
+    base < 0 && continue
+    local n::Int = isempty(info.dims) ? 1 : prod(info.dims)
+    for j in 1:size(a.domain, 2)
+      empty!(idx)
+      for s::IR in r.subs
+        local k::Union{Nothing, Int} = _knownSubscript(s, a.domain, j)
+        k === nothing && break
+        push!(idx, k)
+      end
+      if length(idx) == length(info.dims) && all(i::Int -> 1 <= idx[i] <= info.dims[i], eachindex(idx))
+        push!(reads, base + _elementOffset(info, idx, r.name) + 1)
+      else
+        foreach(k::Int -> push!(reads, base + k), 1:n)
+      end
+    end
+  end
+  return reads
+end
+
+"""
+    _knownSubscript(x, d, col) -> Union{Nothing, Int}
+
+The value of the subscript `x` at the instance `col` of the domain `d` from literals, the domain's slots and integer
+arithmetic; `nothing` for another (a loop's iterator, a parameter: `_evalInt` would make it structural).
+"""
+function _knownSubscript(x::IR, d::Matrix{Int}, col::Int)::Union{Nothing, Int}
+  x isa Lit && return x.v isa Integer ? Int(x.v) : nothing
+  x isa Slot && return 1 <= x.k <= size(d, 1) ? d[x.k, col] : nothing
+  x isa Op || return nothing
+  local args::Vector{Union{Nothing, Int}} = Union{Nothing, Int}[_knownSubscript(y, d, col) for y in x.args]
+  any(isnothing, args) && return nothing
+  x.op == :+ && length(args) == 2 && return args[1] + args[2]
+  x.op == :- && length(args) == 2 && return args[1] - args[2]
+  x.op == :* && length(args) == 2 && return args[1] * args[2]
+  x.op == :neg && length(args) == 1 && return -args[1]
+  return nothing
+end
+
+"Whether `x` calls a function (`:fcall`, also in a relation's or an event-generating function's operand)."
+_callsFunction(x::IR)::Bool = false
+_callsFunction(x::Op)::Bool = x.op == :fcall || any(_callsFunction, x.args)
+_callsFunction(x::Rel)::Bool = _callsFunction(x.lhs) || _callsFunction(x.rhs)
+_callsFunction(x::EvFn)::Bool = _callsFunction(x.arg)
+
+"""
+    _checks(st, functionAsserts) -> Bool
+
+Whether the algorithm statement `st` asserts (`SAssert`) or, where a function has an assert (`functionAsserts`), calls
+a function (`_callsFunction`), at any depth.
+"""
+_checks(st::Stmt, functionAsserts::Bool)::Bool = false
+_checks(st::SAssert, functionAsserts::Bool)::Bool = true
+_checks(st::SAssign, functionAsserts::Bool)::Bool = functionAsserts && _callsFunction(st.value)
+_checks(st::SCall, functionAsserts::Bool)::Bool = functionAsserts && _callsFunction(st.call)
+_checks(st::Union{SIf, SWhen}, functionAsserts::Bool)::Bool =
+  any(b::Tuple{IR, Vector{Stmt}} -> (functionAsserts && _callsFunction(b[1])) || any(s::Stmt -> _checks(s, functionAsserts), b[2]),
+      st.branches)
+_checks(st::SFor, functionAsserts::Bool)::Bool = any(s::Stmt -> _checks(s, functionAsserts), st.body)
+_checks(st::SWhile, functionAsserts::Bool)::Bool =
+  (functionAsserts && _callsFunction(st.cond)) || any(s::Stmt -> _checks(s, functionAsserts), st.body)
+
+"""
     _invariantRows!(solutions, g, el, matchRow, producer, loops, batches) -> BitVector
 
 The time-invariant rows: an equation solved explicitly (`_solution!`, into `solutions`) for an algebraic unknown from

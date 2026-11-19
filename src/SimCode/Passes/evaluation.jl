@@ -174,9 +174,9 @@ function tryEvalNumeric(e::Exp)::Union{Float64, Nothing}
   return nothing
 end
 
-tryEvalNumeric(e::Exp, simCode::SIM_CODE)::Union{Float64, Nothing} = tryEvalNumeric(e, simCode, OrderedSet{String}())
+tryEvalNumeric(@nospecialize(e::Exp), simCode::SIM_CODE)::Union{Float64, Nothing} = tryEvalNumeric(e, simCode, OrderedSet{String}())
 
-function tryEvalNumeric(e::Exp, simCode::SIM_CODE, seen::OrderedSet{String})::Union{Float64, Nothing}
+function tryEvalNumeric(@nospecialize(e::Exp), simCode::SIM_CODE, seen::OrderedSet{String})::Union{Float64, Nothing}
   e isa RCONST && return e.value
   e isa ICONST && return Float64(e.value)
   e isa ENUM_LITERAL && return Float64(e.index)
@@ -227,7 +227,7 @@ evaluated (a cycle does not evaluate).
 """
 tryEvalScalar(e::Exp, simCode::SIM_CODE) = tryEvalScalar(e, simCode, OrderedSet{String}())
 
-function tryEvalScalar(e::Exp, simCode::SIM_CODE, seen::OrderedSet{String})
+function tryEvalScalar(@nospecialize(e::Exp), simCode::SIM_CODE, seen::OrderedSet{String})
   e isa Union{BCONST, SCONST, ICONST, RCONST} && return e.value
   e isa ENUM_LITERAL && return e.index
   if e isa EXP_CREF

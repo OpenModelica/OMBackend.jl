@@ -21,11 +21,11 @@ package OMBackendWorkload "The models of OMBackend's precompile workload for the
     v0 := transpose(R.T) * v;
   end resolve1;
 
-  function shaped "x + x^3/10, no derivative annotation: a constraint through it differentiated through its body"
+  function shaped "x + x^3/10 + sin(x)/100, no derivative annotation: a constraint through it differentiated through its body (a builtin call among its terms)"
     input Real x;
     output Real y;
   algorithm
-    y := x + x ^ 3 / 10;
+    y := x + x ^ 3 / 10 + sin(x) / 100;
   end shaped;
 
   model Link "a link turning by phi against its base: its frame from a function, its tip resolved through it; a pair of inertias rigidly coupled through a function (index 3)"

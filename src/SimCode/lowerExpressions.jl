@@ -231,7 +231,7 @@ coils' `sta[i].nomVal`, `sta[iSta].perCur.capFunT[6]` in an initial algorithm) a
 their references, subscripted; a scalar subscripted by ones as the scalar; another reference
 by its flat name.
 """
-function simCrefExp(names::Names, cref::IR.ComponentRef, ty::IR.ModelicaType)::Exp
+function simCrefExp(names::Names, cref::IR.ComponentRef, @nospecialize(ty::IR.ModelicaType))::Exp
   local state = get(names.stateOf, cref.name, nothing)
   state === nothing || return DER(SimCref(Symbol(simName(names, state)), Int[], state))
   local full = simName(names, cref)

@@ -149,6 +149,23 @@ _holdDiscretes!(s::BlockSolver, ::Nothing)::Nothing = nothing
 _sameDiscretes(s::BlockSolver, ::Nothing)::Bool = true
 
 """
+    BlockResidual(blocks!, k)
+
+The residual function of a model's `k`-th large algebraic loop: `blocks!(k, res, y, du, a, u, p, t, z, mode, fire)`,
+the model's one function that calls its loops' residual functions (`BLOCKS!`, a branch per loop). `blockSolve!` and
+`_passBlock!` are specialized on the residual's type: one type per model, not one per loop (MSL EngineV6, 13 loops:
+0.225 s of compile each).
+"""
+struct BlockResidual{F <: Function} <: Function
+  blocks!::F
+  k::Int
+end
+
+@inline (r::BlockResidual)(res::AbstractVector, y::AbstractVector, du::AbstractVector, a::AbstractVector, u::AbstractVector, p,
+                           t::Real, z::CrossingOut, mode::Bool, fire::Bool)::Nothing =
+  r.blocks!(r.k, res, y, du, a, u, p, t, z, mode, fire)
+
+"""
     blockSolve!(s, residual!, du, a, u, p, t, z, mode, fire)
 
 Solve a large algebraic loop of an array model where the equations reach it: `residual!(res, y, du, a, u, p, t, z,
@@ -165,12 +182,12 @@ A linear loop whose Jacobian costs at most `LINEAR_DIRECT_COLORS` evaluations is
 (`_blockLinear!`).
 """
 function blockSolve!(s::BlockSolver, residual!::R, du::AbstractVector, a::AbstractVector, u::AbstractVector, p, t::Real,
-                     z, mode::Bool, fire::Bool)::Nothing where {R <: Function}
+                     z::CrossingOut, mode::Bool, fire::Bool)::Nothing where {R <: Function}
   eltype(a) === Float64 ||
     error("array model: an algebraic loop solved in the equations needs Float64 values (a solver with finite differences)")
   #= of concrete type: an abstract `Tuple` boxed it (208 B per call) and made each residual call a dynamic one =#
-  local args::Tuple{typeof(du), typeof(a), typeof(u), typeof(p), typeof(t), Nothing, Bool, Bool} =
-    (du, a, u, p, t, nothing, false, fire)
+  local args::Tuple{typeof(du), typeof(a), typeof(u), typeof(p), typeof(t), CrossingOut, Bool, Bool} =
+    (du, a, u, p, t, NO_CROSSINGS, false, fire)
   s.x .= s.y
   local ok::Bool = s.linear && length(s.groups) <= LINEAR_DIRECT_COLORS && _blockAttempt!(s, residual!, args, :linear)
   if !(ok && !s.rankDeficient)
@@ -232,7 +249,7 @@ function blockSolve!(s::BlockSolver, residual!::R, du::AbstractVector, a::Abstra
   end
   #= the last evaluation was at the solution unless crossing functions or relation values are asked for =#
   if ok
-    (z === nothing && !mode) || residual!(s.r, s.x, du, a, u, p, t, z, mode, fire)
+    (_noCrossings(z) && !mode) || residual!(s.r, s.x, du, a, u, p, t, z, mode, fire)
   else
     #= of a loop that did not solve at its NaN unknowns, for what the equations after it read; a function's assert
        there (`x0 < x1` of NaN: MSL Fluid's regFun3 in a pipe's friction) is no other failure than the loop's =#

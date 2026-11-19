@@ -326,7 +326,13 @@ function observationPairs(eliminated::Vector{String}, pairs::Vector{AliasEquatio
                           residuals::Vector{RESIDUAL_EQUATION}, replacements::Replacements,
                           refs::Dict{String, EXP_CREF})::Tuple{Vector{String}, Vector{RESIDUAL_EQUATION}}
   local eliminatedSet = Set{String}(eliminated)
-  local incidence = AliasEquation[p for p in pairs if p.equation in removed && (p.first in eliminatedSet || p.second in eliminatedSet)]
+  #= the removed residuals of each eliminated variable, in the pairs' order =#
+  local incidence::Dict{String, Vector{AliasEquation}} = Dict{String, Vector{AliasEquation}}()
+  for p in pairs
+    (p.equation in removed && (p.first in eliminatedSet || p.second in eliminatedSet)) || continue
+    push!(get!(() -> AliasEquation[], incidence, p.first), p)
+    p.second == p.first || push!(get!(() -> AliasEquation[], incidence, p.second), p)
+  end
   local equationOf = Dict{String, Int}()
   local variableOf = Dict{Int, String}()
   foreach(n -> augment!(n, Set{Int}(), incidence, variableOf, equationOf), eliminated)
@@ -345,12 +351,12 @@ end
     augment!(name, seen, incidence, variableOf, equationOf)
 
 Whether an augmenting path from the variable `name` pairs it with an equation of `incidence`
-(one not in `seen`), re-pairing the variables on the path.
+(one not in `seen`; `incidence`: the equations by variable), re-pairing the variables on the path. A scan of all the
+equations per step was quadratic (MSL EngineV6's known values: 6822 eliminated, 0.1 s).
 """
-function augment!(name::String, seen::Set{Int}, incidence::Vector{AliasEquation}, variableOf::Dict{Int, String},
+function augment!(name::String, seen::Set{Int}, incidence::Dict{String, Vector{AliasEquation}}, variableOf::Dict{Int, String},
                   equationOf::Dict{String, Int})::Bool
-  for p in incidence
-    (p.first == name || p.second == name) || continue
+  for p in get(incidence, name, AliasEquation[])
     p.equation in seen && continue
     push!(seen, p.equation)
     if !haskey(variableOf, p.equation) || augment!(variableOf[p.equation], seen, incidence, variableOf, equationOf)
@@ -414,7 +420,7 @@ replaces a free one of the representative. Of an Integer, Boolean or enumeration
 `start`, `fixed`, `min`, `max` (`not start` of a negated Boolean; a negated enumeration gives
 none); a representative without attributes of its own takes the alias's.
 """
-function mergeAliasAttributes(rep::SimVarAttributes, repType::SType, eliminated::SIMVAR, negated::Bool)::SimVarAttributes
+function mergeAliasAttributes(rep::SimVarAttributes, @nospecialize(repType::SType), eliminated::SIMVAR, negated::Bool)::SimVarAttributes
   local e = eliminated.attributes
   attributesGiven(eliminated.elementType, e) || return rep
   local t = eliminated.elementType

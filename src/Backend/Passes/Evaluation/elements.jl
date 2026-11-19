@@ -116,7 +116,7 @@ of any element type: a row of SVPWM's constant Boolean table by a discrete index
 generated lookup of the row was one term and its second element out of bounds).
 """
 function selectElement(@nospecialize(e::IR.Expression), subscripts::Vector{IR.Subscript},
-                       ty::IR.ModelicaType)::IR.Expression
+                       @nospecialize(ty::IR.ModelicaType))::IR.Expression
   isempty(subscripts) && return e
   if e isa IR.SUBSCRIPTED && count(s -> s isa IR.WHOLE, e.subscripts) == length(subscripts) &&
      all(s -> s isa Union{IR.INDEX, IR.WHOLE}, e.subscripts) && all(s -> s isa IR.INDEX, subscripts)

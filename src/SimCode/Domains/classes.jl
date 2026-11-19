@@ -88,21 +88,63 @@ struct EvFn <: IR
   id::Int
 end
 
-irKey(x::Lit) = x.v isa AbstractArray ? string("arr", objectid(x.v)) : repr(x.v)
+"""
+    irKey(x) -> String
 
-irKey(x::Slot) = string("\$", x.k)
+The key of the expression `x`: the same for expressions of one form (a literal array by its identity), and the order
+`_canonical` sorts terms by. Written into one buffer (`_irKey!`): a key built from the keys of its parts as strings took
+MSL EngineV6's `_reroll` 0.66 s.
+"""
+irKey(x::IR)::String = sprint(_irKey!, x)
 
-irKey(::TimeIR) = "time"
+"`x`'s key (`irKey`) written to `io`."
+function _irKey!(io::IO, x::Lit)::Nothing
+  x.v isa AbstractArray ? print(io, "arr", objectid(x.v)) : show(io, x.v)
+  return nothing
+end
+_irKey!(io::IO, x::Slot)::Nothing = print(io, "\$", x.k)
+_irKey!(io::IO, ::TimeIR)::Nothing = print(io, "time")
+function _irKey!(io::IO, x::Ref)::Nothing
+  print(io, x.der ? "der(" : "", x.name, "[")
+  _irKeys!(io, x.subs)
+  print(io, "]", x.der ? ")" : "")
+  return nothing
+end
+function _irKey!(io::IO, x::Pre)::Nothing
+  print(io, "pre(")
+  _irKey!(io, x.ref)
+  print(io, ")")
+  return nothing
+end
+function _irKey!(io::IO, x::Rel)::Nothing
+  print(io, "rel", x.id, x.op, "(")
+  _irKey!(io, x.lhs)
+  print(io, ",")
+  _irKey!(io, x.rhs)
+  print(io, ")")
+  return nothing
+end
+function _irKey!(io::IO, x::Op)::Nothing
+  print(io, x.op, "(")
+  _irKeys!(io, x.args)
+  print(io, ")")
+  return nothing
+end
+function _irKey!(io::IO, x::EvFn)::Nothing
+  print(io, "ev", x.id, x.kind, "(")
+  _irKey!(io, x.arg)
+  print(io, ")")
+  return nothing
+end
 
-irKey(x::Ref) = string(x.der ? "der(" : "", x.name, "[", join(irKey.(x.subs), ","), "]", x.der ? ")" : "")
-
-irKey(x::Pre) = string("pre(", irKey(x.ref), ")")
-
-irKey(x::Rel) = string("rel", x.id, x.op, "(", irKey(x.lhs), ",", irKey(x.rhs), ")")
-
-irKey(x::Op) = string(x.op, "(", join(irKey.(x.args), ","), ")")
-
-irKey(x::EvFn) = string("ev", x.id, x.kind, "(", irKey(x.arg), ")")
+"The keys of `xs` written to `io`, separated by commas."
+function _irKeys!(io::IO, xs::Vector{IR})::Nothing
+  for (k::Int, y::IR) in enumerate(xs)
+    k > 1 && print(io, ",")
+    _irKey!(io, y)
+  end
+  return nothing
+end
 
 """
 The variable accesses of an expression, in a fixed order (not those inside subscripts,
@@ -504,26 +546,35 @@ function _initAlgTargets(g::Gen, stmts::Vector{Stmt})
   end
 end
 
+"The terms of `t` into `terms`: a sum's, its nested sums' flattened; another expression itself."
+function _sumTerms!(terms::Vector{IR}, t::IR)::Vector{IR}
+  if t isa Op && t.op == :+
+    for a::IR in t.args
+      _sumTerms!(terms, a)
+    end
+  else
+    push!(terms, t)
+  end
+  return terms
+end
+
 """
 Sums as sorted term lists, so connection sums that list their terms in another order share
 a shape.
 """
 function _canonical(x::IR)::IR
   x isa Op || return x
-  local args = IR[_canonical(a) for a in x.args]
+  local args::Vector{IR} = IR[_canonical(a) for a in x.args]
   if x.op == :+
-    local terms = IR[]
-    local flat = function (t)
-      if t isa Op && t.op == :+
-        foreach(flat, t.args)
-      else
-        push!(terms, t)
-      end
+    local terms::Vector{IR} = IR[]
+    for a::IR in args
+      _sumTerms!(terms, a)
     end
-    foreach(flat, args)
-    sort!(terms; by = t -> irKey(_abstracted(t, Int[])))
-    local acc = terms[1]
-    for t in terms[2:end]
+    #= each term's key once (sort!'s `by` computes it per comparison) =#
+    local keys::Vector{String} = String[irKey(_abstracted(t, Int[])) for t in terms]
+    local sorted::Vector{IR} = terms[sortperm(keys)]
+    local acc::IR = sorted[1]
+    for t::IR in @view sorted[2:end]
       acc = Op(:+, IR[acc, t])
     end
     return acc
@@ -571,13 +622,20 @@ function _reroll(classes::Vector{EqClass})::Vector{EqClass}
       push!(out, c)
       continue
     end
-    local vals = Int[]
-    local (l, r) = (_canonical(c.lhs), _canonical(c.rhs))
-    #= a = b and b = a are one shape =#
-    irKey(_abstracted(l, Int[])) > irKey(_abstracted(r, Int[])) && ((l, r) = (r, l))
-    local lhs = _abstracted(l, vals)
-    local rhs = _abstracted(r, vals)
-    local key = irKey(lhs) * "=" * irKey(rhs)
+    local vals::Vector{Int} = Int[]
+    local (l::IR, r::IR) = (_canonical(c.lhs), _canonical(c.rhs))
+    local lhs::IR = _abstracted(l, vals)
+    local lhsKey::String = irKey(lhs)
+    #= a = b and b = a are one shape: the side of the smaller key first, its slots numbered first =#
+    local rhsKey::String = irKey(_abstracted(r, Int[]))
+    if lhsKey > rhsKey
+      (l, r) = (r, l)
+      empty!(vals)
+      lhs = _abstracted(l, vals)
+      lhsKey = rhsKey
+    end
+    local rhs::IR = _abstracted(r, vals)
+    local key::String = lhsKey * "=" * irKey(rhs)
     local gi = get(groups, key, 0)
     if gi == 0
       push!(members, (lhs, rhs, [vals], c.nrel, c.text))

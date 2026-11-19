@@ -334,7 +334,7 @@ end
     local s::AG.BlockSolver = AG.BlockSolver(S, AG.columnColors(S), copy(c))
     local residual!(r, y, du, a, u, p, t, z, mode, fire) = (a .= y; r .= y .- c; nothing)
     local (du::Vector{Float64}, a::Vector{Float64}) = (zeros(2), zeros(2))
-    AG.blockSolve!(s, residual!, du, a, Float64[], nothing, 0.0, nothing, false, false)
+    AG.blockSolve!(s, residual!, du, a, Float64[], nothing, 0.0, AG.NO_CROSSINGS, false, false)
     @test s.jacobians == 1
     @test a == c
   end
@@ -353,7 +353,7 @@ end
     local (du::Vector{Float64}, a::Vector{Float64}) = (zeros(1), zeros(1))
     local xs::Vector{Float64} = Float64[]
     for _ in 1:4
-      AG.blockSolve!(s, residual!, du, a, Float64[], nothing, 0.0, nothing, false, false)
+      AG.blockSolve!(s, residual!, du, a, Float64[], nothing, 0.0, AG.NO_CROSSINGS, false, false)
       push!(xs, a[1])
     end
     @test abs(xs[1]) < 1.0e-8
@@ -364,10 +364,10 @@ end
     local target::Base.RefValue{Float64} = Base.RefValue{Float64}(0.0)
     local shifted!(r, y, du, a, u, p, t, z, mode, fire) = (a .= y; r[1] = y[1] - target[]; nothing)
     local f::AG.BlockSolver = AG.BlockSolver(S, AG.columnColors(S), [0.0])
-    AG.blockSolve!(f, shifted!, du, a, Float64[], nothing, 0.0, nothing, false, false)
+    AG.blockSolve!(f, shifted!, du, a, Float64[], nothing, 0.0, AG.NO_CROSSINGS, false, false)
     f.rsolved = 1.0e-6
     target[] = 1.0e-7
-    AG.blockSolve!(f, shifted!, du, a, Float64[], nothing, 0.0, nothing, false, false)
+    AG.blockSolve!(f, shifted!, du, a, Float64[], nothing, 0.0, AG.NO_CROSSINGS, false, false)
     @test a[1] == 1.0e-7
   end
 
@@ -400,7 +400,7 @@ end
     for M in ([2.0 1.0; 1.0 3.0], [2.5 1.0; 0.5 3.0], [1.0e-3 1.0; 1.0 2.0])
       A[] = M
       local before::Int = s.residuals
-      AG.blockSolve!(s, residual!, du, a, Float64[], nothing, 0.0, nothing, false, false)
+      AG.blockSolve!(s, residual!, du, a, Float64[], nothing, 0.0, AG.NO_CROSSINGS, false, false)
       @test a ≈ M \ b rtol = 1e-12
       #= the residuals at the guess, at the kept factors' step, two colors, at the step =#
       @test s.residuals - before <= 5
@@ -408,7 +408,7 @@ end
     @test s.jacobians == 3
     #= a matrix that has not moved (a circuit between switchings): the kept factors' step, no Jacobian =#
     local before::Int = s.residuals
-    AG.blockSolve!(s, residual!, du, a, Float64[], nothing, 0.0, nothing, false, false)
+    AG.blockSolve!(s, residual!, du, a, Float64[], nothing, 0.0, AG.NO_CROSSINGS, false, false)
     @test s.residuals - before == 2
     @test s.jacobians == 3
   end
@@ -489,6 +489,19 @@ end
     @test maximum(abs.(ss .- as)) < 1e-8
   end
 
+  @testset "Emission: slots of one value folded" begin
+    local AG::Module = OMBackend.CodeGeneration.ArrayODEGen
+    local row::Expr = :(a[2569 + (s5 - 1)] = P[s1, s2] * u[3 + (_col - 1) * 2 + 1] + s1 * 0.5)
+    local x::Any = AG._foldSlots(row, Dict{Symbol, Int}(:s5 => 1, :s1 => 1, :s2 => 2, :_col => 3))
+    @test x == :(a[2569] = P[1, 2] * u[8] + 1 * 0.5)
+    @test row == :(a[2569 + (s5 - 1)] = P[s1, s2] * u[3 + (_col - 1) * 2 + 1] + s1 * 0.5)
+    #= One column: no slot bound; an affine range: only the slots that vary =#
+    local one::Expr = AG._loopCode(2, [4; 7;;], [1], :(a[s1 + s2] = 0.0))
+    @test one == Expr(:let, Expr(:block), :(a[11] = 0.0))
+    local loop::Expr = AG._loopCode(2, [4 4; 7 8], [1, 2], :(a[s1 + s2] = 0.0))
+    @test loop.head === :for && !occursin("s1", string(loop)) && occursin("s2", string(loop))
+  end
+
   @testset "Time-invariant rows: in invariants! only, per solve; the callbacks' types erased" begin
     #= n and c read parameters only (SimCode Domains: invariant rows): invariants! computes them once per solve,
        equations! (the relation's event, the observed values) calls it and holds no copy. MSL EngineV6: such rows were
@@ -524,6 +537,14 @@ end
     @test all(c -> c.condition isa OMBackend.CodeGeneration._ErasedCall && c.affect! isa OMBackend.CodeGeneration._ErasedCall,
               callbacks)
     @test !any(c -> occursin(name, string(typeof(c))), callbacks)
+    #= equations! and invariants! in the submodule ColdCode at LLVM level 0 (not called in the solver's steps), RHS! in
+       the model module at its level; the module's equations! is ColdCode's =#
+    local mod::Module = OMBackend._modelModule(Symbol(name))
+    local cold::Module = getglobal(mod, :ColdCode)
+    @test ccall(:jl_get_module_optlevel, Cint, (Any,), cold) == 0
+    @test ccall(:jl_get_module_optlevel, Cint, (Any,), mod) != 0
+    @test parentmodule(getglobal(mod, :equations!)) === cold && parentmodule(getglobal(mod, :invariants!)) === cold
+    @test parentmodule(getglobal(mod, :RHS!)) === mod
   end
 
   @testset "The time derivative's step does not grow with time" begin
@@ -980,7 +1001,7 @@ end DivideInLoop;
     local b::Vector{Float64} = A * [1.0, 2.0]
     local solver = generation.BlockSolver(generation._SPARSE.sparse(ones(2, 2)), [1, 2], [0.0, 0.0])
     local residual! = (res, y, du, a, u, p, t, z, mode, fire) -> (res .= A * y .- b; a .= y; nothing)
-    generation.blockSolve!(solver, residual!, zeros(1), zeros(2), zeros(1), nothing, 0.0, nothing, false, false)
+    generation.blockSolve!(solver, residual!, zeros(1), zeros(2), zeros(1), nothing, 0.0, generation.NO_CROSSINGS, false, false)
     @test solver.failures == 0
     @test isapprox(solver.x, [1.0, 2.0]; rtol = 1e-5)
   end
@@ -998,7 +1019,7 @@ end DivideInLoop;
     plain.x .= plain.y
     @test !generation._blockAttempt!(plain, residual!, arguments, :full)
     local solver = generation.BlockSolver(generation._SPARSE.sparse(ones(2, 2)), [1, 2], [3.0, 0.0])
-    generation.blockSolve!(solver, residual!, zeros(1), zeros(2), zeros(1), nothing, 0.0, nothing, false, false)
+    generation.blockSolve!(solver, residual!, zeros(1), zeros(2), zeros(1), nothing, 0.0, generation.NO_CROSSINGS, false, false)
     @test solver.failures == 0
     @test isapprox(solver.x, [1.5, 1.5]; atol = 1e-8)
     #= residuals that throw at every iterate (the cosine of an infinite angle; from the varied start values too): a
@@ -1007,7 +1028,7 @@ end DivideInLoop;
     local throwing! = (res, y, du, a, u, p, t, z, mode, fire) ->
       (res[1] = cos(1.0 / (y[1] - y[1])); res[2] = y[2]; nothing)
     local thrown = generation.BlockSolver(generation._SPARSE.sparse(ones(2, 2)), [1, 2], [1.0, 1.0])
-    generation.blockSolve!(thrown, throwing!, zeros(1), zeros(2), zeros(1), nothing, 0.0, nothing, false, false)
+    generation.blockSolve!(thrown, throwing!, zeros(1), zeros(2), zeros(1), nothing, 0.0, generation.NO_CROSSINGS, false, false)
     @test thrown.failures == 1
     @test all(isnan, thrown.x)
     #= start values at which a residual is stationary in its unknown (a MOSFET's current, even in the drain-source
@@ -1019,7 +1040,7 @@ end DivideInLoop;
     still.x .= still.y
     @test !(generation._blockAttempt!(still, even!, arguments, :full) && !still.rankDeficient)
     local varied = generation.BlockSolver(generation._SPARSE.sparse(ones(2, 2)), [1, 2], [0.0, 0.0])
-    generation.blockSolve!(varied, even!, zeros(1), zeros(2), zeros(1), nothing, 0.0, nothing, false, false)
+    generation.blockSolve!(varied, even!, zeros(1), zeros(2), zeros(1), nothing, 0.0, generation.NO_CROSSINGS, false, false)
     @test varied.failures == 0
     @test isapprox(varied.x, [5.0, 0.0]; atol = 1e-8)
   end
@@ -1040,7 +1061,7 @@ end DivideInLoop;
       @test !(generation._blockAttempt!(plain, limiter!, arguments, kind) && !plain.rankDeficient)
     end
     local solver = generation.BlockSolver(generation._SPARSE.sparse(ones(2, 2)), [1, 2], [1.6e-3, 0.0])
-    generation.blockSolve!(solver, limiter!, zeros(1), zeros(2), zeros(1), nothing, 0.0, nothing, false, false)
+    generation.blockSolve!(solver, limiter!, zeros(1), zeros(2), zeros(1), nothing, 0.0, generation.NO_CROSSINGS, false, false)
     @test solver.failures == 0
     @test isapprox(solver.x, [1.6e-3 + 9.9e-9, 9.9]; rtol = 1e-12)
   end
@@ -3460,5 +3481,30 @@ end DivideInLoop;
     local name::String = _translateProgram(program, "ByIndex.EnumerationString"; scalarized = false)
     @test _arrayPathTaken(name)
     @test_logs (:warn, r"e=  three\|$") match_mode = :any OMBackend.simulateModel(name; tspan = (0.0, 1.0))
+  end
+
+  @testset "A translate of unchanged code keeps the module; changed code evaluates it again" begin
+    #= a model of a file simulated again is translated again: its module was compiled again (BouncingBall: 0.7 s) =#
+    local decay(rate::String) = OMFrontend.OMParser.@Modelica """
+      model KeptDecay
+        Real x[2](each start = 1.0, each fixed = true);
+      equation
+        der(x) = {-x[1], -$(rate) * x[2]};
+      end KeptDecay;
+      """
+    local name::String = _translateProgram(decay("2.0"), "KeptDecay"; scalarized = false)
+    @test _arrayPathTaken(name)
+    OMBackend.simulateModel(name; tspan = (0.0, 1.0))
+    local evaluated::Module = OMBackend._modelModule(Symbol(name))
+    _translateProgram(decay("2.0"), "KeptDecay"; scalarized = false)
+    @test !OMBackend.modelWasCompiledAgainDE(name)
+    local sol = OMBackend.simulateModel(name; tspan = (0.0, 1.0), reltol = 1e-8, abstol = 1e-10)
+    @test OMBackend._modelModule(Symbol(name)) === evaluated
+    @test _values(sol, ["x[1]", "x[2]"]) ≈ [exp(-1.0), exp(-2.0)] rtol = 1e-6
+    _translateProgram(decay("3.0"), "KeptDecay"; scalarized = false)
+    @test OMBackend.modelWasCompiledAgainDE(name)
+    sol = OMBackend.simulateModel(name; tspan = (0.0, 1.0), reltol = 1e-8, abstol = 1e-10)
+    @test OMBackend._modelModule(Symbol(name)) !== evaluated
+    @test _values(sol, ["x[1]", "x[2]"]) ≈ [exp(-1.0), exp(-3.0)] rtol = 1e-6
   end
 end

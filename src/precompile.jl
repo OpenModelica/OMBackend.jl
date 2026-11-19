@@ -223,6 +223,26 @@ function _irCounter(name::String)::OMJLIR.Model
 end
 
 """
+`model Guard parameter Real a = 1; Real x(start = 1, fixed = true); equation der(x) = -homotopy(a * x, x);
+assert(x > 0.5, "x below 0.5", AssertionLevel.warning); end Guard;` in OMJLIR, named `name`: homotopy() and an assert
+that a crossing violates (a warning at t = log(2)).
+"""
+function _irGuard(name::String)::OMJLIR.Model
+  local level::OMJLIR.ENUM_LITERAL =
+    OMJLIR.ENUM_LITERAL(OMJLIR.T_ENUMERATION(:AssertionLevel, Symbol[:warning, :error]), :warning, 1)
+  local guard::OMJLIR.ASSERT_EQUATION =
+    OMJLIR.ASSERT_EQUATION(OMJLIR.RELATION(_irReal(:x), OMJLIR.GREATER, OMJLIR.REAL(0.5), 0), OMJLIR.STRING("x below 0.5"),
+                           level, OMJLIR.NO_SOURCE)
+  local blend::OMJLIR.CALL =
+    OMJLIR.CALL(:homotopy, OMJLIR.Expression[_irBinary(_irReal(:a), OMJLIR.MUL, _irReal(:x)), _irReal(:x)],
+                OMJLIR.T_REAL(), OMJLIR.BUILTIN_CALL)
+  return _irModel(name, OMJLIR.Variable[_irVariable(:a, OMJLIR.PARAMETER(); binding = 1.0),
+                                        _irVariable(:x, OMJLIR.ALGEBRAIC(); start = 1.0)],
+                  OMJLIR.Equation[_irEquation(_irBuiltin(:der, _irReal(:x)), OMJLIR.UNARY(OMJLIR.UMINUS, blend, OMJLIR.T_REAL())),
+                                  guard])
+end
+
+"""
     _precompileIRModel(model::Function, name::String, arrayCode::Bool) -> Nothing
 
 The OMJLIR model `model(name)` translated as OMJL's `translate` does after a frontend's lowering, by the array code
@@ -247,8 +267,9 @@ function _precompileIRModel(model::Function, name::String, arrayCode::Bool)::Not
 end
 
 """
-The OMJLIR workload (`_precompileIRModel`): Decay and Counter by the array code and by the passes and `translate`, the
-registries restored afterwards (`_registries`). A frontend's translate workload adds the lowering and the passes of
+The OMJLIR workload (`_precompileIRModel`): Decay and Counter by the array code and by the passes and `translate`, Guard
+by the array code (its asserts' and homotopy()'s drivers: arrayAsserts.jl, arrayInitialization.jl), the registries
+restored afterwards (`_registries`). A frontend's translate workload adds the lowering and the passes of
 larger models (OMBackendOMFrontendExt); the build and the solve compile here, where OMBackend is open.
 """
 function _precompileWarmupIR()::Nothing
@@ -258,9 +279,43 @@ function _precompileWarmupIR()::Nothing
       _precompileIRModel(model, name * "Arrays", true)
       _precompileIRModel(model, name, false)
     end
+    _precompileIRModel(_irGuard, "OMBackendIRWorkloadGuardArrays", true)
   finally
     _restoreRegistries!(registries)
   end
+  return nothing
+end
+
+"The residual of `_precompileWarmupArrayHelpers`'s initial system: z = (1, 2), two blocks."
+function _precompileResidual!(res::AbstractVector, z::AbstractVector)::Nothing
+  res[1] = z[1] - 1.0
+  res[2] = z[2] - 2.0 * z[1]
+  return nothing
+end
+
+"`_precompileResidual!` as NonlinearSolve calls it (`newtonInitialSolve`), with its parameters."
+_precompileResidual!(res::AbstractVector, z::AbstractVector, ::Any)::Nothing = _precompileResidual!(res, z)
+
+"""
+    _precompileWarmupArrayHelpers() -> Nothing
+
+The array code's helpers that every array model calls with its own functions (`@nospecialize`: compiled once, for
+`Function`), into the image: the initial system's solve (`sortedInitialSolve`, `scaledTrustRegionSolve`: NonlinearSolve's
+TrustRegion over `_ScaledResidual`; `newtonInitialSolve`), the asserts' step-start state (`_withDiscreteState`) and the
+relation search of an event iteration. Without them, a process's first model with asserts or an initial system compiled them (PID_Controller
+0.14 s, 2026-11-18).
+"""
+function _precompileWarmupArrayHelpers()::Nothing
+  local AG::Module = CodeGeneration.ArrayODEGen
+  for reads::Union{Nothing, Vector{Vector{Int}}} in (nothing, [[1], [1, 2]])
+    AG.sortedInitialSolve(_precompileResidual!, [0.0, 0.0], [1.0, 1.0], reads)
+  end
+  AG.newtonInitialSolve(_precompileResidual!, [0.0, 0.0])
+  local P::DataType = AG.ArrayModelParameters
+  local V::DataType = Vector{Float64}
+  precompile(AG._withDiscreteState, (Function, P, Tuple{V, V, Vector{Bool}, V}))
+  precompile(AG._searchRelations!, (Function, Function, V, V, V, P, Float64, Bool, Vector{Bool}, V, BitVector, Vector{Int},
+                                    BitVector))
   return nothing
 end
 
@@ -281,6 +336,11 @@ end
         catch err
           @warn "[OMBackend] DirectRHS precompile warmup skipped" eventful exception = (err, catch_backtrace())
         end
+      end
+      try
+        _precompileWarmupArrayHelpers()
+      catch err
+        @warn "[OMBackend] array helpers precompile warmup skipped" exception = (err, catch_backtrace())
       end
       try
         Base.CoreLogging.with_logger(_precompileWarmupIR, Base.CoreLogging.NullLogger())
