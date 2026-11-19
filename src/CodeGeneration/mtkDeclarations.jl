@@ -82,151 +82,43 @@ function decomposeVariables(stateVariables::Vector{Symbol}, algebraicVariables::
 end
 
 """
-  Decomposes equations into chunked constructor functions.
-  Returns (outer_defs, inner_refs) where:
-  - outer_defs: function definitions at module level
-  - inner_refs: parameter assignments + equationConstructorCalls array (inside model function)
-  The `modelPrefix` avoids name collisions when multiple models are translated in one session.
+    decomposeEquationsInline(equations, parameterAssignments, components; chunkSize) -> Expr
+
+The model function's code that pushes `equations` to its vector `components`, `chunkSize` at a time, each chunk as
+`push!(components, Base.invokelatest(() -> Symbolics.Equation[...]))` after `parameterAssignments`. The chunks read
+the model function's locals (its `@parameters`); `hoistBuildClosures!` makes each a function of the module that takes
+them as arguments, since Julia's lowering of a function is quadratic in its closures (a 4000-element chain: 480 chunk
+closures in the model function, 10 s to lower it).
 """
-function decomposeEquations(equations, parameterAssignments; modelPrefix::String = "", chunkSize::Int = CHUNK_SIZE[])
-  local equationVectors = collect(Iterators.partition(equations, chunkSize))
-  local outerDefs = Expr[]
-  local functionNames = Symbol[]
-  local i = 0
-  for equationVector in equationVectors
-    local eqv = collect(equationVector)
-    local fName = Symbol(modelPrefix, "generateEquations", i)
-    push!(outerDefs, quote
-      function $(fName)()
-        [$(eqv...)]
-      end
-    end)
-    push!(functionNames, fName)
-    i += 1
+function decomposeEquationsInline(equations::Vector, parameterAssignments::Vector, components::Symbol;
+                                  chunkSize::Int = CHUNK_SIZE[])::Expr
+  local exprs::Vector{Any} = Any[parameterAssignments...]
+  for equationVector in Iterators.partition(equations, chunkSize)
+    local (csEqs, csPreamble) = extractCommonHvcats(collect(equationVector))
+    push!(exprs, :(push!($(components), Base.invokelatest(() -> begin
+      $(csPreamble...)
+      Symbolics.Equation[$(csEqs...)]
+    end))))
   end
-  local outerExpr = quote
-    $(outerDefs...)
-  end
-  local innerExpr = quote
-    $(parameterAssignments...)
-    local equationConstructors::Vector{Function}
-    local equationConstructorCalls::Vector
-    equationConstructorCalls = [$(functionNames...)]
-  end
-  return (outerExpr, innerExpr)
+  return Expr(:block, exprs...)
 end
 
 """
-  Decomposes start equations into chunked constructor functions.
-  Returns (outer_defs, inner_refs) where:
-  - outer_defs: function definitions at module level
-  - inner_refs: startEquationConstructors array assignment (inside model function)
-  The `modelPrefix` avoids name collisions, `functionSuffix` differentiates initial vs final start eqs.
-"""
-function decomposeStartEquations(equations; functionSuffix = "", modelPrefix::String = "", chunkSize::Int = CHUNK_SIZE[])
-  local equationVectors = collect(Iterators.partition(equations, chunkSize))
-  local outerDefs = Expr[]
-  local constructorNames = Symbol[]
-  local i = 0
-  for equationVector in equationVectors
-    local fName = Symbol(modelPrefix, "generateStartEquations", functionSuffix, i)
-    push!(outerDefs, quote
-      function $(fName)()
-        [$(equationVector...)]
-      end
-    end)
-    push!(constructorNames, fName)
-    i += 1
-  end
-  local outerExpr = quote
-    $(outerDefs...)
-  end
-  local innerExpr = quote
-    startEquationConstructors = Function[$(constructorNames...)]
-  end
-  return (outerExpr, innerExpr)
-end
+    decomposeStartEquationsInline(equations, components; chunkSize) -> Expr
 
+The model function's code that pushes the start equations (`x => value`) `equations` to its vector `components`,
+`chunkSize` at a time, as `decomposeEquationsInline` does.
 """
-  Inline variant of decomposeEquations that keeps function definitions inside
-  the model function body. Equation expressions reference parameter symbols that
-  are local to the model function (created by @parameters), so they cannot be
-  moved to module level.
-"""
-function decomposeEquationsInline(equations, parameterAssignments; chunkSize::Int = CHUNK_SIZE[])
-  local equationVectors = collect(Iterators.partition(equations, chunkSize))
-  local exprs = Expr[]
-  local functionNames = Symbol[]
-  local constructors = quote
-    $(parameterAssignments...)
-    local equationConstructors::Vector{Function}
-    local equationConstructorCalls::Vector{Function}
+function decomposeStartEquationsInline(equations::Vector, components::Symbol; chunkSize::Int = CHUNK_SIZE[])::Expr
+  local exprs::Vector{Any} = Any[]
+  for equationVector in Iterators.partition(equations, chunkSize)
+    local (csEqs, csPreamble) = extractCommonHvcats(collect(equationVector))
+    push!(exprs, :(push!($(components), Base.invokelatest(() -> begin
+      $(csPreamble...)
+      [$(csEqs...)]
+    end))))
   end
-  push!(exprs, constructors)
-  local i = 0
-  for equationVector in equationVectors
-    local eqv = collect(equationVector)
-    local (csEqs, csPreamble) = extractCommonHvcats(eqv)
-    local fName = Symbol("generateEquations", i)
-    if isempty(csPreamble)
-      push!(exprs, quote
-        function $(fName)()
-          Symbolics.Equation[$(eqv...)]
-        end
-      end)
-    else
-      push!(exprs, quote
-        function $(fName)()
-          $(csPreamble...)
-          Symbolics.Equation[$(csEqs...)]
-        end
-      end)
-    end
-    push!(functionNames, fName)
-    i += 1
-  end
-  return quote
-    $(exprs...)
-    equationConstructorCalls = [$(functionNames...)]
-  end
-end
-
-"""
-  Inline variant of decomposeStartEquations that keeps function definitions inside
-  the model function body. Start equations reference symbols that may be local to
-  the model function (created by @parameters or phase 3 eval), so they cannot be
-  moved to module level.
-"""
-function decomposeStartEquationsInline(equations; functionSuffix = "", chunkSize::Int = CHUNK_SIZE[])
-  local equationVectors = collect(Iterators.partition(equations, chunkSize))
-  local exprs = Expr[]
-  local constructorNames = Symbol[]
-  local i = 0
-  for equationVector in equationVectors
-    local eqv = collect(equationVector)
-    local (csEqs, csPreamble) = extractCommonHvcats(eqv)
-    local fName = Symbol("generateStartEquations", functionSuffix, i)
-    if isempty(csPreamble)
-      push!(exprs, quote
-        function $(fName)()
-          [$(eqv...)]
-        end
-      end)
-    else
-      push!(exprs, quote
-        function $(fName)()
-          $(csPreamble...)
-          [$(csEqs...)]
-        end
-      end)
-    end
-    push!(constructorNames, fName)
-    i += 1
-  end
-  return quote
-    $(exprs...)
-    startEquationConstructors = Function[$(constructorNames...)]
-  end
+  return Expr(:block, exprs...)
 end
 
 """
@@ -332,38 +224,21 @@ function decomposeParametersDeclaration(parVariablesSym; unassigned::Set{Symbol}
 end
 
 """
-  Chunks parameter equations (sym => value pairs) into small inner functions
-  to reduce JIT overhead from compiling one massive Dict literal.
-  Each chunk function returns a Dict of parameter pairs. Results are
-  merged into the final pars Dict via invokelatest.
+    decomposeParameterEquationsInline(parameterEquations; chunkSize) -> Expr
 
-  Parameter equations reference @parameters symbols which are local to the
-  model function, so chunk functions are defined inline as closures.
+The model function's code that sets `pars`, the parameter equations' (`p => value`) Dict: in one literal up to
+`chunkSize` of them, else `chunkSize` at a time, each chunk as `merge!(pars, Base.invokelatest(() -> Dict(...)))`
+(a function of the module, `decomposeEquationsInline`).
 """
-function decomposeParameterEquationsInline(parameterEquations; chunkSize = CHUNK_SIZE[])
+function decomposeParameterEquationsInline(parameterEquations::Vector; chunkSize::Int = CHUNK_SIZE[])::Expr
   if length(parameterEquations) <= chunkSize
     return :(pars = Dict($(parameterEquations...)))
   end
-  local chunks = collect(Iterators.partition(parameterEquations, chunkSize))
-  local exprs = Expr[]
-  local constructorNames = Symbol[]
-  for (i, chunk) in enumerate(chunks)
-    local fName = Symbol("_generatePars_", i - 1)
-    local chunkExprs = collect(chunk)
-    push!(exprs, quote
-      function $(fName)()
-        Dict($(chunkExprs...))
-      end
-    end)
-    push!(constructorNames, fName)
+  local exprs::Vector{Any} = Any[:(pars = Dict{Any, Any}())]
+  for chunk in Iterators.partition(parameterEquations, chunkSize)
+    push!(exprs, :(merge!(pars, Base.invokelatest(() -> Dict($(chunk...))))))
   end
-  return quote
-    $(exprs...)
-    pars = Dict{Any,Any}()
-    for _parFn in [$(constructorNames...)]
-      merge!(pars, Base.invokelatest(_parFn))
-    end
-  end
+  return Expr(:block, exprs...)
 end
 
 """
