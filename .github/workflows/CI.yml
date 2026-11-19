@@ -183,8 +183,8 @@ jobs:
           OMBACKEND_TEST_GROUP: ${{ matrix.group }}
         with:
           project: OMBackend.jl
-          # Coverage on Linux only: the whole suite runs there (Codecov merges
-          # the two shards' uploads of a commit). Coverage of a
+          # Coverage on Linux only: the whole suite runs there (the job
+          # `coverage` merges the two shards' lcov files). Coverage of a
           # path (`@OMBackend.jl`) still loads the dependencies' package images
           # from the cache (the cache report shows them on Linux).
           coverage: ${{ runner.os == 'Linux' }}
@@ -201,15 +201,14 @@ jobs:
         with:
           directories: OMBackend.jl/src
 
-      - name: Upload coverage to Codecov
+      # the shard's lcov file for the job `coverage` (no external service)
+      - name: Upload the shard's coverage
         if: runner.os == 'Linux'
-        uses: codecov/codecov-action@v4
-        # an upload problem (Codecov's service or network) must not fail the tests
-        continue-on-error: true
+        uses: actions/upload-artifact@v4
         with:
-          files: lcov.info
-          token: ${{ secrets.CODECOV_TOKEN }}
-          fail_ci_if_error: false
+          name: coverage-${{ matrix.group }}
+          path: lcov.info
+          retention-days: 14
 
       - name: Email maintainer on nightly failure
         if: ${{ failure() && github.event_name == 'schedule' && env.MAIL_CONFIGURED == 'true' }}
@@ -231,3 +230,40 @@ jobs:
             Commit:       ${{ github.sha }}
             Branch:       ${{ github.ref_name }}
             Matrix:       ${{ matrix.os }} / Julia ${{ matrix.version }} / ${{ matrix.arch }}
+
+  # The Linux shards' coverage merged: the percentage and a table per file in the job summary, the merged lcov file
+  # an artifact (utilities/coverageSummary.jl; no external service). Also after a failed shard: the coverage of
+  # what ran.
+  coverage:
+    name: Coverage
+    needs: test
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout OMBackend.jl
+        uses: actions/checkout@v4
+
+      - name: Download the shards' coverage
+        uses: actions/download-artifact@v4
+        with:
+          pattern: coverage-*
+          path: shards
+
+      - name: Set up Julia
+        uses: julia-actions/setup-julia@v2
+        with:
+          version: '1.13'
+
+      - name: Merge and summarize
+        shell: bash
+        run: |
+          shopt -s nullglob
+          julia --startup-file=no utilities/coverageSummary.jl lcov.info shards/*/lcov.info >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the merged coverage
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-merged
+          path: lcov.info
+          retention-days: 30
