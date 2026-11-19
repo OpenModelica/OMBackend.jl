@@ -297,6 +297,44 @@ end
     end
   end
 
+  #= the events among a model's callbacks (isEventCallback): an assert and a run's bookkeeping are none (OM.eventCount
+     counted the assert check on the scalarizing route, the start state, first step and assert callbacks on the
+     arrays-kept one: a UDE over the model refused); a relation is one =#
+  @testset "Event callbacks: asserts and bookkeeping are no events" begin
+    local program = Modelica"""
+      package EventKinds
+        model Asserted
+          Real x[2](each start = 1, each fixed = true);
+        equation
+          der(x) = -{1, 2} .* x;
+          assert(x[1] > 0.1, "x[1] too small");
+        end Asserted;
+        model Switched
+          Real x[2](each start = 1, each fixed = true);
+          Real y;
+        equation
+          der(x) = -{1, 2} .* x;
+          y = if x[1] > 0.5 then 1 else 0;
+        end Switched;
+      end EventKinds;
+      """
+    local events = cb -> cb === nothing ? 0 :
+      cb isa OMBackend.CodeGeneration.DiffEqBase.CallbackSet ?
+        count(OMBackend.isEventCallback, cb.continuous_callbacks) + count(OMBackend.isEventCallback, cb.discrete_callbacks) :
+        Int(OMBackend.isEventCallback(cb))
+    for scalarized in ROUTES
+      local asserted::String = _translateProgram(program, "EventKinds.Asserted"; scalarized)
+      local sol = OMBackend.simulateModel(asserted; tspan = (0.0, 1.0))
+      @test sol.retcode == ReturnCode.Success
+      @test OMBackend.eventCallbacks(asserted) !== nothing
+      @test events(OMBackend.eventCallbacks(asserted)) == 0
+      @test events(get(sol.prob.kwargs, :callback, nothing)) == 0
+      local switched::String = _translateProgram(program, "EventKinds.Switched"; scalarized)
+      @test events(OMBackend.eventCallbacks(switched)) > 0
+      @test _values(OMBackend.simulateModel(switched; tspan = (0.0, 1.0)), ["y"]) == [0.0]
+    end
+  end
+
   #= a tuple equation with a record target and fewer targets than outputs: q its position 3 (r.a, r.b, q); the
      scalarizing route =#
   if true in ROUTES

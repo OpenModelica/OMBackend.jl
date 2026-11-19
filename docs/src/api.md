@@ -33,6 +33,7 @@ OMBackend.defaultSolver
 OMBackend.daeFallbackSolver
 OMBackend.getVariableValues
 OMBackend.eventCallbacks
+OMBackend.isEventCallback
 OMBackend.isStepControl
 OMBackend.ModelicaAssertionError
 OMBackend.plot

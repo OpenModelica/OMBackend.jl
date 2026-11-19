@@ -61,14 +61,14 @@ include("$CURRENT_DIRECTORY/CodeGeneration/IMTKGen.jl")
 include("backendUtils.jl")
 #= Finally add the API=#
 include("backendAPI.jl")
-using .CodeGeneration: ModelicaAssertionError, isStepControl
+using .CodeGeneration: ModelicaAssertionError, isStepControl, isEventCallback
 using .SimCode: EliminationOptions
 #= The public API: these names hold for all of 1.x (docs/src/api.md, test/publicAPITests.jl). Nothing is exported:
    call them as `OMBackend.name`. Every other name is internal and may change in any release. =#
 public translate, translateReducedArrays, generateTargetCode, knownValues, BackendMode, IMTK_MODE, MTK_MODE,
   EliminationOptions, explainIndexReduction, scalarizedFallbackReason, canonicalName
 public simulateModel, resimulateModel, getMTKProblem, defaultSolver, daeFallbackSolver, getVariableValues,
-  eventCallbacks, isStepControl, ModelicaAssertionError, plot
+  eventCallbacks, isEventCallback, isStepControl, ModelicaAssertionError, plot
 public withTunableParameters, isTunable, pristineParameters
 public availableModels, printModel, modelToString, writeModelToFile, dumpGeneratedCode
 public clearCaches!, forgetModel

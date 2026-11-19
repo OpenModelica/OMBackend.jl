@@ -301,8 +301,8 @@ function withDelayRecords(callbacks, problem, model::Symbol, args::Vector, delay
     return false
   end
   local never! = integrator -> nothing
-  local cbStepEnd = DiffEqBase.DiscreteCallback(stepEnd, never!; save_positions = (false, false))
-  local cbAfterEvents = DiffEqBase.DiscreteCallback(afterEvents, never!; initialize = start!,
+  local cbStepEnd = DiffEqBase.DiscreteCallback(NotAnEvent(stepEnd), never!; save_positions = (false, false))
+  local cbAfterEvents = DiffEqBase.DiscreteCallback(NotAnEvent(afterEvents), never!; initialize = start!,
                                                     save_positions = (false, false))
   return _joinCallbacks(cbStepEnd, callbacks, cbAfterEvents)
 end
