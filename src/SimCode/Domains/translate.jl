@@ -652,6 +652,11 @@ function _valueIRx(g::Gen, e::SC.Exp, ctx::Ctx)::IR
   if e isa SC.EXP_CREF && isempty(e.cref.subs)
     local whole::Union{Nothing, IR} = _wholeArrayIRx(g, String(e.cref.sym))
     whole === nothing || return whole
+    #= a parameter array as a whole (a table's `table` given to its constructor, MSL ComparisonPullInStroke's 530 x 4):
+       its value =#
+    local param::Union{Nothing, VarInfo} = get(g.vars, String(e.cref.sym), nothing)
+    (param !== nothing && param.kind == :param && param.vtype != :other && !isempty(param.dims)) &&
+      return Ref(String(e.cref.sym), IR[], false)
   end
   #= pre() of an array variable as a whole (`random(pre(state))`, MSL's random number generators): the array of
      pre() of its elements =#

@@ -1773,6 +1773,8 @@ function jl(g::Gen, x::IR)
       info.vtype == :other && ns("parameter $(x.name) of a type the array path does not pass")
       local v = _paramValue!(g, x.name)
       v isa AbstractArray || return g.paramSyms[x.name]
+      #= a parameter array as a whole (a function's argument, `_valueIRx`): its value =#
+      isempty(x.subs) && return g.paramSyms[x.name]
       local (psym, pidx) = (g.paramSyms[x.name], Any[jl(g, s) for s in x.subs])
       return _discreteRead(info, all(_staticSubscript, x.subs) ? Expr(:ref, psym, pidx...) :
                                                                  Expr(:call, _checkedIndex, psym, pidx...))

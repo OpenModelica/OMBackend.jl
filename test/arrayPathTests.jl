@@ -3678,4 +3678,39 @@ end DivideInLoop;
                   tspan = (0.0, 0.1), reltol = 1e-8, abstol = 1e-10)
     @test a ≈ s rtol = 1e-6
   end
+
+  @testset "A parameter array as a whole as a function's argument: its value" begin
+    #= MSL ComparisonPullInStroke: CombiTimeTable's 530 x 4 table given to its constructor, more elements than an
+       argument's literal takes (MAX_ELEMENT_TERMS), read as a scalar (the MTK fallback before). y = k t: x(1) = k / 2 =#
+    local tables = Modelica"""
+      package Tab
+        function interpolate "linear interpolation in the rows of a table {t, y}"
+          input Real table[:, 2];
+          input Real t;
+          output Real y;
+        protected
+          Integer i = 1;
+        algorithm
+          while i < size(table, 1) - 1 and t > table[i + 1, 1] loop
+            i := i + 1;
+          end while;
+          y := table[i, 2] + (table[i + 1, 2] - table[i, 2]) * (t - table[i, 1]) / (table[i + 1, 1] - table[i, 1]);
+          annotation(Inline = false);
+        end interpolate;
+        model TableArgument "a table of 501 x 2 = 1002 elements"
+          parameter Real k = 2;
+          parameter Real table[501, 2] = {{(i - 1) / 500, k * (i - 1) / 500} for i in 1:501};
+          Real x(start = 0, fixed = true);
+          Real y;
+        equation
+          y = interpolate(table, time);
+          der(x) = y;
+        end TableArgument;
+      end Tab;
+      """
+    local name::String = _translateProgram(tables, "Tab.TableArgument"; scalarized = false)
+    @test _arrayPathTaken(name)
+    local sol = OMBackend.simulateModel(name; tspan = (0.0, 1.0), reltol = 1e-10, abstol = 1e-12)
+    @test _values(sol, ["y", "x"]) ≈ [2.0, 1.0] rtol = 1e-8
+  end
 end
