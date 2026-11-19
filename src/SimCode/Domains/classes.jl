@@ -305,6 +305,18 @@ struct DelaySite
   time::IR
 end
 
+"""
+An external object the code reads (`_objectRead`, `_objectElementRead`), made once per build: its label (the
+parameter, `name[i,j]` for an element of an array of them), the parameter it is of, its constructor's call and its
+destructor's name.
+"""
+struct ObjectSlot
+  label::String
+  param::String
+  value::IR
+  destructor::String
+end
+
 mutable struct Gen
   vars::Dict{String, VarInfo}
   nStates::Int
@@ -333,8 +345,8 @@ mutable struct Gen
   derOf::Dict{String, String}   #= the states' derivative links (SimCode's STATE_DERIVATIVE entries): \$STATEDER.x -> x =#
   startComputed::Set{String}    #= parameters the translation has no value of (an impure call): computed at each start =#
   strings::Vector{Tuple{String, String}}  #= String parameters the code reads (name, translated value): the run state's slots =#
-  #= the external objects the code reads (name, constructor call, destructor): one object per build (`_objectRead`) =#
-  objects::Vector{Tuple{String, IR, String}}
+  #= the external objects the code reads: one object per build, an array's elements in row-major order =#
+  objects::Vector{ObjectSlot}
   usesLeft::Bool   #= the code reads an algebraic variable's left limit at an event (pre() of it) =#
   delays::Vector{DelaySite}   #= the delay() calls of the equations and when-equations, numbered (`_numberDelays!`) =#
   usesHomotopy::Bool   #= the code calls homotopy(): the initialization's continuation in its λ (`homotopyStart!`) =#

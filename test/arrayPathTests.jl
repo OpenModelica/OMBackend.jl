@@ -3780,4 +3780,49 @@ end DivideInLoop;
     local sol = OMBackend.simulateModel(name; tspan = (0.0, 0.9))
     @test _values(sol, ["y", "z"]) ≈ [0.75 * 1100 * 1101 / 2, 0.75 * sum(-2 * i^2 for i in 1:600)] rtol = 1e-12
   end
+
+  @testset "An array of components, each with its own external object" begin
+    #= MSL CCCV_Stack: the tableID of each cell, an array of external objects (index reduction refused it, the MTK
+       fallback before): one object per element, each by its own constructor call (its component's shift), read at
+       the element of the iterators (`_objectElementRead`) =#
+    local name::String = _arrayPathTranslate("ArrayPath.TableArray"; scalarized = false)
+    @test _arrayPathTaken(name)
+    local sol = OMBackend.simulateModel(name; tspan = (0.0, 1.0))
+    @test _values(sol, ["c[1].x", "c[2].x", "c[3].x"]) ≈ [1.0, 1.0, 0.0] atol = 1e-10
+  end
+
+  @testset "A binding of each component of a component array, reading its own record array" begin
+    #= MSL CCCV_StackRC: `c.C[3, 2] = {c.cellData.rc[1].C, c.cellData.rc[2].C}`, a binding of fewer dimensions than
+       its parameter, was written out over the leading ones (`bindingElementForm`): the third cell's elements did not
+       evaluate (the MTK fallback before). v = exp(-t / (R C)) =#
+    local cells = Modelica"""
+      package RCs
+        record RC "MSL Batteries' RCData"
+          parameter Real R;
+          parameter Real C;
+        end RC;
+        record CellData
+          parameter RC rc[2];
+        end CellData;
+        model Cell "two RC elements discharging: C dv/dt = -v / R"
+          parameter CellData cellData;
+          parameter Real C[2] = {cellData.rc[1].C, cellData.rc[2].C};
+          Real v[2](each start = 1, each fixed = true);
+        equation
+          for i in 1:2 loop
+            C[i] * der(v[i]) = -v[i] / cellData.rc[i].R;
+          end for;
+        end Cell;
+        model Cells "three cells, the first with other data"
+          parameter CellData a(rc = {RC(R = 1, C = 2), RC(R = 2, C = 3)});
+          parameter CellData b(rc = {RC(R = 1, C = 1), RC(R = 1, C = 4)});
+          Cell c[3](cellData = {a, b, b});
+        end Cells;
+      end RCs;
+      """
+    local name::String = _translateProgram(cells, "RCs.Cells"; scalarized = false)
+    @test _arrayPathTaken(name)
+    local sol = OMBackend.simulateModel(name; tspan = (0.0, 1.0), reltol = 1e-10, abstol = 1e-12)
+    @test _values(sol, ["c[1].v[1]", "c[1].v[2]", "c[2].v[1]", "c[3].v[2]"]) ≈ exp.(-1 ./ [2.0, 6.0, 1.0, 4.0]) rtol = 1e-9
+  end
 end

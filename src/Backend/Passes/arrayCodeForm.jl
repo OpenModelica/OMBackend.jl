@@ -613,6 +613,10 @@ function bindingElementForm(v::IR.Variable, cx::ElementContext)::IR.Expression
     all((d::IR.Dimension) -> d isa IR.DIM_SIZE, v.ty.dimensions) || return b
     local dims::Vector{Int} = Int[(d::IR.DIM_SIZE).size for d in v.ty.dimensions]
     prod(dims) <= MAX_ELEMENT_TERMS || return b
+    #= a binding of fewer dimensions, of each component of a component array (`rcData.C[3, 2, 2] = {cellData.rcData[1].C,
+       cellData.rcData[2].C}` of MSL CCCV_StackRC's cells, its references to fields of its own component): as it is,
+       the element view evaluates its values (`IndexReduction.ComponentValue`) =#
+    length(IR.dimensions(IR.typeOf(b))) == length(dims) || return b
     return elementArray(b, dims, v.ty, cx)
   end
   return elementFormExp(b, cx)

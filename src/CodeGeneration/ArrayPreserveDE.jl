@@ -90,7 +90,7 @@ import ...SimCode
 import ...SimCode.Domains: DomainSystem, InstanceTable, EqClass, EvFn, Gen, IR, Lit, LoopBlocks, NotSupported, Op, Pre,
   Ref, Rel, SAssert, SAssign, SBreak, SCall, SFor, SIf, SPreStart, SWhen, SWhile, Slot, Stmt, TimeIR, TornBlock, VarInfo,
   WhenClass,
-  AlgClass, DelaySite,
+  AlgClass, DelaySite, ObjectSlot,
   _affineIn, _unknownVariables, _blockFamilies, _callOfParameters, _condElements, _initAlgAssigned, _parameterAlgorithms, _paramValue!,
   _parametersOnly, _relationSlots, _relationInstances,
   _isTimeRelation, _timeRelationSlots, _continuous, _assertRows,
@@ -1895,7 +1895,11 @@ function jl(g::Gen, x::IR)
     x.op == :terminate && return :(_terminate!(p, $(args[1])))
     x.op == :stringparam && return :(p.state.strings[$(x.args[1].v)])
     #= an external object: the module's constant (`_objectDefinitions`) =#
-    x.op == :object && return Symbol("OBJECT_", x.args[1].v)
+    if x.op == :object
+      length(x.args) == 2 && return Symbol("OBJECT_", x.args[1].v)
+      #= an element of an array of them at subscripts of iterators (`_objectElementRead`) =#
+      return Expr(:ref, Symbol("OBJECTS_", x.args[1].v), Any[jl(g, s) for s in x.args[4:end]]...)
+    end
     x.op == :seq && return Expr(:block, args...)
     x.op == :noEvent && return args[1]
     #= homotopy(actual, simplified): actual at λ = 1, the blend in the continuation (`homotopyStart!`) =#
@@ -3839,18 +3843,31 @@ end
 The external objects the code reads (`Gen.objects`) as the module's constants `OBJECT_k`: each made once, when the
 module is evaluated, by its constructor's call on the translated parameter values (`PARAMETER_VALUES`), and registered
 under the model with its destructor (`CodeGeneration._externalObjectRef`); the objects of the model's build before this
-one are freed first. NotSupported for a constructor call without code.
+one are freed first. The elements of an array of them also as the array `OBJECTS_k` (`k` its first element's), of the
+array's dimensions. NotSupported for a constructor call without code.
 """
 function _objectDefinitions(g::Gen, modelName::String)::Vector{Any}
   isempty(g.objects) && return Any[]
   local model::String = _OMBACKEND.canonicalName(modelName)
   local defs::Vector{Any} = Any[:($(_OMBACKEND.CodeGeneration.freeExternalObjects!)($model))]
-  for (k::Int, (nm::String, value::IR, destructor::String)) in enumerate(g.objects)
-    local rule::Any = _bindingCode(g, ParameterBinding(nm, _bindingDeps(g, g.vars[nm].var), :scalar, IR[value]))
-    rule === nothing && ns("the constructor of the external object $(nm)")
+  local arrays::Dict{String, Vector{Int}} = Dict{String, Vector{Int}}()
+  local order::Vector{String} = String[]   #= the arrays in the order of their first elements: the same code each time =#
+  for (k::Int, o::ObjectSlot) in enumerate(g.objects)
+    local rule::Any = _bindingCode(g, ParameterBinding(o.param, _bindingDeps(g, g.vars[o.param].var), :scalar, IR[o.value]))
+    rule === nothing && ns("the constructor of the external object $(o.label)")
     push!(defs, :(const $(Symbol("OBJECT_", k)) =
-                    $(_OMBACKEND.CodeGeneration._externalObjectRef)($(QuoteNode(Symbol(nm))), ($rule)(PARAMETER_VALUES),
-                                                                    $(QuoteNode(Symbol(destructor))), $model)))
+                    $(_OMBACKEND.CodeGeneration._externalObjectRef)($(QuoteNode(Symbol(o.label))), ($rule)(PARAMETER_VALUES),
+                                                                    $(QuoteNode(Symbol(o.destructor))), $model)))
+    o.label == o.param && continue
+    haskey(arrays, o.param) || push!(order, o.param)
+    push!(get!(Vector{Int}, arrays, o.param), k)
+  end
+  for nm::String in order
+    local slots::Vector{Int} = arrays[nm]
+    local dims::Vector{Int} = g.vars[nm].dims
+    local vect::Expr = Expr(:vect, Any[Symbol("OBJECT_", k) for k in slots]...)   #= row-major =#
+    push!(defs, :(const $(Symbol("OBJECTS_", slots[1])) =
+                    $(length(dims) == 1 ? vect : :(permutedims(reshape($vect, $(reverse(dims)...)), $(length(dims)):-1:1)))))
   end
   return defs
 end

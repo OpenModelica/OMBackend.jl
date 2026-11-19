@@ -170,12 +170,16 @@ function _parameterBinding(g::Gen, nm::String)::ParameterBinding
     local ctx::Ctx = Ctx(Dict{String, Int}(), Int[])
     isempty(info.dims) && return ParameterBinding(nm, deps, :scalar, IR[toIR(g, b, ctx)])
     (_isFunctionCall(g, b) && _expType(b) isa SC.TYPE_ARRAY) && return ParameterBinding(nm, deps, :value, IR[_valueIRx(g, b, ctx)])
+    #= a binding of each component of a component array, reading its own component's fields (references of fewer
+       dimensions than their arrays, `IndexReduction.ComponentValue`): no code, its value the lowering's =#
+    _readsComponentFields(g, b) && return ParameterBinding(nm, deps, :none, IR[])
     if !(b isa SC.ARRAY_EXP)
       #= one value for every element (`each`); an array binding not written per element has no code =#
       _expType(b) isa SC.TYPE_ARRAY && ns("the array binding of $(nm), not per element")
       return ParameterBinding(nm, deps, :each, IR[toIR(g, b, ctx)])
     end
     local elements::Vector{IR} = IR[toIR(g, x, ctx) for x in _rowMajorElements(b)]
+    length(elements) == prod(info.dims) || return ParameterBinding(nm, deps, :none, IR[])
     nm in deps || return ParameterBinding(nm, deps, :elements, elements)
     #= elements that read other elements of the parameter (a rolled component's parameter bound to another
        instance's): each as its binding over the other parameters =#
@@ -184,6 +188,23 @@ function _parameterBinding(g::Gen, nm::String)::ParameterBinding
     err isa NotSupported || rethrow(err)
     return ParameterBinding(nm, deps, :none, IR[])
   end
+end
+
+"""
+Whether the binding `b` reads a field of its own component in a component array: a reference to an array parameter
+that is not subscripted and not of an array type (`cellData.rcData[1].C` of `Real[3, 2, 2]`, typed `Real`, in the
+binding of each cell).
+"""
+function _readsComponentFields(g::Gen, b::SC.Exp)::Bool
+  local found::Base.RefValue{Bool} = Base.RefValue{Bool}(false)
+  SC.foreachExp(b) do x::SC.Exp
+    found[] && return nothing
+    (x isa SC.EXP_CREF && isempty(x.cref.subs) && !(x.ty isa SC.TYPE_ARRAY)) || return nothing
+    local info::Union{Nothing, VarInfo} = get(g.vars, String(x.cref.sym), nothing)
+    (info !== nothing && info.kind == :param && !isempty(info.dims)) && (found[] = true)
+    nothing
+  end
+  return found[]
 end
 
 """
@@ -483,19 +504,98 @@ function _objectRead(g::Gen, name::String)::Union{Nothing, IR}
   local root::Union{Nothing, Tuple{String, SC.CALL}} = _objectRoot(g, name)
   root === nothing && return nothing
   local (nm::String, call::SC.CALL) = root
-  local k::Union{Nothing, Int} = findfirst(o::Tuple{String, IR, String} -> o[1] == nm, g.objects)
+  local k::Union{Nothing, Int} = findfirst((o::ObjectSlot) -> o.label == nm, g.objects)
   if k === nothing
-    _isFunctionCall(g, call) || ns("the constructor of the external object $(nm): $(_str(call))")
-    local value::IR = _functionCallIRx(g, call, Ctx(Dict{String, Int}(), Int[]))
-    _parametersOnly(g, value) || ns("the constructor of the external object $(nm) reads a variable: $(_str(call))")
-    for d in _bindingDeps(g, g.vars[nm].var)
-      push!(g.structural, d)
-      _paramValue!(g, d)
-    end
-    push!(g.objects, (nm, value, replace(String(call.name), r"_constructor$" => "_destructor")))
+    _objectDependencies!(g, nm, call)
+    push!(g.objects, ObjectSlot(nm, nm, _objectValue(g, nm, call), _destructorName(call)))
     k = length(g.objects)
   end
   return Op(:object, IR[Lit(k), Lit(nm)])
+end
+
+"The destructor's name of an external object's constructor `call`."
+_destructorName(call::SC.CALL)::String = replace(String(call.name), r"_constructor$" => "_destructor")
+
+"""
+The parameters the constructor `call` of the external object `name` reads: structural (the object is made from their
+translated values, an override refused), their values translated. NotSupported for a call without code.
+"""
+function _objectDependencies!(g::Gen, name::String, call::SC.CALL)::Nothing
+  _isFunctionCall(g, call) || ns("the constructor of the external object $(name): $(_str(call))")
+  for d in _bindingDeps(g, g.vars[name].var)
+    push!(g.structural, d)
+    _paramValue!(g, d)
+  end
+  return nothing
+end
+
+"The constructor call `call` of the external object `name` as IR; NotSupported where it reads a variable."
+function _objectValue(g::Gen, name::String, call::SC.Exp)::IR
+  local value::IR = _functionCallIRx(g, call, Ctx(Dict{String, Int}(), Int[]))
+  _parametersOnly(g, value) || ns("the constructor of the external object $(name) reads a variable: $(_str(call))")
+  return value
+end
+
+"""
+The array of external objects `name` (`ExternalCombiTable1D tableID[3, 2]` of an array of components: MSL
+CCCV_Stack's cells), its dimensions and its constructor's call, one call for all elements; nothing for another
+parameter.
+"""
+function _objectArrayRoot(g::Gen, name::String)::Union{Nothing, Tuple{Vector{Int}, SC.CALL}}
+  local info::Union{Nothing, VarInfo} = get(g.vars, name, nothing)
+  (info !== nothing && info.kind == :param && info.vtype == :other && !isempty(info.dims)) || return nothing
+  local ty::SC.SType = info.var.simVar.elementType
+  (ty isa SC.TYPE_COMPLEX && !ty.isRecord) || return nothing
+  local b::Union{Nothing, SC.Exp} = SC.bindingOf(info.var.simVar.varKind)
+  return b isa SC.CALL ? (info.dims, b) : nothing
+end
+
+"""
+The constructor call `call` of the element `index` of an array of external objects of dimensions `dims`
+(`_objectArrayRoot`): a field of the element's component (a variable of those dimensions read by a reference of its
+element's type, `isCsvExt` of type Boolean for `isCsvExt[3, 2]`) read as that element. NotSupported for a field of
+more dimensions (an array in each component).
+"""
+function _objectElementCall(g::Gen, call::SC.CALL, dims::Vector{Int}, index::Vector{Int})::SC.Exp
+  local visit::Function = (x::SC.Exp, acc::Nothing) -> begin
+    (x isa SC.EXP_CREF && isempty(x.cref.subs) && !(x.ty isa SC.TYPE_ARRAY)) || return (x, true, acc)
+    local info::Union{Nothing, VarInfo} = get(g.vars, String(x.cref.sym), nothing)
+    (info === nothing || length(info.dims) < length(dims) || info.dims[1:length(dims)] != dims) && return (x, true, acc)
+    length(info.dims) == length(dims) ||
+      ns("an external object's constructor reading $(x.cref.sym), an array in each component")
+    return (SC.ASUB(x, SC.Exp[SC.ICONST(i) for i in index]), false, acc)
+  end
+  return first(SC.traverseExpTopDown(call, visit, nothing))
+end
+
+"""
+A read of the element `subs` of the array of external objects `name` (`_objectArrayRoot`), nothing where `name` is
+none. Each element's object is made once per build by its call (`_objectElementCall`), as a scalar one is
+(`_objectRead`), the elements in row-major order. `Op(:object)` of the element's slot at literal subscripts, else of
+the first element's slot, the array's name and dimensions and the subscripts (the code indexes the array of the
+elements' objects, `OBJECTS_k`).
+"""
+function _objectElementRead(g::Gen, name::String, subs::Vector{IR})::Union{Nothing, IR}
+  local root::Union{Nothing, Tuple{Vector{Int}, SC.CALL}} = _objectArrayRoot(g, name)
+  root === nothing && return nothing
+  local (dims::Vector{Int}, call::SC.CALL) = root
+  length(subs) == length(dims) || ns("partial subscripts on the external objects $(name)")
+  local first::Union{Nothing, Int} = findfirst((o::ObjectSlot) -> o.param == name, g.objects)
+  if first === nothing
+    _objectDependencies!(g, name, call)
+    first = length(g.objects) + 1
+    for t in Iterators.product((1:d for d in reverse(dims))...)   #= row-major: the last index fastest =#
+      local index::Vector{Int} = reverse!(collect(Int, t))
+      local label::String = "$(name)[$(join(index, ","))]"
+      push!(g.objects, ObjectSlot(label, name, _objectValue(g, label, _objectElementCall(g, call, dims, index)),
+                                  _destructorName(call)))
+    end
+  end
+  if all((s::IR) -> s isa Lit, subs)
+    local at::Int = first + LinearIndices(Tuple(reverse(dims)))[reverse(Int[(s::Lit).v for s in subs])...] - 1
+    return Op(:object, IR[Lit(at), Lit(g.objects[at].label)])
+  end
+  return Op(:object, IR[Lit(first); Lit(name); Lit(Tuple(dims)); subs])
 end
 
 """
@@ -919,6 +1019,10 @@ function _argumentsIRx!(out::Vector{IR}, g::Gen, a::SC.Exp, ctx::Ctx)::Nothing
     local object::Union{Nothing, IR} = a.ty.isRecord ? nothing : _objectRead(g, String(a.cref.sym))
     object === nothing && ns("a record argument: $(_str(a))")
     push!(out, object)
+  elseif a isa SC.ASUB && a.exp isa SC.EXP_CREF && isempty(a.exp.cref.subs) &&
+         _objectArrayRoot(g, String(a.exp.cref.sym)) !== nothing
+    #= an element of an array of external objects (a table of each of an array of components) =#
+    push!(out, _objectElementRead(g, String(a.exp.cref.sym), IR[toIR(g, s, ctx) for s in a.subs])::IR)
   elseif a isa SC.PARTEVALFUNCTION
     push!(out, _partialApplicationIRx(g, a, ctx))
   else
@@ -2366,7 +2470,7 @@ function domainSystem(sc::SC.SIM_CODE)::DomainSystem
   local g::Gen = Gen(Dict{String, VarInfo}(), 0, 0, 0, Dict{String, Any}(), Dict{String, Symbol}(), Set{String}(),
                 EqClass[], EqClass[], AlgClass[], Tuple{String, String, Bool}[], WhenClass[], AssertClass[], 0, 0, 0, 0,
                 -1000, false, Dict{Int, Int}(), AlgClass[], String[], AssertClass[], functionOutputs, Dict{String, String}(),
-                Set{String}(), Tuple{String, String}[], Tuple{String, IR, String}[], false, DelaySite[], false)
+                Set{String}(), Tuple{String, String}[], ObjectSlot[], false, DelaySite[], false)
   local stateNamesOrdered::Vector{String} = String[]; local algNamesOrdered::Vector{String} = String[]
   local discreteNamesOrdered::Vector{String} = String[]
   local u0::Vector{Float64} = Float64[]; local d0::Vector{Float64} = Float64[]; local a0::Vector{Float64} = Float64[]
