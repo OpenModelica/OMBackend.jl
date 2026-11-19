@@ -23,7 +23,7 @@ function heldDiscreteRun(model::String)
   local file::String = joinpath(@__DIR__, "Models", "HeldDiscretes.mo")
   local (fm, cache) = OMFrontend.instantiateSCodeToFM(model, OMFrontend.translateToSCode(OMFrontend.parseFile(file)))
   OMBackend.translate(fm; functionList = OMFrontend.cacheToFunctionList(cache))
-  return OMBackend.simulateModel(OMBackend.canonicalName(model); tspan = (0.0, 2.0), reltol = 1.0e-6)
+  return OMBackend.simulate(OMBackend.canonicalName(model); tspan = (0.0, 2.0), reltol = 1.0e-6)
 end
 
 @testset "Held discretes keep their values where an event moves the integrator" begin

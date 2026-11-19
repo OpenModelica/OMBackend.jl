@@ -11,9 +11,6 @@ Nothing is exported: call them as `OMBackend.name`. Every other name is internal
 
 ```@docs
 OMBackend.translate
-OMBackend.translateReducedArrays
-OMBackend.generateTargetCode
-OMBackend.knownValues
 OMBackend.BackendMode
 OMBackend.IMTK_MODE
 OMBackend.MTK_MODE
@@ -26,12 +23,12 @@ OMBackend.canonicalName
 ## Simulate
 
 ```@docs
-OMBackend.simulateModel
-OMBackend.resimulateModel
+OMBackend.simulate
+OMBackend.resimulate
 OMBackend.getMTKProblem
 OMBackend.defaultSolver
 OMBackend.daeFallbackSolver
-OMBackend.getVariableValues
+OMBackend.variableValues
 OMBackend.eventCallbacks
 OMBackend.isEventCallback
 OMBackend.isStepControl
@@ -57,7 +54,6 @@ OMBackend.availableModels
 OMBackend.printModel
 OMBackend.modelToString
 OMBackend.writeModelToFile
-OMBackend.dumpGeneratedCode
 ```
 
 ## Caches
@@ -66,6 +62,21 @@ OMBackend.dumpGeneratedCode
 OMBackend.clearCaches!
 OMBackend.forgetModel
 ```
+
+## Renamed in 1.0
+
+The 0.x names still work in 1.x, with a deprecation warning (shown with `--depwarn=yes`).
+
+| 0.x | 1.0 |
+|---|---|
+| `simulateModel(name; MODE)` | `simulate(name; mode)` |
+| `resimulateModel(name; MODE)` | `resimulate(name; mode)` |
+| `getVariableValues` | `variableValues` |
+| `translate(fm; BackendMode, scalarized)` | `translate(fm; mode, scalarize)` |
+| `translateReducedArrays(fm; BackendMode)` | `translate(fm; scalarize = false, mode)` |
+
+`availableModels` returns a `Vector{String}` (0.x: one `String` with headings). `generateTargetCode`, `knownValues`
+and `dumpGeneratedCode` are internal.
 
 ## Index
 

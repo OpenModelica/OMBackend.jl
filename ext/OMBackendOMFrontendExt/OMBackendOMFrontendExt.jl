@@ -37,7 +37,7 @@
     OMBackendOMFrontendExt
 
 OMFrontend.jl's flat model through OMBackend, loaded with OMFrontend: the lowering into OMJLIR (`LowerFlatModel`),
-the backend's entry points on the FlatModel (`translate`, `translateReducedArrays`, `omjlirModel`,
+the backend's entry points on the FlatModel (`translate`, `omjlirModel`,
 `explainIndexReduction`, ...; translate.jl), the frontend's part of a recompilation at a structural change
 (`Recompilation`), the URI resolution of external functions' include directories, and the translate precompile
 workload. OMBackend alone takes OMJLIR (`translate(::OMJLIR.Model)`; omc's frontend through OMBackendOMCompilerExt).
@@ -56,11 +56,10 @@ import OMBackend: OMJLIR, Passes, SimCode, IMTKGen, DEFAULT_BACKEND_MODE, IMTK_M
   MODEL_RUN_DIRS, ARRAY_PRESERVE_DE_MODELS, ARRAY_REDUCED_MODELS, ARRAY_PATH_REASONS, BACKEND_SCALARIZED_MODELS,
   COMPILED_MODELS_MTK, canonicalName,
   createLogRunId, resetFallbacks!, withLogRunDir, debugWrite, logPath, envSwitch, isFatal, declineArrayPath!,
-  generateTargetCode, scalarizedReducedModel, generateReducedArrayPreserveDETargetCode, simulateModel,
+  generateTargetCode, scalarizedReducedModel, generateReducedArrayPreserveDETargetCode, simulate,
   defaultSolver, daeFallbackSolver, @BACKEND_PERFLOG, @BACKEND_LOGGING
-import OMBackend: translate, explainIndexReduction, omjlirModel, arrayReducedModel, reducedArrayModel,
-  backendScalarizedModel,
-  translateReducedArrays, lowerFlatModel, resolveModelicaURI
+import OMBackend: translate, explainIndexReduction, omjlirModel, reducedArrayModel, backendScalarizedModel,
+  lowerFlatModel, resolveModelicaURI
 
 const F = OMFrontend.Frontend
 

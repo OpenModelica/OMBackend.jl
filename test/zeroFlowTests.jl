@@ -33,13 +33,13 @@ _zfResiduals(sc) = [sprint(show, r.exp) for r in sc.residualEquations]
     @test !any(r -> occursin("Q_flow", r), res)
     local (fm, functions) = _zfFlat("ZeroMassChain")
     OMBackend.translate(fm; functionList = functions)
-    local sol = OMBackend.simulateModel(OMBackend.canonicalName("ZeroFlow.ZeroMassChain"); tspan = (0.0, 1.0), reltol = 1e-8, abstol = 1e-8)
+    local sol = OMBackend.simulate(OMBackend.canonicalName("ZeroFlow.ZeroMassChain"); tspan = (0.0, 1.0), reltol = 1e-8, abstol = 1e-8)
     @test sol.retcode == OMBackend.CodeGeneration.ModelingToolkit.SciMLBase.ReturnCode.Success
-    local h = OMBackend.getVariableValues(sol, "c2.h")
+    local h = OMBackend.variableValues(sol, "c2.h")
     @test h[findfirst(>=(0.25), sol.t)] ≈ 1e6
     @test h[findfirst(>=(0.75), sol.t)] ≈ 2e6
     #= m_flow = (0.5 - t) / 30: E(1) = (0.125 * 1e6 - 0.125 * 2e6) / 30 =#
-    @test OMBackend.getVariableValues(sol, "E")[end] ≈ -1.25e5 / 30 rtol = 1e-6
+    @test OMBackend.variableValues(sol, "E")[end] ≈ -1.25e5 / 30 rtol = 1e-6
   end
 
   @testset "an if-equation on noEvent(abs(w) < small)" begin
@@ -49,15 +49,15 @@ _zfResiduals(sc) = [sprint(show, r.exp) for r in sc.residualEquations]
     @test "w" in withenv(() -> _zfSimCode("NoEventSpeed"), "OMBACKEND_IF_READS_IRREDUCIBLE" => "true").irreducibleVariables
     local (fm, functions) = _zfFlat("NoEventSpeed")
     OMBackend.translate(fm; functionList = functions)
-    local sol = OMBackend.simulateModel(OMBackend.canonicalName("ZeroFlow.NoEventSpeed"); tspan = (0.0, 1.0), reltol = 1e-8, abstol = 1e-8)
+    local sol = OMBackend.simulate(OMBackend.canonicalName("ZeroFlow.NoEventSpeed"); tspan = (0.0, 1.0), reltol = 1e-8, abstol = 1e-8)
     @test sol.retcode == OMBackend.CodeGeneration.ModelingToolkit.SciMLBase.ReturnCode.Success
-    local tau = OMBackend.getVariableValues(sol, "tau")
+    local tau = OMBackend.variableValues(sol, "tau")
     local at = t -> findfirst(>=(t), sol.t)
     #= tau = dp V / w = V^2 while the speed turns; 0 after 0.5 (a relay of the condition stayed false: no crossing of
        abs(w) - small reaches below its hysteresis, and tau * 0 = 0) =#
     @test tau[at(0.25)] ≈ exp(-2 * sol.t[at(0.25)]) rtol = 1e-6
     @test tau[end] == 0
-    @test OMBackend.getVariableValues(sol, "dp")[end] == 0
+    @test OMBackend.variableValues(sol, "dp")[end] == 0
   end
 
   @testset "the initialization from a flow guessed at 0, where the losses are flat" begin
@@ -65,10 +65,10 @@ _zfResiduals(sc) = [sprint(show, r.exp) for r in sc.residualEquations]
        mismatch (MomentumBalanceFittings: 3333 Pa in three rows, the phases stalled); nudged to 1 =#
     local (fm, functions) = _zfFlat("FlatZeroFlow")
     OMBackend.translate(fm; functionList = functions)
-    local sol = OMBackend.simulateModel(OMBackend.canonicalName("ZeroFlow.FlatZeroFlow"); tspan = (0.0, 1.0))
+    local sol = OMBackend.simulate(OMBackend.canonicalName("ZeroFlow.FlatZeroFlow"); tspan = (0.0, 1.0))
     @test sol.retcode == OMBackend.CodeGeneration.ModelingToolkit.SciMLBase.ReturnCode.Success
-    @test OMBackend.getVariableValues(sol, "m_flow")[1] ≈ sqrt(1e4 / 3) rtol = 1e-6
-    @test OMBackend.getVariableValues(sol, "p")[1] ≈ 110000 - 1e4 / 3 rtol = 1e-9
+    @test OMBackend.variableValues(sol, "m_flow")[1] ≈ sqrt(1e4 / 3) rtol = 1e-6
+    @test OMBackend.variableValues(sol, "p")[1] ≈ 110000 - 1e4 / 3 rtol = 1e-9
   end
 
   @testset "smooth(0, ...) with its event, smooth(1, ...) without" begin
@@ -82,10 +82,10 @@ _zfResiduals(sc) = [sprint(show, r.exp) for r in sc.residualEquations]
     for (name, at, crossing, E) in (("SmoothStream", 0.5, true, -5 / 48), ("SmoothQuadraticLoad", 0.25, false, 13 / 96))
       local (fm, functions) = _zfFlat(name)
       OMBackend.translate(fm; functionList = functions)
-      local sol = OMBackend.simulateModel(OMBackend.canonicalName("ZeroFlow." * name); tspan = (0.0, 1.0), reltol = 1e-8, abstol = 1e-8)
+      local sol = OMBackend.simulate(OMBackend.canonicalName("ZeroFlow." * name); tspan = (0.0, 1.0), reltol = 1e-8, abstol = 1e-8)
       @test sol.retcode == OMBackend.CodeGeneration.ModelingToolkit.SciMLBase.ReturnCode.Success
       @test any(t -> abs(t - at) < 1e-9, sol.t) == crossing
-      @test OMBackend.getVariableValues(sol, "E")[end] ≈ E rtol = 1e-5
+      @test OMBackend.variableValues(sol, "E")[end] ≈ E rtol = 1e-5
     end
   end
 end

@@ -29,11 +29,11 @@ function _bothWays(model, names; tspan = (0.0, 1.0), kwargs...)
   local name = OMBackend.canonicalName(model)
   local s::Vector{Float64} = _scalarizedReference(model, names, tspan, kwargs) do
     _arrayPathTranslate(model; scalarized = true)
-    return _values(OMBackend.simulateModel(name; tspan = tspan, kwargs...), names)
+    return _values(OMBackend.simulate(name; tspan = tspan, kwargs...), names)
   end
   _arrayPathTranslate(model; scalarized = false)
   @test _arrayPathTaken(name)
-  local sol::OMBackend.DifferentialEquations.SciMLBase.AbstractODESolution = OMBackend.simulateModel(name; tspan = tspan, kwargs...)
+  local sol::OMBackend.DifferentialEquations.SciMLBase.AbstractODESolution = OMBackend.simulate(name; tspan = tspan, kwargs...)
   @test sol.retcode == ReturnCode.Success
   return (s, _values(sol, names), sol)
 end
@@ -46,11 +46,11 @@ function _bothWaysOf(program, model::String, names::Vector{String}; tspan = (0.0
   local name::String = OMBackend.canonicalName(model)
   local s::Vector{Float64} = _scalarizedReference(model, names, tspan, kwargs) do
     _translateProgram(program, model; scalarized = true)
-    return _values(OMBackend.simulateModel(name; tspan = tspan, kwargs...), names)
+    return _values(OMBackend.simulate(name; tspan = tspan, kwargs...), names)
   end
   _translateProgram(program, model; scalarized = false)
   @test _arrayPathTaken(name)
-  local sol = OMBackend.simulateModel(name; tspan = tspan, kwargs...)
+  local sol = OMBackend.simulate(name; tspan = tspan, kwargs...)
   @test sol.retcode == ReturnCode.Success
   return (s, _values(sol, names), sol)
 end
@@ -61,10 +61,10 @@ end
     @test _arrayPathTaken(name)
     local stats = OMBackend.CodeGeneration.ArrayPreserveDE.LAST_STATS[]
     @test stats.states == 1000 && stats.batches == 1
-    local sol = OMBackend.simulateModel(name; tspan = (0.0, 1.0))
+    local sol = OMBackend.simulate(name; tspan = (0.0, 1.0))
     @test sol.retcode == ReturnCode.Success
     @test maximum(abs(sol.u[end][i] - exp(-i)) for i in 1:1000) < 1e-6
-    @test OMBackend.getVariableValues(sol, "x[2]")[end] ≈ exp(-2) atol = 1e-6
+    @test OMBackend.variableValues(sol, "x[2]")[end] ≈ exp(-2) atol = 1e-6
   end
 
   @testset "Chain: connections, algebraic variables, as scalarized" begin
@@ -82,70 +82,70 @@ end
   @testset "Parameters: overrides and dependent bindings" begin
     local name = _arrayPathTranslate("ArrayPath.ParamDep"; scalarized = false)
     @test _arrayPathTaken(name)
-    local x = OMBackend.simulateModel(name; tspan = (0.0, 1.0)).u[end]
+    local x = OMBackend.simulate(name; tspan = (0.0, 1.0)).u[end]
     @test x ≈ exp.(-[2.0, 4.0, 6.0]) rtol = 1e-4
     #= b = 3a and k = {a, 2a, b} follow a =#
-    x = OMBackend.resimulateModel(name; tspan = (0.0, 1.0), parameters = Dict("a" => 1.0)).u[end]
+    x = OMBackend.resimulate(name; tspan = (0.0, 1.0), parameters = Dict("a" => 1.0)).u[end]
     @test x ≈ exp.(-[1.0, 2.0, 3.0]) rtol = 1e-4
-    x = OMBackend.resimulateModel(name; tspan = (0.0, 1.0), parameters = Dict("k[2]" => 0.5)).u[end]
+    x = OMBackend.resimulate(name; tspan = (0.0, 1.0), parameters = Dict("k[2]" => 0.5)).u[end]
     @test x[2] ≈ exp(-0.5) rtol = 1e-4
     #= an element override with an override of what the array reads: the array's rule, then the element (k[1] kept
        its translated 2 before) =#
-    x = OMBackend.resimulateModel(name; tspan = (0.0, 1.0), parameters = Dict("a" => 1.0, "k[2]" => 0.5)).u[end]
+    x = OMBackend.resimulate(name; tspan = (0.0, 1.0), parameters = Dict("a" => 1.0, "k[2]" => 0.5)).u[end]
     @test x ≈ exp.(-[1.0, 0.5, 3.0]) rtol = 1e-4
     #= a Real array whose rule gives Integers keeps its type (an element override of 0.5 threw InexactError) =#
     local ib = _arrayPathTranslate("ArrayPath.IntBoundRealArray"; scalarized = false)
     @test _arrayPathTaken(ib)
-    local xi = OMBackend.resimulateModel(ib; tspan = (0.0, 1.0), parameters = Dict{String, Any}("m" => 3, "k[2]" => 0.5))
-    @test OMBackend.getVariableValues(xi, "x")[end] ≈ 3.5 rtol = 1e-6
+    local xi = OMBackend.resimulate(ib; tspan = (0.0, 1.0), parameters = Dict{String, Any}("m" => 3, "k[2]" => 0.5))
+    @test OMBackend.variableValues(xi, "x")[end] ≈ 3.5 rtol = 1e-6
     #= parameter names that differ in . and _ only are their own parameters (one symbol: x(1) = 66, omc 26) =#
     local nc = _arrayPathTranslate("ArrayPath.ParamNameClash"; scalarized = false)
     @test _arrayPathTaken(nc)
-    @test OMBackend.getVariableValues(OMBackend.simulateModel(nc; tspan = (0.0, 1.0)), "x")[end] ≈ 26.0 rtol = 1e-6
-    @test OMBackend.getVariableValues(OMBackend.resimulateModel(nc; tspan = (0.0, 1.0), parameters = Dict{String, Any}("c_k" => 1.0)), "x")[end] ≈ 13.0 rtol = 1e-6
-    @test OMBackend.getVariableValues(OMBackend.resimulateModel(nc; tspan = (0.0, 1.0), parameters = Dict{String, Any}("c.k" => 5.0)), "x")[end] ≈ 25.0 rtol = 1e-6
+    @test OMBackend.variableValues(OMBackend.simulate(nc; tspan = (0.0, 1.0)), "x")[end] ≈ 26.0 rtol = 1e-6
+    @test OMBackend.variableValues(OMBackend.resimulate(nc; tspan = (0.0, 1.0), parameters = Dict{String, Any}("c_k" => 1.0)), "x")[end] ≈ 13.0 rtol = 1e-6
+    @test OMBackend.variableValues(OMBackend.resimulate(nc; tspan = (0.0, 1.0), parameters = Dict{String, Any}("c.k" => 5.0)), "x")[end] ≈ 25.0 rtol = 1e-6
     #= a binding that references another parameter follows its overrides (it was that one's value: gain = 5 gave 5532,
        omc 5535) =#
     local pr = _arrayPathTranslate("ArrayPath.ParamReference"; scalarized = false)
     @test _arrayPathTaken(pr)
-    @test OMBackend.getVariableValues(OMBackend.simulateModel(pr; tspan = (0.0, 1.0)), "x")[end] ≈ 5232.0 rtol = 1e-6
+    @test OMBackend.variableValues(OMBackend.simulate(pr; tspan = (0.0, 1.0)), "x")[end] ≈ 5232.0 rtol = 1e-6
     local po = Dict{String, Any}("gain" => 5.0, "p1" => 4.0, "a" => [4.0, 6.0])
-    @test OMBackend.getVariableValues(OMBackend.resimulateModel(pr; tspan = (0.0, 1.0), parameters = po), "x")[end] ≈ 5 + 40 + 500 + 6000 rtol = 1e-6
+    @test OMBackend.variableValues(OMBackend.resimulate(pr; tspan = (0.0, 1.0), parameters = po), "x")[end] ≈ 5 + 40 + 500 + 6000 rtol = 1e-6
     #= a parameter coefficient of der() follows its override (the array commit folded it: c = 4 kept 2) =#
     local dc = _arrayPathTranslate("ArrayPath.DerCoefficient"; scalarized = false)
     @test _arrayPathTaken(dc)
-    @test OMBackend.getVariableValues(OMBackend.simulateModel(dc; tspan = (0.0, 1.0)), "x")[end] ≈ 0.5 rtol = 1e-6
-    @test OMBackend.getVariableValues(OMBackend.resimulateModel(dc; tspan = (0.0, 1.0), parameters = Dict{String, Any}("c" => 4.0)), "x")[end] ≈ 0.25 rtol = 1e-6
+    @test OMBackend.variableValues(OMBackend.simulate(dc; tspan = (0.0, 1.0)), "x")[end] ≈ 0.5 rtol = 1e-6
+    @test OMBackend.variableValues(OMBackend.resimulate(dc; tspan = (0.0, 1.0), parameters = Dict{String, Any}("c" => 4.0)), "x")[end] ≈ 0.25 rtol = 1e-6
     #= a coefficient that is a call of a parameter: a parameter of its own (computed at each start, not in each right-hand
        side), which follows the override =#
     local dk = _arrayPathTranslate("ArrayPath.DerCoefficientOfCall"; scalarized = false)
     @test _arrayPathTaken(dk)
-    @test OMBackend.getVariableValues(OMBackend.simulateModel(dk; tspan = (0.0, 1.0)), "x")[end] ≈ 1 / sin(0.5) rtol = 1e-6
-    @test OMBackend.getVariableValues(OMBackend.resimulateModel(dk; tspan = (0.0, 1.0), parameters = Dict{String, Any}("p" => 1.0)), "x")[end] ≈ 1 / sin(1.0) rtol = 1e-6
+    @test OMBackend.variableValues(OMBackend.simulate(dk; tspan = (0.0, 1.0)), "x")[end] ≈ 1 / sin(0.5) rtol = 1e-6
+    @test OMBackend.variableValues(OMBackend.resimulate(dk; tspan = (0.0, 1.0), parameters = Dict{String, Any}("p" => 1.0)), "x")[end] ≈ 1 / sin(1.0) rtol = 1e-6
     #= starts that read parameters follow their overrides (they kept the translated values: 4) =#
     local sp = _arrayPathTranslate("ArrayPath.StartOfParameters"; scalarized = false)
     @test _arrayPathTaken(sp)
-    local sps = OMBackend.resimulateModel(sp; tspan = (0.0, 1.0), parameters = Dict{String, Any}("p1" => 10.0))
-    @test [OMBackend.getVariableValues(sps, v)[end] for v in ("y", "w")] ≈ [11.0, 11.0] rtol = 1e-6
+    local sps = OMBackend.resimulate(sp; tspan = (0.0, 1.0), parameters = Dict{String, Any}("p1" => 10.0))
+    @test [OMBackend.variableValues(sps, v)[end] for v in ("y", "w")] ≈ [11.0, 11.0] rtol = 1e-6
     #= a fixed start that reads a parameter the initialization computes: y = q there (it took q's start, 1); the array
        code declines it (its initial algorithms run after the initialization), the scalar path's value omc's =#
     local sf = _arrayPathTranslate("ArrayPath.StartOfFreeParameter"; scalarized = false)
-    @test OMBackend.getVariableValues(OMBackend.simulateModel(sf; tspan = (0.0, 1.0)), "y")[1] ≈ 3.0 rtol = 1e-6
+    @test OMBackend.variableValues(OMBackend.simulate(sf; tspan = (0.0, 1.0)), "y")[1] ≈ 3.0 rtol = 1e-6
     #= a parameter a structural one's binding reads is structural too: its override is refused (it ran with the
        translated if-equation) =#
     local sd = _arrayPathTranslate("ArrayPath.StructuralDependency"; scalarized = false)
-    @test OMBackend.getVariableValues(OMBackend.simulateModel(sd; tspan = (0.0, 1.0)), "x")[end] ≈ 2.0 rtol = 1e-6
-    @test_throws ErrorException OMBackend.resimulateModel(sd; tspan = (0.0, 1.0), parameters = Dict{String, Any}("R0" => -3.0))
+    @test OMBackend.variableValues(OMBackend.simulate(sd; tspan = (0.0, 1.0)), "x")[end] ≈ 2.0 rtol = 1e-6
+    @test_throws ErrorException OMBackend.resimulate(sd; tspan = (0.0, 1.0), parameters = Dict{String, Any}("R0" => -3.0))
     #= a call equation under an if-equation's branch: made where the branch holds (a TypeError: its condition was
        lifted into a Real) =#
     local cb = _arrayPathTranslate("ArrayPath.CallInIfBranch"; scalarized = false)
     @test _arrayPathTaken(cb)
-    @test OMBackend.getVariableValues(OMBackend.resimulateModel(cb; tspan = (0.0, 1.0), parameters = Dict{String, Any}("lim" => 2.0)), "x")[end] ≈ 1.0 rtol = 1e-6
-    @test_throws Exception OMBackend.resimulateModel(cb; tspan = (0.0, 1.0))
+    @test OMBackend.variableValues(OMBackend.resimulate(cb; tspan = (0.0, 1.0), parameters = Dict{String, Any}("lim" => 2.0)), "x")[end] ≈ 1.0 rtol = 1e-6
+    @test_throws Exception OMBackend.resimulate(cb; tspan = (0.0, 1.0))
     #= a sample interval that is not finite is refused (its ticks did not end) =#
     local se = _arrayPathTranslate("ArrayPath.SampleEquation"; scalarized = false)
-    @test_throws ErrorException OMBackend.resimulateModel(se; tspan = (0.0, 1.0), parameters = Dict{String, Any}("samplePeriod" => Inf))
-    @test_throws Exception OMBackend.resimulateModel(name; tspan = (0.0, 1.0), parameters = Dict("n" => 4))
+    @test_throws ErrorException OMBackend.resimulate(se; tspan = (0.0, 1.0), parameters = Dict{String, Any}("samplePeriod" => Inf))
+    @test_throws Exception OMBackend.resimulate(name; tspan = (0.0, 1.0), parameters = Dict("n" => 4))
   end
 
   #= isTunable, pristineParameters and eventCallbacks of an array model: they read the IMTK route's build only (false,
@@ -167,7 +167,7 @@ end
     @test sort(p0) == [2.0, 2.0, 4.0, 6.0, 6.0]
     #= a copy: changing it changes no later simulation =#
     p0 .= 0.0
-    @test OMBackend.simulateModel(name; tspan = (0.0, 1.0)).u[end] ≈ exp.(-[2.0, 4.0, 6.0]) rtol = 1e-4
+    @test OMBackend.simulate(name; tspan = (0.0, 1.0)).u[end] ≈ exp.(-[2.0, 4.0, 6.0]) rtol = 1e-4
     local cb = OMBackend.eventCallbacks(name)
     @test cb !== nothing
     @test typeof(cb) == typeof(OMBackend.getMTKProblem(name)[2])
@@ -194,8 +194,8 @@ end
   @testset "Asserts" begin
     local name = _arrayPathTranslate("ArrayPath.Guarded"; scalarized = false)
     @test _arrayPathTaken(name)
-    @test_throws OMBackend.CodeGeneration.ModelicaAssertionError OMBackend.simulateModel(name; tspan = (0.0, 1.0))
-    @test OMBackend.simulateModel(name; tspan = (0.0, 0.4)).retcode == ReturnCode.Success
+    @test_throws OMBackend.CodeGeneration.ModelicaAssertionError OMBackend.simulate(name; tspan = (0.0, 1.0))
+    @test OMBackend.simulate(name; tspan = (0.0, 0.4)).retcode == ReturnCode.Success
   end
 
   @testset "Initial array equations: for-equations over their elements (rollLeftArrayEquations!)" begin
@@ -210,7 +210,7 @@ end
        at a time (no residual solves them); q' = -p q, d doubled at 0.5 =#
     local (s, a, sol) = _bothWays("ArrayPath.ArrayInitialFree", ["q[1]", "q[2]", "d[1]", "d[2]"]; reltol = 1e-9, abstol = 1e-9)
     @test maximum(abs.(a .- [exp(-1), exp(-2), 6, 8])) < 1e-6 && maximum(abs.(s .- a)) < 1e-6
-    @test OMBackend.getVariableValues(sol, "d[2]")[1] == 4
+    @test OMBackend.variableValues(sol, "d[2]")[1] == 4
   end
 
   @testset "The step after an event, a singular Jacobian at the start values, a coefficient of zero" begin
@@ -219,7 +219,7 @@ end
        the event crossed the transient at once: a(0.2003) read 18.9 (`_restartStep!`) =#
     local step::String = _arrayPathTranslate("ArrayPath.StepAfterEvent"; scalarized = false)
     @test _arrayPathTaken(step)
-    local s1 = OMBackend.simulateModel(step; tspan = (0.0, 0.3), reltol = 1e-8, abstol = 1e-10)
+    local s1 = OMBackend.simulate(step; tspan = (0.0, 0.3), reltol = 1e-8, abstol = 1e-10)
     @test s1.retcode == ReturnCode.Success
     @test [s1(t; idxs = :a) for t in (0.2003, 0.2005, 0.21)] ≈ [20 * exp(-3), 20 * exp(-5), 0.0] atol = 1e-3
     #= a state following its input through a gain of 15000 into a limit, no event at the limit: the solver's own
@@ -227,7 +227,7 @@ end
        on the input, 5.32 at 0.11 (the values: this model at a tolerance of 1e-10) =#
     local kink::String = _arrayPathTranslate("ArrayPath.HighGainKink"; scalarized = false)
     @test _arrayPathTaken(kink)
-    local s2 = OMBackend.simulateModel(kink; tspan = (0.0, 0.11), reltol = 1e-6, abstol = 1e-8)
+    local s2 = OMBackend.simulate(kink; tspan = (0.0, 0.11), reltol = 1e-6, abstol = 1e-8)
     @test s2.retcode == ReturnCode.Success
     @test [s2(t; idxs = :x) for t in (0.101, 0.105, 0.11)] ≈ [0.6116052, 1.8580219, 3.4969888] atol = 1e-4
     #= (v[k] + i[k])^3 = P in a loop through the elements, the start values zero: its rows of the Jacobian are zero
@@ -261,7 +261,7 @@ end
        (not against the scalarized path: its when on integer(4x) > pre(n) fails, a BoundsError) =#
     local name = _arrayPathTranslate("ArrayPath.EventFunctions"; scalarized = false)
     @test _arrayPathTaken(name)
-    local ev = OMBackend.simulateModel(name; tspan = (0.0, 0.95))
+    local ev = OMBackend.simulate(name; tspan = (0.0, 0.95))
     @test _values(ev, ["y[1]", "y[2]", "y[3]", "n"]) ≈ [2.0, 0.05, 2.0, 3.0] atol = 1e-6
     #= the events: floor(2.5x) steps at 0.4 and 0.8, n at 0.25, 0.5, 0.75 =#
     @test [ev(t; idxs = Symbol("y[1]")) for t in (0.39, 0.41, 0.79, 0.81)] == [0.0, 1.0, 1.0, 2.0]
@@ -278,7 +278,7 @@ end
     local impulse = _arrayPathTranslate("ArrayPath.DoubleExpImpulse"; scalarized = false)
     @test _arrayPathTaken(impulse)
     local (eta, tau1, tau2) = (0.9511248490912196, 4.7010661173524463e-4, 4.0639516102066676e-6)
-    local ys = _values(OMBackend.simulateModel(impulse; tspan = (0.0, 1e-3), reltol = 1e-10, abstol = 1e-12), ["y[1]", "y[2]", "x[1]"])
+    local ys = _values(OMBackend.simulate(impulse; tspan = (0.0, 1e-3), reltol = 1e-10, abstol = 1e-12), ["y[1]", "y[2]", "x[1]"])
     @test ys ≈ [fill((exp(-1e-3 / tau1) - exp(-1e-3 / tau2)) / eta, 2); (tau1 * (1 - exp(-1e-3 / tau1)) - tau2 * (1 - exp(-1e-3 / tau2))) / eta] rtol = 1e-8
     local (s4, a4, _) = _bothWays("ArrayPath.InitAlgPulse", ["count", "T_start", "y"])
     @test maximum(abs.(s4 .- a4)) < 1e-6
@@ -292,7 +292,7 @@ end
     local name = _arrayPathTranslate("ArrayPath.InitialAssert"; scalarized = false)
     @test _arrayPathTaken(name)
     local err = try
-      OMBackend.simulateModel(name; tspan = (0.0, 1.0)); nothing
+      OMBackend.simulate(name; tspan = (0.0, 1.0)); nothing
     catch e
       e
     end
@@ -305,7 +305,7 @@ end
        generation); (p, q) = f(x) as an algorithm node (the MTK path fails on it) =#
     local name = _arrayPathTranslate("ArrayPath.Functions"; scalarized = false)
     @test _arrayPathTaken(name)
-    local sol = OMBackend.simulateModel(name; tspan = (0.0, 1.0))
+    local sol = OMBackend.simulate(name; tspan = (0.0, 1.0))
     @test sol.retcode == ReturnCode.Success
     local x = exp(-1.0)
     @test _values(sol, ["x", "y", "z", "p", "q"]) ≈ [x, 2x, 3x + 1, x^2, -x] rtol = 1e-5
@@ -317,7 +317,7 @@ end
   @testset "elsewhen, calls without a result, asserts in when bodies" begin
     local name = _arrayPathTranslate("ArrayPath.ElseWhen"; scalarized = false)
     @test _arrayPathTaken(name)
-    local sol = @test_logs (:warn, r"n reached 11") match_mode = :any OMBackend.simulateModel(name; tspan = (0.0, 1.0))
+    local sol = @test_logs (:warn, r"n reached 11") match_mode = :any OMBackend.simulate(name; tspan = (0.0, 1.0))
     #= x > 0.3: the first branch; x > 0.6 (the first condition still true): the second =#
     @test [sol(t; idxs = :n) for t in (0.2, 0.4, 0.7)] == [0.0, 1.0, 11.0]
     @test sol(1.0; idxs = :m) == 1.0
@@ -327,7 +327,7 @@ end
     local name = _arrayPathTranslate("ArrayPath.AssertMessage"; scalarized = false)
     @test _arrayPathTaken(name)
     local err = try
-      OMBackend.simulateModel(name; tspan = (0.0, 1.0)); nothing
+      OMBackend.simulate(name; tspan = (0.0, 1.0)); nothing
     catch e
       e
     end
@@ -551,7 +551,7 @@ end
     #= n's row once in the module: in invariants!, not in equations! =#
     @test count("sqrt(", string(OMBackend.COMPILED_MODELS_ARRAY_PRESERVE_DE[name][1])) == 1
     #= another solve, another k: its own invariant values (x(1) = exp(-2/3) > 0.5: y stays n[1]) =#
-    local again = OMBackend.resimulateModel(name; tspan = (0.0, 1.0), reltol = 1e-10, abstol = 1e-12,
+    local again = OMBackend.resimulate(name; tspan = (0.0, 1.0), reltol = 1e-10, abstol = 1e-12,
                                             parameters = Dict{String, Any}("k" => 1.0))
     @test _values(again, ["x", "y", "c"]) ≈ [exp(-2 / 3), 1 / 3, 2 / 3] rtol = 1e-8
     #= the solver's callbacks: conditions and affects behind one wrapper type (`_erasedCallbacks`), nothing of the
@@ -585,7 +585,7 @@ end
       """
     local name::String = _translateProgram(hum, "StiffHum"; scalarized = false)
     @test _arrayPathTaken(name)
-    local sol = OMBackend.simulateModel(name; tspan = (0.0, 30.0), reltol = 1e-6)
+    local sol = OMBackend.simulate(name; tspan = (0.0, 30.0), reltol = 1e-6)
     @test sol.retcode == ReturnCode.Success
     @test count(t::Float64 -> t > 29.0, sol.t) < 1.2 * count(t::Float64 -> t < 1.0, sol.t)
   end
@@ -642,7 +642,7 @@ end
     for kwargs::NamedTuple in ((;), (; verbose = OMBackend.Runtime.DiffEqBase.DEVerbosity()))
       local logger::Test.TestLogger = Test.TestLogger(min_level = Base.CoreLogging.Warn)
       local sol = Base.CoreLogging.with_logger(logger) do
-        OMBackend.simulateModel(name; tspan = (0.0, 0.1), kwargs...)
+        OMBackend.simulate(name; tspan = (0.0, 0.1), kwargs...)
       end
       @test sol.retcode == ReturnCode.Success
       push!(warnings, count(r -> occursin("Initial timestep too small", string(r.message)), logger.logs))
@@ -675,9 +675,9 @@ end
     #= nonlinear (the scalarized model's initialization fails here): its residuals at the end =#
     local name::String = _arrayPathTranslate("ArrayPath.CoupledNonlinear"; scalarized = false)
     @test _arrayPathTaken(name)
-    sol = OMBackend.simulateModel(name; tspan = (0.0, 1.0), tight...)
+    sol = OMBackend.simulate(name; tspan = (0.0, 1.0), tight...)
     @test sol.retcode == ReturnCode.Success
-    local val::Function = (n::String) -> OMBackend.getVariableValues(sol, n)[end]
+    local val::Function = (n::String) -> OMBackend.variableValues(sol, n)[end]
     local (x::Vector{Float64}, v::Vector{Float64}, w::Vector{Float64}) = ([val("x[$i]") for i in 1:20], [val("v[$i]") for i in 1:20], [val("w[$i]") for i in 1:20])
     local residuals::Vector{Float64} = [2v[1] - v[2] + 0.1v[1]^3 - x[1]; [-v[i - 1] + 3v[i] - v[i + 1] + 0.1v[i]^3 - x[i] for i in 2:19];
                        -v[19] + 2v[20] + 0.1v[20]^3 - x[20]]
@@ -811,7 +811,7 @@ end
       """
     local name::String = _translateProgram(unread, "UnreadParameters"; scalarized = false)
     @test _arrayPathTaken(name)
-    local sol = OMBackend.simulateModel(name; tspan = (0.0, 1.0))
+    local sol = OMBackend.simulate(name; tspan = (0.0, 1.0))
     @test sol.retcode == ReturnCode.Success
     @test _values(sol, ["J", "k"]) == [2.0, 6.0]
   end
@@ -921,7 +921,7 @@ end DivideInLoop;
        is no state. The scalarized route does not build this model (a structural imbalance of its reduced system) =#
     local phases::String = _arrayPathTranslate("ArrayPath.ZeroOrientationPhases"; scalarized = false)
     @test _arrayPathTaken(phases)
-    local solPhases = OMBackend.simulateModel(phases; tspan = (0.0, 1.0))
+    local solPhases = OMBackend.simulate(phases; tspan = (0.0, 1.0))
     @test solPhases.retcode == ReturnCode.Success
     local angles::Vector{Float64} = [0.0, 2pi / 3, 4pi / 3]
     @test isapprox(_values(solPhases, ["Phire[1]", "Phire[2]", "Phire[3]"]), cos.(angles) .* exp(-1); atol = 1e-6)
@@ -1140,7 +1140,7 @@ end DivideInLoop;
        above[1], which keeps pre()'s true: count 11. (The scalarized route starts with 10: not compared there) =#
     local startName::String = _arrayPathTranslate("ArrayPath.PreStartInLoop"; scalarized = false)
     @test _arrayPathTaken(startName)
-    @test _values(OMBackend.simulateModel(startName; tspan = (0.0, 0.01)), ["count"]) == [11.0]
+    @test _values(OMBackend.simulate(startName; tspan = (0.0, 0.01)), ["count"]) == [11.0]
     local (sp, ap, _) = _bothWays("ArrayPath.PreStartInLoop", ["x", "count"])
     @test isapprox(ap, [0.5 + 0.4 * cos(1.0), 10.0]; atol = 1e-6)
     @test maximum(abs.(sp .- ap)) < 1e-6
@@ -1414,21 +1414,21 @@ end DivideInLoop;
          ("ArrayPath.WhenIfArrayTarget", ["d[1]", "d[2]"], 1.0, [8.0, 10.0], true),
          ("ArrayPath.TupleArrayTarget", ["r", "s[1]", "s[2]"], 0.9, [5.0, 3.0, 3.0], false),
          ("ArrayPath.PreArrayStart", ["r", "s[1]", "s[2]"], 0.9, [2.000000005e9, 2.000000003e9, 3.0], false))
-      #= the route of OM's translate (`translateReducedArrays`: `nothing` is its caller's
+      #= the route of OM's translate (`translate(fm; scalarize = false)`: `nothing` is its caller's
          `ARRAY_PRESERVING_CODEGEN_NOT_SUPPORTED`) =#
       local name::String = _arrayPathTranslate(model; scalarized = false)
       local (fm, cache) = OMFrontend.instantiateSCodeToFM(model, _ARRAY_PATH_SCODE[]; scalarize = false)
-      @test OMBackend.translateReducedArrays(fm; functionList = OMFrontend.cacheToFunctionList(cache)) !== nothing
+      @test OMBackend.translate(fm; scalarize = false, functionList = OMFrontend.cacheToFunctionList(cache)) !== nothing
       @test _arrayPathTaken(name)
       if whenModel
         OMBackend.ARRAY_PRESERVE_DE_GENERATION[] = false
         try
-          @test OMBackend.translateReducedArrays(fm; functionList = OMFrontend.cacheToFunctionList(cache)) !== nothing
+          @test OMBackend.translate(fm; scalarize = false, functionList = OMFrontend.cacheToFunctionList(cache)) !== nothing
           @test name in OMBackend.BACKEND_SCALARIZED_MODELS
-          @test _values(OMBackend.simulateModel(name; tspan = (0.0, T)), names) ≈ expected atol = 1e-9
+          @test _values(OMBackend.simulate(name; tspan = (0.0, T)), names) ≈ expected atol = 1e-9
           #= switched off: `nothing` (the caller's error), the reason recorded =#
           withenv("OMBACKEND_BACKEND_SCALARIZATION" => "false") do
-            @test OMBackend.translateReducedArrays(fm; functionList = OMFrontend.cacheToFunctionList(cache)) === nothing
+            @test OMBackend.translate(fm; scalarize = false, functionList = OMFrontend.cacheToFunctionList(cache)) === nothing
             @test !(name in OMBackend.BACKEND_SCALARIZED_MODELS)
             @test occursin("backend scalarization: switched off", OMBackend.scalarizedFallbackReason(name))
           end
@@ -1438,7 +1438,7 @@ end DivideInLoop;
       end
       _arrayPathTranslate(model; scalarized = false)
       local sol::OMBackend.DifferentialEquations.SciMLBase.AbstractODESolution =
-        OMBackend.simulateModel(name; tspan = (0.0, T))
+        OMBackend.simulate(name; tspan = (0.0, T))
       @test sol.retcode == ReturnCode.Success
       @test _values(sol, names) ≈ expected atol = 1e-9
     end
@@ -1472,7 +1472,7 @@ end DivideInLoop;
        code does not take): [1.2, 0.9, 0.2] at 1.2 =#
     local name = _arrayPathTranslate("ArrayPath.ReinitElements"; scalarized = false)
     @test _arrayPathTaken(name)
-    local sol = OMBackend.simulateModel(name; tspan = (0.0, 1.2))
+    local sol = OMBackend.simulate(name; tspan = (0.0, 1.2))
     @test sol.retcode == ReturnCode.Success
     @test isapprox(_values(sol, ["v[1]", "v[2]", "v[3]"]), [1.2, 0.9, 0.2]; atol = 1e-6)
     #= the record's fields and the scalar by their positions in the result, 1, 2, 3 (1, 3, 4 before: out of the
@@ -1488,7 +1488,7 @@ end DivideInLoop;
     local (sg, ag, _) = _bothWays("ArrayPath.EdgeOfTarget", ["cnt"])
     @test ag == [0.0] && sg == ag
     local (ss, as, solS) = _bothWays("ArrayPath.SumOfTargets", ["s"])
-    @test as == [6.0] && ss == as && OMBackend.getVariableValues(solS, "s")[findlast(<=(0.5), solS.t)] == 4.0
+    @test as == [6.0] && ss == as && OMBackend.variableValues(solS, "s")[findlast(<=(0.5), solS.t)] == 4.0
     #= a read through a variable subscript (x[i], i = 2) before the assignment of x[2]: x[2] from pre(x[2]) (did not
        settle: x[2] grew by 10 at every pass); OpenModelica 1.27.1: 40 at 1 =#
     local (sv, av, _) = _bothWays("ArrayPath.VarSubRead", ["x[1]", "x[2]"])
@@ -1497,8 +1497,8 @@ end DivideInLoop;
        before its guarded assignment through s[k] keeps its value there; an element read before its assignment through
        s[k] starts from pre(); OpenModelica 1.27.1's values =#
     local at = (name::String, var::String, ts::Vector{Float64}) -> begin
-      local sol = OMBackend.simulateModel(_arrayPathTranslate(name; scalarized = false); tspan = (0.0, 1.0))
-      local v::Vector{Float64} = OMBackend.getVariableValues(sol, var)
+      local sol = OMBackend.simulate(_arrayPathTranslate(name; scalarized = false); tspan = (0.0, 1.0))
+      local v::Vector{Float64} = OMBackend.variableValues(sol, var)
       return [v[findlast(<=(t), sol.t)] for t in ts]
     end
     @test at("ArrayPath.AssignedThenGuarded", "s[2].a", [0.2, 0.4, 0.7, 0.9]) == [5.0, 5.0, 7.0, 7.0]
@@ -1523,12 +1523,12 @@ end DivideInLoop;
     local arrayRun = (name::String; kw...) -> begin
       local n = _arrayPathTranslate(name; scalarized = false)
       @test _arrayPathTaken(n)
-      local sol = OMBackend.simulateModel(n; tspan = (0.0, 1.0), kw...)
+      local sol = OMBackend.simulate(n; tspan = (0.0, 1.0), kw...)
       @test sol.retcode == ReturnCode.Success
       return sol
     end
     local at = (sol, var::String, ts::Vector{Float64}) -> begin
-      local v::Vector{Float64} = OMBackend.getVariableValues(sol, var)
+      local v::Vector{Float64} = OMBackend.variableValues(sol, var)
       return [v[findlast(<=(t), sol.t)] for t in ts]
     end
     #= a lifted discrete cluster runs at every pass of every event and of the start's iteration: pre(mode) the initial
@@ -1536,12 +1536,12 @@ end DivideInLoop;
        0, x(1) = 0); OpenModelica 1.27.1's values =#
     local pai = arrayRun("ArrayPath.PreAfterInit")
     @test at(pai, "mode", [0.0, 0.5]) == [1.0, 1.0]
-    @test OMBackend.getVariableValues(pai, "x")[end] ≈ 1.0 atol = 1e-6
+    @test OMBackend.variableValues(pai, "x")[end] ≈ 1.0 atol = 1e-6
     #= a time event (time < 0.5) at its exact time, the relations literal there: f <= 0 at f = 0 holds (with the
        events' hysteresis free stayed false: x(1) = 0); OpenModelica 1.27.1's values =#
     local eb = arrayRun("ArrayPath.ExactBoundaryAtEvent")
     @test at(eb, "free", [0.45, 0.6]) == [0.0, 1.0]
-    @test OMBackend.getVariableValues(eb, "x")[end] ≈ 0.5 atol = 1e-6
+    @test OMBackend.variableValues(eb, "x")[end] ≈ 0.5 atol = 1e-6
     #= sample() in an equation, its start from an initial equation: the ticks at 0, 0.2, ... (refused before);
        OpenModelica 1.27.1's values =#
     @test at(arrayRun("ArrayPath.SampleEquation"), "y", [0.1, 0.3, 0.5, 0.9]) ≈ [0.0, 0.0, 0.2, 0.6] atol = 1e-9
@@ -1585,7 +1585,7 @@ end DivideInLoop;
 
   @testset "overrides of parameters read only by starts" begin
     local x0 = (name::String, var::String, parameters::Dict{String, Any}) ->
-      OMBackend.getVariableValues(OMBackend.resimulateModel(name; tspan = (0.0, 1.0), parameters), var)[1]
+      OMBackend.variableValues(OMBackend.resimulate(name; tspan = (0.0, 1.0), parameters), var)[1]
     #= sum(q) in a start (q was no parameter of the array code: the sum of an array literal did not translate); omc
        6, with -override=q[1]=10 15 =#
     local su = _arrayPathTranslate("ArrayPath.StartOfSum"; scalarized = false)
@@ -1606,11 +1606,11 @@ end DivideInLoop;
     local run = (model::String, scalarized::Bool; taken::Bool = true, parameters = Dict{String, Any}()) -> begin
       local n = _arrayPathTranslate("ArrayPath." * model; scalarized)
       (scalarized || !taken) || @test _arrayPathTaken(n)
-      return isempty(parameters) ? OMBackend.simulateModel(n; tspan = (0.0, 1.0)) :
-                                   OMBackend.resimulateModel(n; tspan = (0.0, 1.0), parameters)
+      return isempty(parameters) ? OMBackend.simulate(n; tspan = (0.0, 1.0)) :
+                                   OMBackend.resimulate(n; tspan = (0.0, 1.0), parameters)
     end
     local at = (sol, var::String, ts::Vector{Float64}) -> begin
-      local v::Vector{Float64} = OMBackend.getVariableValues(sol, var)
+      local v::Vector{Float64} = OMBackend.variableValues(sol, var)
       return [v[findlast(<=(t + 1e-12), sol.t)] for t in ts]
     end
     #= the array path: a der() coefficient of a parameter with fixed = false stays an expression (its parameter was a
@@ -1621,15 +1621,15 @@ end DivideInLoop;
     local sp = _arrayPathTranslate("ArrayPath.StringParam"; scalarized = false)
     @test _arrayPathTaken(sp)
     local se = try
-      OMBackend.resimulateModel(sp; tspan = (0.0, 1.0), parameters = Dict{String, Any}("s" => "xyz"))
+      OMBackend.resimulate(sp; tspan = (0.0, 1.0), parameters = Dict{String, Any}("s" => "xyz"))
       nothing
     catch e
       e
     end
     @test se isa OMBackend.CodeGeneration.ModelicaAssertionError && occursin("xyz", se.message)
-    @test_throws ArgumentError OMBackend.resimulateModel(sp; tspan = (0.0, 1.0), parameters = Dict{String, Any}("s" => 3.0))
+    @test_throws ArgumentError OMBackend.resimulate(sp; tspan = (0.0, 1.0), parameters = Dict{String, Any}("s" => 3.0))
     local ps = _arrayPathTranslate("ArrayPath.ParamSample"; scalarized = false)
-    @test_throws ArgumentError OMBackend.resimulateModel(ps; tspan = (0.0, 1.0), parameters = Dict{String, Any}("T" => "abc"))
+    @test_throws ArgumentError OMBackend.resimulate(ps; tspan = (0.0, 1.0), parameters = Dict{String, Any}("T" => "abc"))
     #= two problems of one model, both built before either is solved: each its own samples (they shared them) =#
     local mod::Module = getfield(OMBackend, Symbol(ps))
     local modelFn = getfield(mod, Symbol(ps, "Model"))
@@ -1637,25 +1637,25 @@ end DivideInLoop;
     local (p2, c2) = Base.invokelatest(modelFn, (0.0, 1.0); parameters = Dict{String, Any}("T" => 0.1))
     local DE = OMBackend.DifferentialEquations
     #= the generated module's functions in the latest world (it was evaluated in this test) =#
-    @test OMBackend.getVariableValues(Base.invokelatest(DE.solve, p1, DE.Rodas5P(); callback = c1), "n")[end] == 5.0
-    @test OMBackend.getVariableValues(Base.invokelatest(DE.solve, p2, DE.Rodas5P(); callback = c2), "n")[end] == 11.0
+    @test OMBackend.variableValues(Base.invokelatest(DE.solve, p1, DE.Rodas5P(); callback = c1), "n")[end] == 5.0
+    @test OMBackend.variableValues(Base.invokelatest(DE.solve, p2, DE.Rodas5P(); callback = c2), "n")[end] == 11.0
     #= a copied problem (an ensemble's trajectories, `remake` with deepcopy(p)): the module shared, the run's state its own =#
     local (p3, c3) = Base.invokelatest(modelFn, (0.0, 1.0); parameters = Dict{String, Any}("T" => 0.25))
     local q3 = deepcopy(p3.p)
     @test q3.model === p3.p.model && q3.state !== p3.p.state
     local ens = DE.EnsembleProblem(p3; prob_func = (pr, ctx) -> DE.remake(pr; p = deepcopy(pr.p)))
     local es = Base.invokelatest(DE.solve, ens, DE.Rodas5P(), DE.EnsembleSerial(); trajectories = 2, callback = c3)
-    @test [OMBackend.getVariableValues(s, "n")[end] for s in es.u] == [5.0, 5.0]
+    @test [OMBackend.variableValues(s, "n")[end] for s in es.u] == [5.0, 5.0]
   end
 
   @testset "slices of component arrays, a start solution that fires whens, checked subscripts" begin
     local run = (model::String, scalarized::Bool; stop::Float64 = 1.0) -> begin
       local n = _arrayPathTranslate("ArrayPath." * model; scalarized)
       scalarized || @test _arrayPathTaken(n)
-      return OMBackend.simulateModel(n; tspan = (0.0, stop))
+      return OMBackend.simulate(n; tspan = (0.0, stop))
     end
     local at = (sol, var::String, ts::Vector{Float64}) -> begin
-      local v::Vector{Float64} = OMBackend.getVariableValues(sol, var)
+      local v::Vector{Float64} = OMBackend.variableValues(sol, var)
       return [v[findlast(<=(t + 1e-12), sol.t)] for t in ts]
     end
     #= a field of a connector array and of a model array through a whole slice (ac.pin[:].i, c[:].x) =#
@@ -1821,16 +1821,16 @@ end DivideInLoop;
       """
     local pico::String = _translateProgram(pulses, "PicoPulse"; scalarized = false)
     @test _arrayPathTaken(pico)
-    local ps = OMBackend.simulateModel(pico; tspan = (0.0, 1.0e-11), dt = 1.0e-15)
+    local ps = OMBackend.simulate(pico; tspan = (0.0, 1.0e-11), dt = 1.0e-15)
     @test ps.retcode == ReturnCode.Success
-    @test OMBackend.getVariableValues(ps, "x")[end] ≈ 2.5e-12 rtol = 1e-9
+    @test OMBackend.variableValues(ps, "x")[end] ≈ 2.5e-12 rtol = 1e-9
     local ticks::String = _translateProgram(pulses, "Ticks"; scalarized = false)
     @test _arrayPathTaken(ticks)
     local (tp, tc) = OMBackend.getMTKProblem(ticks)
     @test tp.tspan == (0.0, 1.0)
     local DE = OMBackend.DifferentialEquations
     local tsol = Base.invokelatest(DE.solve, tp, DE.Rodas5P(); callback = tc)
-    @test OMBackend.getVariableValues(tsol, "n")[end] == 1001.0
+    @test OMBackend.variableValues(tsol, "n")[end] == 1001.0
     @test length(tp.p.state.sampleStops) == 2
   end
 
@@ -1948,10 +1948,10 @@ end DivideInLoop;
     @test al ≈ [0.5, 0.0] atol = 1e-6
     @test sl ≈ al atol = 1e-6
     local latch::String = _translateProgram(latches, "Latch"; scalarized = false)
-    @test OMBackend.getVariableValues(OMBackend.simulateModel(latch; tspan = (0.0, 0.25)), "active")[end] == 1.0
-    local inactive = OMBackend.resimulateModel(latch; tspan = (0.0, 1.0),
+    @test OMBackend.variableValues(OMBackend.simulate(latch; tspan = (0.0, 0.25)), "active")[end] == 1.0
+    local inactive = OMBackend.resimulate(latch; tspan = (0.0, 1.0),
                                                parameters = Dict{String, Any}("initiallyActive" => false))
-    @test OMBackend.getVariableValues(inactive, "x")[end] ≈ 0.0 atol = 1e-9
+    @test OMBackend.variableValues(inactive, "x")[end] ≈ 0.0 atol = 1e-9
   end
 
   @testset "a when-equation on an array: a vector of conditions, change() of an array" begin
@@ -2088,7 +2088,7 @@ end DivideInLoop;
     @test at ≈ [2.0, 0.8, 0.8] atol = 1e-9
     @test st ≈ at atol = 1e-9
     #= not before the end: at 0.6 the crossing only =#
-    local n::Vector{Float64} = OMBackend.getVariableValues(sol, "n")
+    local n::Vector{Float64} = OMBackend.variableValues(sol, "n")
     @test n[findlast(<=(0.6), sol.t)] == 1.0
   end
 
@@ -2390,7 +2390,7 @@ end DivideInLoop;
       """
     local name::String = _translateProgram(clash, "ClashingStarts"; scalarized = false)
     if _arrayPathTaken(name)
-      @test_throws Exception OMBackend.simulateModel(name; tspan = (0.0, 1.0))
+      @test_throws Exception OMBackend.simulate(name; tspan = (0.0, 1.0))
     else
       @test occursin("the initialization is over-determined: ia[k] = 0.0", OMBackend.scalarizedFallbackReason(name))
     end
@@ -2576,12 +2576,12 @@ end DivideInLoop;
        of people 0 all day, 42 of 606 variables off omc). A read makes the run's calls again up to its time =#
     local name = _arrayPathTranslate("ArrayPath.TableSegments"; scalarized = false)
     @test _arrayPathTaken(name)
-    local sol = OMBackend.simulateModel(name; tspan = (0.0, 1.0))
+    local sol = OMBackend.simulate(name; tspan = (0.0, 1.0))
     @test sol.retcode == ReturnCode.Success
     @test isapprox(_values(sol, ["x[1]", "x[2]"]), [3.8, 7.6]; rtol = 1e-6)
     @test [sol(t; idxs = :y) for t in (0.2, 0.45, 0.8, 0.1)] == [0.0, 10.0, 2.0, 0.0]
     #= at the events the left and the right value =#
-    local y::Vector{Float64} = OMBackend.getVariableValues(sol, "y")
+    local y::Vector{Float64} = OMBackend.variableValues(sol, "y")
     local steps::Vector{Tuple{Float64, Float64, Float64}} =
       [(sol.t[i], y[i - 1], y[i]) for i in 2:length(sol.t) if sol.t[i] == sol.t[i - 1] && sol.t[i] > 0]
     @test [(round(t; digits = 6), l, r) for (t, l, r) in steps] == [(0.3, 0.0, 10.0), (0.6, 10.0, 2.0)]
@@ -2603,11 +2603,11 @@ end DivideInLoop;
     local name::String = _translateProgram(small, "SmallStates"; scalarized = false)
     @test _arrayPathTaken(name)
     local exact::Vector{Float64} = [k * 1.0e-8 * exp(-k * (1 + (1 - cos(20.0)) / 20)) for k in 1:2]
-    local sol = OMBackend.simulateModel(name; tspan = (0.0, 1.0))
+    local sol = OMBackend.simulate(name; tspan = (0.0, 1.0))
     @test sol.retcode == ReturnCode.Success
     @test isapprox(_values(sol, ["x[1]", "x[2]"]), exact; rtol = 0.02)
     #= 1% at 1e-10 (the states 1e-8); at 1e-6 x[2] was 1.2e-8 for 2.6e-9. A caller's abstol is the solver's =#
-    local loose = OMBackend.simulateModel(name; tspan = (0.0, 1.0), abstol = 1e-6)
+    local loose = OMBackend.simulate(name; tspan = (0.0, 1.0), abstol = 1e-6)
     @test length(loose.t) < length(sol.t)
   end
 
@@ -2869,14 +2869,14 @@ end DivideInLoop;
       """
     local name::String = _translateProgram(program, "ModeSingular"; scalarized = false)
     @test _arrayPathTaken(name)
-    local sol = OMBackend.simulateModel(name; tspan = (0.0, 20.0))
+    local sol = OMBackend.simulate(name; tspan = (0.0, 20.0))
     @test sol.retcode == ReturnCode.Success
-    local x::Vector{Float64} = OMBackend.getVariableValues(sol, "x")
-    local dp::Vector{Float64} = OMBackend.getVariableValues(sol, "p[1]") .- OMBackend.getVariableValues(sol, "p[11]")
+    local x::Vector{Float64} = OMBackend.variableValues(sol, "x")
+    local dp::Vector{Float64} = OMBackend.variableValues(sol, "p[1]") .- OMBackend.variableValues(sol, "p[11]")
     local mOpen::Float64 = -0.1 / sqrt(0.1 + 1e-6)
     @test isapprox(x[end], 10 * mOpen; rtol = 1e-6)
     @test isapprox(dp[1], 1.0; rtol = 1e-8)
-    @test isapprox(OMBackend.getVariableValues(sol, "m")[end], mOpen; rtol = 1e-8)
+    @test isapprox(OMBackend.variableValues(sol, "m")[end], mOpen; rtol = 1e-8)
   end
 
   @testset "Two relations of one threshold within their hysteresis bands" begin
@@ -2906,9 +2906,9 @@ end DivideInLoop;
       """
     local name::String = _translateProgram(program, "BandedSwitch"; scalarized = false)
     @test _arrayPathTaken(name)
-    local sol = OMBackend.simulateModel(name; tspan = (0.0, 10.0))
+    local sol = OMBackend.simulate(name; tspan = (0.0, 10.0))
     @test sol.retcode == ReturnCode.Success
-    @test isapprox(OMBackend.getVariableValues(sol, "x")[end], 6.5; rtol = 1e-6)
+    @test isapprox(OMBackend.variableValues(sol, "x")[end], 6.5; rtol = 1e-6)
   end
 
   @testset "A clocked partition of arrays read by their elements" begin
@@ -2940,9 +2940,9 @@ end DivideInLoop;
       """
     local name::String = _translateProgram(program, "ClockedVector"; scalarized = false)
     @test _arrayPathTaken(name)
-    local sol = OMBackend.simulateModel(name; tspan = (0.0, 0.95))
+    local sol = OMBackend.simulate(name; tspan = (0.0, 0.95))
     @test sol.retcode == ReturnCode.Success
-    local at = (v::String) -> OMBackend.getVariableValues(sol, v)[end]
+    local at = (v::String) -> OMBackend.variableValues(sol, v)[end]
     @test isapprox([at("y[1]"), at("y[2]"), at("a"), at("ys[2]"), at("w")], [10.0, 20.0, 20.0, 1.8, 21.8]; rtol = 1e-9)
   end
 
@@ -3166,8 +3166,8 @@ end DivideInLoop;
     local (s, a, sol) = _bothWaysOf(program, "LockedLoad", ["i", "x", "sa", "w"]; tspan = (0.0, 0.2))
     @test a ≈ [2.0, 2.0, 0.0, 0.0] atol = 1e-8
     @test s ≈ a atol = 1e-8
-    @test OMBackend.getVariableValues(sol, "i")[1] ≈ 2.0 atol = 1e-8
-    @test OMBackend.getVariableValues(sol, "sa")[1] ≈ 0.0 atol = 1e-8
+    @test OMBackend.variableValues(sol, "i")[1] ≈ 2.0 atol = 1e-8
+    @test OMBackend.variableValues(sol, "sa")[1] ≈ 0.0 atol = 1e-8
   end
 
   @testset "Rotated constant currents through an inductance" begin
@@ -3195,9 +3195,9 @@ end DivideInLoop;
       """
     local name::String = _translateProgram(program, "RotatedCurrent"; scalarized = false)
     @test _arrayPathTaken(name)
-    local sol = OMBackend.simulateModel(name; tspan = (0.0, 1.0))
+    local sol = OMBackend.simulate(name; tspan = (0.0, 1.0))
     @test sol.retcode == ReturnCode.Success
-    local at = (v::String) -> OMBackend.getVariableValues(sol, v)[end]
+    local at = (v::String) -> OMBackend.variableValues(sol, v)[end]
     local expected::Vector{Float64} = [0.5 * (-2 * sin(1.0) - 3 * cos(1.0)), 0.5 * (2 * cos(1.0) - 3 * sin(1.0))]
     @test isapprox([at("v[1]"), at("v[2]")], expected; rtol = 1e-5)
   end
@@ -3243,9 +3243,9 @@ end DivideInLoop;
       """
     local name::String = _translateProgram(program, "IdealOrTable"; scalarized = false)
     @test _arrayPathTaken(name)
-    local sol = OMBackend.simulateModel(name; tspan = (0.0, 1.0))
+    local sol = OMBackend.simulate(name; tspan = (0.0, 1.0))
     @test sol.retcode == ReturnCode.Success
-    local at = (v::String) -> OMBackend.getVariableValues(sol, v)[end]
+    local at = (v::String) -> OMBackend.variableValues(sol, v)[end]
     @test isapprox([at("x"), at("r[1,2]"), at("a")], [1 / 3.5, 2 / 3.5, 2.5 / 3.5]; rtol = 1e-5)
   end
 
@@ -3272,7 +3272,7 @@ end DivideInLoop;
       """
     local name::String = _translateProgram(program, "DerOfExpression"; scalarized = false)
     @test _arrayPathTaken(name)
-    local sol = OMBackend.simulateModel(name; tspan = (0.0, 3.0))
+    local sol = OMBackend.simulate(name; tspan = (0.0, 3.0))
     @test sol.retcode == ReturnCode.Success
     @test isapprox([sol(1.0; idxs = :h), sol(3.0; idxs = :h), sol(3.0; idxs = Symbol("x[2]"))],
                    [1 - exp(-1.0), 1 - exp(-4.0), exp(-3.0)]; rtol = 1e-4)
@@ -3302,7 +3302,7 @@ end DivideInLoop;
       """
     local name::String = _translateProgram(program, "Comparators"; scalarized = false)
     @test _arrayPathTaken(name)
-    local sol = OMBackend.simulateModel(name; tspan = (0.0, 2.0))
+    local sol = OMBackend.simulate(name; tspan = (0.0, 2.0))
     @test sol.retcode == ReturnCode.Success
     @test isapprox([sol(t; idxs = Symbol("x[1]")) for t in (0.25, 1.0, 2.0)], [-0.25, 0.002, -0.004]; atol = 1e-4)
     @test isapprox([sol(t; idxs = Symbol("x[2]")) for t in (0.5, 1.0)], [-0.25, -0.248]; atol = 1e-4)
@@ -3333,7 +3333,7 @@ end DivideInLoop;
     local name::String = _translateProgram(program, "HomotopyThrows"; scalarized = false)
     @test _arrayPathTaken(name)
     @test OMBackend.FALLBACKS[:arrayHomotopyContinuation].exceptionType == "DomainError"
-    local sol = OMBackend.simulateModel(name; tspan = (0.0, 1.0))
+    local sol = OMBackend.simulate(name; tspan = (0.0, 1.0))
     @test sol.retcode == ReturnCode.Success
     @test sol.u[1] == [0.0, 0.25]
   end
@@ -3449,7 +3449,7 @@ end DivideInLoop;
       """
     local (s, a, sol) = _bothWaysOf(program, "TwoTables", ["yAnd", "yXor"])
     @test a == [4.0, 3.0] && s == a
-    @test [OMBackend.getVariableValues(sol, "yXor")[1]] == [1.0]
+    @test [OMBackend.variableValues(sol, "yXor")[1]] == [1.0]
   end
 
   @testset "Events: a short window, an event function at its interval's end, a DAE solver" begin
@@ -3497,19 +3497,19 @@ end DivideInLoop;
        intervals (`_stepKwargs`) =#
     local name::String = _translateProgram(program, "SmallEvents.ShortWindow"; scalarized = false)
     @test _arrayPathTaken(name)
-    @test OMBackend.getVariableValues(OMBackend.simulateModel(name; tspan = (0.0, 10.0)), "n")[end] == 2
+    @test OMBackend.variableValues(OMBackend.simulate(name; tspan = (0.0, 10.0)), "n")[end] == 2
     #= mod(time, 24) reaches 24 just after the crossing of DNTime > 24 (2e-6 earlier, at the hysteresis): its value
        kept within the band was stale at that event, and the relations switched back and forth (OM.jl's
        PersonalityAspects); at an event it is literal, as omc's _event_floor =#
     name = _translateProgram(program, "SmallEvents.ModDay"; scalarized = false)
-    local day = OMBackend.simulateModel(name; tspan = (0.0, 60.0), abstol = 1e-2, reltol = 1e-2,
+    local day = OMBackend.simulate(name; tspan = (0.0, 60.0), abstol = 1e-2, reltol = 1e-2,
                                         solver = OMBackend.OrdinaryDiffEqBDF.FBDF(autodiff = fd))
     @test day.retcode == ReturnCode.Success
     @test [day(t; idxs = :DNTime) for t in (30.0, 36.0)] ≈ [6.0, 12.0] atol = 1e-6
     #= a DAE solver on the array code: its ODE in residual form (`ode_to_dae`), initialized by Brown's method after a
        reinit (the default check failed with the residual of the reinit's jump) =#
     name = _translateProgram(program, "SmallEvents.DAEIfReinit"; scalarized = false)
-    local dae = OMBackend.simulateModel(name; tspan = (0.0, 3.5), reltol = 1e-8, abstol = 1e-10,
+    local dae = OMBackend.simulate(name; tspan = (0.0, 3.5), reltol = 1e-8, abstol = 1e-10,
                                         solver = OMBackend.OrdinaryDiffEqBDF.DFBDF(autodiff = fd))
     @test dae.retcode == ReturnCode.Success
     @test [dae(1.4; idxs = :z), dae(3.2; idxs = :v), dae(3.5; idxs = :z)] ≈ [0.375, 0.19282993096291295, 1.125] atol = 1e-6
@@ -3536,7 +3536,7 @@ end DivideInLoop;
     #= the literals of an enumeration are a tuple of names, indexed by its value (`_checkedIndex(::Tuple, i)`) =#
     local name::String = _translateProgram(program, "ByIndex.EnumerationString"; scalarized = false)
     @test _arrayPathTaken(name)
-    @test_logs (:warn, r"e=  three\|$") match_mode = :any OMBackend.simulateModel(name; tspan = (0.0, 1.0))
+    @test_logs (:warn, r"e=  three\|$") match_mode = :any OMBackend.simulate(name; tspan = (0.0, 1.0))
   end
 
   @testset "A translate of unchanged code keeps the module; changed code evaluates it again" begin
@@ -3550,16 +3550,16 @@ end DivideInLoop;
       """
     local name::String = _translateProgram(decay("2.0"), "KeptDecay"; scalarized = false)
     @test _arrayPathTaken(name)
-    OMBackend.simulateModel(name; tspan = (0.0, 1.0))
+    OMBackend.simulate(name; tspan = (0.0, 1.0))
     local evaluated::Module = OMBackend._modelModule(Symbol(name))
     _translateProgram(decay("2.0"), "KeptDecay"; scalarized = false)
     @test !OMBackend.modelWasCompiledAgainArrayPreserveDE(name)
-    local sol = OMBackend.simulateModel(name; tspan = (0.0, 1.0), reltol = 1e-8, abstol = 1e-10)
+    local sol = OMBackend.simulate(name; tspan = (0.0, 1.0), reltol = 1e-8, abstol = 1e-10)
     @test OMBackend._modelModule(Symbol(name)) === evaluated
     @test _values(sol, ["x[1]", "x[2]"]) ≈ [exp(-1.0), exp(-2.0)] rtol = 1e-6
     _translateProgram(decay("3.0"), "KeptDecay"; scalarized = false)
     @test OMBackend.modelWasCompiledAgainArrayPreserveDE(name)
-    sol = OMBackend.simulateModel(name; tspan = (0.0, 1.0), reltol = 1e-8, abstol = 1e-10)
+    sol = OMBackend.simulate(name; tspan = (0.0, 1.0), reltol = 1e-8, abstol = 1e-10)
     @test OMBackend._modelModule(Symbol(name)) !== evaluated
     @test _values(sol, ["x[1]", "x[2]"]) ≈ [exp(-1.0), exp(-3.0)] rtol = 1e-6
   end
@@ -3598,7 +3598,7 @@ end DivideInLoop;
       """
     local name::String = _translateProgram(reductions, "Red.Reductions"; scalarized = false)
     @test _arrayPathTaken(name)
-    local sol = OMBackend.simulateModel(name; tspan = (0.0, 0.6), reltol = 1e-10, abstol = 1e-12)
+    local sol = OMBackend.simulate(name; tspan = (0.0, 0.6), reltol = 1e-10, abstol = 1e-12)
     @test _values(sol, ["count"]) == [2.0]
     @test _values(sol, ["w"])[1] ≈ sum(k * exp(-0.6k) for k in 1:3) + exp(-0.6) + exp(-3.6) rtol = 1e-8
   end
@@ -3735,7 +3735,7 @@ end DivideInLoop;
       """
     local name::String = _translateProgram(tables, "Tab.TableArgument"; scalarized = false)
     @test _arrayPathTaken(name)
-    local sol = OMBackend.simulateModel(name; tspan = (0.0, 1.0), reltol = 1e-10, abstol = 1e-12)
+    local sol = OMBackend.simulate(name; tspan = (0.0, 1.0), reltol = 1e-10, abstol = 1e-12)
     @test _values(sol, ["y", "x"]) ≈ [2.0, 1.0] rtol = 1e-8
   end
 
@@ -3802,7 +3802,7 @@ end DivideInLoop;
       """
     local name::String = _translateProgram(buffers, "Buf.Sampled"; scalarized = false)
     @test _arrayPathTaken(name)
-    local sol = OMBackend.simulateModel(name; tspan = (0.0, 0.9))
+    local sol = OMBackend.simulate(name; tspan = (0.0, 0.9))
     @test _values(sol, ["y", "z"]) ≈ [0.75 * 1100 * 1101 / 2, 0.75 * sum(-2 * i^2 for i in 1:600)] rtol = 1e-12
   end
 
@@ -3812,7 +3812,7 @@ end DivideInLoop;
        the element of the iterators (`_objectElementRead`) =#
     local name::String = _arrayPathTranslate("ArrayPath.TableArray"; scalarized = false)
     @test _arrayPathTaken(name)
-    local sol = OMBackend.simulateModel(name; tspan = (0.0, 1.0))
+    local sol = OMBackend.simulate(name; tspan = (0.0, 1.0))
     @test _values(sol, ["c[1].x", "c[2].x", "c[3].x"]) ≈ [1.0, 1.0, 0.0] atol = 1e-10
   end
 
@@ -3847,7 +3847,7 @@ end DivideInLoop;
       """
     local name::String = _translateProgram(cells, "RCs.Cells"; scalarized = false)
     @test _arrayPathTaken(name)
-    local sol = OMBackend.simulateModel(name; tspan = (0.0, 1.0), reltol = 1e-10, abstol = 1e-12)
+    local sol = OMBackend.simulate(name; tspan = (0.0, 1.0), reltol = 1e-10, abstol = 1e-12)
     @test _values(sol, ["c[1].v[1]", "c[1].v[2]", "c[2].v[1]", "c[3].v[2]"]) ≈ exp.(-1 ./ [2.0, 6.0, 1.0, 4.0]) rtol = 1e-9
   end
 
@@ -3883,7 +3883,7 @@ end DivideInLoop;
       """
     local name::String = _translateProgram(tuples, "RecTuple.Cell"; scalarized = false)
     @test _arrayPathTaken(name)
-    local sol = OMBackend.simulateModel(name; tspan = (0.0, 1.0), reltol = 1e-10, abstol = 1e-12)
+    local sol = OMBackend.simulate(name; tspan = (0.0, 1.0), reltol = 1e-10, abstol = 1e-12)
     @test _values(sol, ["x", "c.i", "c.q", "g"]) ≈ exp(-1) .* [1.0, 2.0, 5.0, 3.0] rtol = 1e-9
   end
 
@@ -3928,7 +3928,7 @@ end DivideInLoop;
       """
     local name::String = _translateProgram(partial, "PartRec.M"; scalarized = false)
     @test _arrayPathTaken(name)
-    local sol = OMBackend.simulateModel(name; tspan = (0.0, 1.0), reltol = 1e-10, abstol = 1e-12)
+    local sol = OMBackend.simulate(name; tspan = (0.0, 1.0), reltol = 1e-10, abstol = 1e-12)
     @test _values(sol, ["x", "y"]) ≈ [exp(-1), 2 * exp(-1) + 3] rtol = 1e-9
   end
 end

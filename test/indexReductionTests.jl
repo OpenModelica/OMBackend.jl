@@ -42,12 +42,12 @@ end
 "The values of `names` at the end of a simulation of `IndexReduction.<name>` to `stop`, scalarized or with its arrays kept."
 function _irArraySimulate(name::String, names::Vector{String}, stop::Float64; kept::Bool)::Vector{Float64}
   local (fm, functions) = kept ? _irArrayFlat(name) : _irFlat(name)
-  OMBackend.translate(fm; functionList = functions, scalarized = !kept)
+  OMBackend.translate(fm; functionList = functions, scalarize = !kept)
   #= tight tolerances: the arrays-kept model may take another path (array code) than the scalarized one =#
-  local sol::OMBackend.DifferentialEquations.SciMLBase.AbstractODESolution = OMBackend.simulateModel(OMBackend.canonicalName("IndexReduction." * name); tspan = (0.0, stop),
+  local sol::OMBackend.DifferentialEquations.SciMLBase.AbstractODESolution = OMBackend.simulate(OMBackend.canonicalName("IndexReduction." * name); tspan = (0.0, stop),
                                       reltol = 1e-10, abstol = 1e-10)
   @test sol.retcode == ReturnCode.Success
-  return Float64[OMBackend.getVariableValues(sol, n)[end] for n in names]
+  return Float64[OMBackend.variableValues(sol, n)[end] for n in names]
 end
 
 #= A test's own models written beside it, `Modelica"""..."""` (OMParser 1.0), as in arrayPathTests.jl =#
@@ -63,11 +63,11 @@ end
 "The values of `names` at the end of a simulation of the model `name` of `program` to `stop`, scalarized or with its arrays kept."
 function _irSimulateOf(program, name::String, names::Vector{String}, stop::Float64; kept::Bool)::Vector{Float64}
   local (fm, cache) = OMFrontend.instantiateSCodeToFM(name, OMFrontend.translateToSCode(program); scalarize = !kept)
-  OMBackend.translate(fm; functionList = OMFrontend.cacheToFunctionList(cache), scalarized = !kept)
+  OMBackend.translate(fm; functionList = OMFrontend.cacheToFunctionList(cache), scalarize = !kept)
   local sol::OMBackend.DifferentialEquations.SciMLBase.AbstractODESolution =
-    OMBackend.simulateModel(OMBackend.canonicalName(name); tspan = (0.0, stop), reltol = 1e-10, abstol = 1e-10)
+    OMBackend.simulate(OMBackend.canonicalName(name); tspan = (0.0, stop), reltol = 1e-10, abstol = 1e-10)
   @test sol.retcode == ReturnCode.Success
-  return Float64[OMBackend.getVariableValues(sol, n)[end] for n in names]
+  return Float64[OMBackend.variableValues(sol, n)[end] for n in names]
 end
 
 "explain of `IndexReduction.<name>`."
@@ -250,7 +250,7 @@ end
     @test sort(String.(e.states)) == ["x1"]
     local (fmC, functionsC) = _irFlat("ConstructorConstraint")
     OMBackend.translate(fmC; functionList = functionsC)
-    local solC = OMBackend.simulateModel(OMBackend.canonicalName("IndexReduction.ConstructorConstraint"); tspan = (0.0, 1.0),
+    local solC = OMBackend.simulate(OMBackend.canonicalName("IndexReduction.ConstructorConstraint"); tspan = (0.0, 1.0),
                                          reltol = 1e-8, abstol = 1e-8)
     @test solC(1.0; idxs = :x1) ≈ sin(1) / 4 rtol = 1e-6
     @test solC(1.0; idxs = :x2) ≈ sin(1) / 4 rtol = 1e-6
@@ -293,11 +293,11 @@ end
     @test calls(x -> x isa _IRM.CALL && x.name === Symbol("IndexReduction.wrapped__inlineDer"))
     @test !calls(x -> x isa _IRM.CALL && x.name === Symbol("IndexReduction.fromAuxDer"))
     OMBackend.translate(fm; functionList = functions)
-    local sol = OMBackend.simulateModel(OMBackend.canonicalName("IndexReduction.InlinedRecordDerivative"); tspan = (0.0, 1.0),
+    local sol = OMBackend.simulate(OMBackend.canonicalName("IndexReduction.InlinedRecordDerivative"); tspan = (0.0, 1.0),
                                         reltol = 1e-8, abstol = 1e-8)
     @test sol.retcode == ReturnCode.Success
     #= 2 x1 + x1^2 / 3 = t =#
-    @test OMBackend.getVariableValues(sol, "x1")[end] ≈ 3 * (sqrt(4 / 3) - 1) rtol = 1e-6
+    @test OMBackend.variableValues(sol, "x1")[end] ≈ 3 * (sqrt(4 / 3) - 1) rtol = 1e-6
   end
 
   @testset "StateSelect.prefer an artificial state (OMBACKEND_PREFER_STATES)" begin
@@ -310,11 +310,11 @@ end
     local (fm, functions) = _irFlat("PreferredState")
     local sol = withenv("OMBACKEND_PREFER_STATES" => "true") do
       OMBackend.translate(fm; functionList = functions)
-      OMBackend.simulateModel(OMBackend.canonicalName("IndexReduction.PreferredState"); tspan = (0.0, 1.0), reltol = 1e-8, abstol = 1e-8)
+      OMBackend.simulate(OMBackend.canonicalName("IndexReduction.PreferredState"); tspan = (0.0, 1.0), reltol = 1e-8, abstol = 1e-8)
     end
     @test sol.retcode == ReturnCode.Success
-    @test OMBackend.getVariableValues(sol, "m")[end] ≈ 2 * exp(-1) rtol = 1e-6
-    @test OMBackend.getVariableValues(sol, "x")[end] ≈ 0.3469902420410083 rtol = 1e-6
+    @test OMBackend.variableValues(sol, "m")[end] ≈ 2 * exp(-1) rtol = 1e-6
+    @test OMBackend.variableValues(sol, "x")[end] ≈ 0.3469902420410083 rtol = 1e-6
   end
 
   @testset "a function without derivative annotation, its body run symbolically" begin
@@ -322,11 +322,11 @@ end
     @test _irStates("IfFunctionConstraint") == ["x1"]
     local (fm, functions) = _irFlat("IfFunctionConstraint")
     OMBackend.translate(fm; functionList = functions)
-    local sol = OMBackend.simulateModel(OMBackend.canonicalName("IndexReduction.IfFunctionConstraint"); tspan = (0.0, 1.0),
+    local sol = OMBackend.simulate(OMBackend.canonicalName("IndexReduction.IfFunctionConstraint"); tspan = (0.0, 1.0),
                                         reltol = 1e-8, abstol = 1e-8)
     @test sol.retcode == ReturnCode.Success
     #= x1 + x1^2 = t + 2 =#
-    @test OMBackend.getVariableValues(sol, "x1")[end] ≈ (sqrt(13) - 1) / 2 rtol = 1e-6
+    @test OMBackend.variableValues(sol, "x1")[end] ≈ (sqrt(13) - 1) / 2 rtol = 1e-6
   end
 
   @testset "known values folded" begin
@@ -476,11 +476,11 @@ end
     end
     @test reads(_irEquationOf(off, Symbol("\$STATEDER.v1")).rhs, Symbol("\$DER.v1"))
     OMBackend.translate(fm; functionList = functions)
-    local sol = OMBackend.simulateModel(OMBackend.canonicalName("IndexReduction.NonlinearCapacitors"); tspan = (0.0, 2.0),
+    local sol = OMBackend.simulate(OMBackend.canonicalName("IndexReduction.NonlinearCapacitors"); tspan = (0.0, 2.0),
                                         reltol = 1e-8, abstol = 1e-8)
     @test sol.retcode == ReturnCode.Success
     #= (3 + 2 v^2) v' = sin(t): 3 v + 2/3 v^3 = 1 - cos(t) =#
-    local v = OMBackend.getVariableValues(sol, "v1")[end]
+    local v = OMBackend.variableValues(sol, "v1")[end]
     @test 3v + 2 / 3 * v^3 ≈ 1 - cos(2.0) rtol = 1e-6
   end
 
@@ -506,10 +506,10 @@ end
     #= an if-equation's Boolean position after its rows: the else-branch's derivative by its full count =#
     local (fm, functions) = _irFlat("IfEquationPositions")
     OMBackend.translate(fm; functionList = functions)
-    local sol = OMBackend.simulateModel(OMBackend.canonicalName("IndexReduction.IfEquationPositions"); tspan = (0.0, 1.0),
+    local sol = OMBackend.simulate(OMBackend.canonicalName("IndexReduction.IfEquationPositions"); tspan = (0.0, 1.0),
                                         reltol = 1e-8, abstol = 1e-8)
     @test sol.retcode == ReturnCode.Success
-    @test OMBackend.getVariableValues(sol, "x1")[end] ≈ 1 / 6 + 1 / 8 rtol = 1e-6
+    @test OMBackend.variableValues(sol, "x1")[end] ≈ 1 / 6 + 1 / 8 rtol = 1e-6
     #= its row in the block of the choice: Jacobian entries by the branch the start values take, the numeric
        choice (an if-equation row sent it to the structural fallback: MSL SMEE_Generator's zero-sequence state) =#
     local mI = _irUnreduced("IfEquationPositions")
@@ -528,10 +528,10 @@ end
     #= no derivative argument for an Integer input: powerNDer(x1, 2, der(x1)) =#
     local (fmN, functionsN) = _irFlat("IntegerInputDerivative")
     OMBackend.translate(fmN; functionList = functionsN)
-    local solN = OMBackend.simulateModel(OMBackend.canonicalName("IndexReduction.IntegerInputDerivative"); tspan = (0.0, 1.0),
+    local solN = OMBackend.simulate(OMBackend.canonicalName("IndexReduction.IntegerInputDerivative"); tspan = (0.0, 1.0),
                                          reltol = 1e-8, abstol = 1e-8)
     @test solN.retcode == ReturnCode.Success
-    @test OMBackend.getVariableValues(solN, "x1")[end] ≈ (sqrt(13) - 1) / 2 rtol = 1e-6
+    @test OMBackend.variableValues(solN, "x1")[end] ≈ (sqrt(13) - 1) / 2 rtol = 1e-6
     #= v1 * der(v1) = i1 with v1 = 0 at the given start: der(v2) solved through (2 + v2^2), not through v1 =#
     local (fmZ, functionsZ) = _irFlat("ZeroStartCapacitance")
     local eqs = OMBackend.omjlirModel(fmZ; functionList = functionsZ).continuous[1].equations
@@ -543,7 +543,7 @@ end
     @test length(eDer.states) == 1
     local (fmD, functionsD) = _irFlat("DerOfExpression")
     OMBackend.translate(fmD; functionList = functionsD)
-    local solDer = OMBackend.simulateModel(OMBackend.canonicalName("IndexReduction.DerOfExpression"); tspan = (0.0, 1.0),
+    local solDer = OMBackend.simulate(OMBackend.canonicalName("IndexReduction.DerOfExpression"); tspan = (0.0, 1.0),
                                            reltol = 1e-8, abstol = 1e-8)
     @test solDer(1.0; idxs = :x1) ≈ exp(-1 / 3) rtol = 1e-6
   end
@@ -826,11 +826,11 @@ end
          run ends at Q[4] < 0; a read at t = 0 starts its Newton from the roots logged there (`_rootsAt`), not from
          the run's last ones: Q[4](0) = 1, continuous over the saved points, the set's switch (an event) included =#
       let (fm, functions) = _irArrayFlat("QuaternionFreeRotation")
-        OMBackend.translate(fm; functionList = functions, scalarized = false)
+        OMBackend.translate(fm; functionList = functions, scalarize = false)
         local sol::OMBackend.DifferentialEquations.SciMLBase.AbstractODESolution =
-          OMBackend.simulateModel(OMBackend.canonicalName("IndexReduction.QuaternionFreeRotation"); tspan = (0.0, 3.0),
+          OMBackend.simulate(OMBackend.canonicalName("IndexReduction.QuaternionFreeRotation"); tspan = (0.0, 3.0),
                                   reltol = 1e-8, abstol = 1e-8)
-        local Q::Vector{Vector{Float64}} = Vector{Float64}[OMBackend.getVariableValues(sol, "Q[$(k)]") for k in 1:4]
+        local Q::Vector{Vector{Float64}} = Vector{Float64}[OMBackend.variableValues(sol, "Q[$(k)]") for k in 1:4]
         @test Q[4][1] == 1.0 && Q[4][end] < 0
         @test maximum(abs.(diff(Q[4]))) < 0.1
         @test maximum(abs(sum(Q[k][i]^2 for k in 1:4) - 1) for i in eachindex(sol.t)) < 1e-10
@@ -860,7 +860,7 @@ end
          scalar is an array of no dimensions); the backend's scalarization and its switch: arrayPathTests =#
       let (fm, functions) = _irArrayFlat("RigidInertias")
         local rigid::String = OMBackend.canonicalName(fm.name)
-        @test OMBackend.translateReducedArrays(fm; functionList = functions) !== nothing
+        @test OMBackend.translate(fm; scalarize = false, functionList = functions) !== nothing
         @test rigid in OMBackend.ARRAY_PRESERVE_DE_MODELS
         local inertias::Vector{String} = ["phi1", "w1", "phi2", "tau"]
         @test isapprox(_irArraySimulate("RigidInertias", inertias, 2.0; kept = true),
@@ -944,10 +944,10 @@ end
   @testset "simulation" begin
     local (fm, functions) = _irFlat("RigidInertias")
     OMBackend.translate(fm; functionList = functions)
-    local sol = OMBackend.simulateModel(OMBackend.canonicalName("IndexReduction.RigidInertias"); tspan = (0.0, 5.0))
+    local sol = OMBackend.simulate(OMBackend.canonicalName("IndexReduction.RigidInertias"); tspan = (0.0, 5.0))
     @test sol.retcode == ReturnCode.Success
     #= (J1 + J2) phi'' = sin(t): phi = (t - sin(t)) / 3 =#
-    @test isapprox(OMBackend.getVariableValues(sol, "phi1")[end], (5 - sin(5)) / 3; rtol = 1e-3)
+    @test isapprox(OMBackend.variableValues(sol, "phi1")[end], (5 - sin(5)) / 3; rtol = 1e-3)
   end
 
   @testset "switch off: MTK's index reduction" begin

@@ -12,10 +12,10 @@ import OMFrontend
   local model = "PeriodicCounters.TrapezoidDifferentiator"
   local (fm, cache) = OMFrontend.instantiateSCodeToFM(model, OMFrontend.translateToSCode(OMFrontend.parseFile(file));
                                                       scalarize = false)
-  OMBackend.translate(fm; functionList = OMFrontend.cacheToFunctionList(cache), scalarized = false)
+  OMBackend.translate(fm; functionList = OMFrontend.cacheToFunctionList(cache), scalarize = false)
   local name = OMBackend.canonicalName(model)
   @test name in OMBackend.ARRAY_PRESERVE_DE_MODELS
-  local sol = OMBackend.simulateModel(name; tspan = (0.0, 1.0), reltol = 1.0e-6)
+  local sol = OMBackend.simulate(name; tspan = (0.0, 1.0), reltol = 1.0e-6)
   @test string(sol.retcode) == "Success"
   @test [sol(t; idxs = :signalSource_count) for t in (0.06, 0.07, 0.17, 0.97)] == [0.0, 1.0, 2.0, 10.0]
   @test sol.prob.p.d[1] ≈ 0.965 atol = 1.0e-8

@@ -24,8 +24,8 @@ end
     local sc = OMBackend.mtkSimCode(OMBackend.omjlirModel(fm; functionList = functions); eliminateNonDynamic = elimination)
     @test !("u" in sc.eliminatedVariables) && !("y" in sc.eliminatedVariables)
     OMBackend.translate(fm; functionList = functions, eliminateNonDynamic = elimination)
-    local sol = OMBackend.simulateModel(OMBackend.canonicalName("ObservedCycles." * name); tspan = (0.0, 1.0))
+    local sol = OMBackend.simulate(OMBackend.canonicalName("ObservedCycles." * name); tspan = (0.0, 1.0))
     @test sol.retcode == OMBackend.CodeGeneration.ModelingToolkit.SciMLBase.ReturnCode.Success
-    @test OMBackend.getVariableValues(sol, "y")[end] ≈ expected atol = 1e-6
+    @test OMBackend.variableValues(sol, "y")[end] ≈ expected atol = 1e-6
   end
 end

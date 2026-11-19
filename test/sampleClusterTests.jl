@@ -11,7 +11,7 @@ function _sampleClusterSolution(name::String, stop::Float64; scalarized::Bool = 
   local file = joinpath(@__DIR__, "Models", "SampleClusters.mo")
   local (fm, cache) = OMFrontend.instantiateSCodeToFM(name, OMFrontend.translateToSCode(OMFrontend.parseFile(file)); scalarize = scalarized)
   OMBackend.translate(fm; functionList = OMFrontend.cacheToFunctionList(cache), scalarized)
-  return OMBackend.simulateModel(OMBackend.canonicalName(name); tspan = (0.0, stop))
+  return OMBackend.simulate(OMBackend.canonicalName(name); tspan = (0.0, stop))
 end
 
 @testset "sample() in a discrete cluster; a late initial section" begin
@@ -26,5 +26,5 @@ end
   #= the array code: its initial arms in the order of what they read (the section ran first and read u's start) =#
   local lateA = _sampleClusterSolution("SampleClusters.LateSection", 1.0; scalarized = false)
   @test OMBackend.canonicalName("SampleClusters.LateSection") in OMBackend.ARRAY_PRESERVE_DE_MODELS
-  @test [OMBackend.getVariableValues(lateA, v)[end] for v in ("delaySignal", "t_next", "y")] == [1.0, -1.0, 1.0]
+  @test [OMBackend.variableValues(lateA, v)[end] for v in ("delaySignal", "t_next", "y")] == [1.0, -1.0, 1.0]
 end

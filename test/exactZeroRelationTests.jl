@@ -12,7 +12,7 @@ import OMFrontend
   local (fm, cache) = OMFrontend.instantiateSCodeToFM("ExactZeroRelations.Latch",
                                                       OMFrontend.translateToSCode(OMFrontend.parseFile(file)))
   OMBackend.translate(fm; functionList = OMFrontend.cacheToFunctionList(cache))
-  local sol = OMBackend.simulateModel(OMBackend.canonicalName("ExactZeroRelations.Latch"); tspan = (0.0, 1.0))
+  local sol = OMBackend.simulate(OMBackend.canonicalName("ExactZeroRelations.Latch"); tspan = (0.0, 1.0))
   @test string(sol.retcode) == "Success"
   @test [sol(t; idxs = :off) for t in (0.2, 0.6, 0.8, 0.95)] == [1.0, 1.0, 0.0, 0.0]
   @test sol(0.8; idxs = :x) == 0.0

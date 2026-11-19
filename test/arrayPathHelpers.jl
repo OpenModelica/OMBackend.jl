@@ -7,7 +7,7 @@ function _arrayPathTranslate(model::String; scalarized::Bool)
   _ARRAY_PATH_SCODE[] === nothing &&
     (_ARRAY_PATH_SCODE[] = OMFrontend.translateToSCode(OMFrontend.parseFile(ARRAY_PATH_FILE)))
   local (fm, cache) = OMFrontend.instantiateSCodeToFM(model, _ARRAY_PATH_SCODE[]; scalarize = scalarized)
-  OMBackend.translate(fm; functionList = OMFrontend.cacheToFunctionList(cache), scalarized = scalarized)
+  OMBackend.translate(fm; functionList = OMFrontend.cacheToFunctionList(cache), scalarize = scalarized)
   return OMBackend.canonicalName(model)
 end
 
@@ -19,9 +19,9 @@ const var"@Modelica_str" = OMFrontend.OMParser.var"@Modelica_str"
 function _translateProgram(program, model::String; scalarized::Bool)::String
   local scode = OMFrontend.translateToSCode(program)
   local (fm, cache) = OMFrontend.instantiateSCodeToFM(model, scode; scalarize = scalarized)
-  OMBackend.translate(fm; functionList = OMFrontend.cacheToFunctionList(cache), scalarized = scalarized)
+  OMBackend.translate(fm; functionList = OMFrontend.cacheToFunctionList(cache), scalarize = scalarized)
   return OMBackend.canonicalName(model)
 end
 
 _arrayPathTaken(name) = name in OMBackend.ARRAY_PRESERVE_DE_MODELS
-_values(sol, names) = [OMBackend.getVariableValues(sol, n)[end] for n in names]
+_values(sol, names) = [OMBackend.variableValues(sol, n)[end] for n in names]

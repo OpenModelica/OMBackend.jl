@@ -13,7 +13,7 @@ import OMFrontend
   local sc = OMBackend.mtkSimCode(OMBackend.omjlirModel(fm; functionList = functions))
   @test haskey(sc.stringToSimVarHT, "c") && haskey(sc.stringToSimVarHT, "d")
   OMBackend.translate(fm; functionList = functions)
-  local sol = OMBackend.simulateModel(OMBackend.canonicalName("ParameterResults.OnlyParameters"); tspan = (0.0, 1.0))
+  local sol = OMBackend.simulate(OMBackend.canonicalName("ParameterResults.OnlyParameters"); tspan = (0.0, 1.0))
   #= "myVar = 42" from 1: the identifier myVar, the index after it 6 =#
   @test sol(0.0; idxs = :c) == 6.0
   @test sol(1.0; idxs = :d) == 12.0

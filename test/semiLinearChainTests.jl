@@ -15,7 +15,7 @@ import OMFrontend
   for m in ("ZeroFlowPump", "ZeroFlowPumpT")
     local (fm, cache) = OMFrontend.instantiateSCodeToFM("SemiLinearChains." * m, scode)
     OMBackend.translate(fm; functionList = OMFrontend.cacheToFunctionList(cache))
-    local sol = OMBackend.simulateModel(OMBackend.canonicalName("SemiLinearChains." * m); tspan = (0.0, 1.0),
+    local sol = OMBackend.simulate(OMBackend.canonicalName("SemiLinearChains." * m); tspan = (0.0, 1.0),
                                         reltol = 1.0e-8, abstol = 1.0e-10)
     @test string(sol.retcode) == "Success"
     @test sol(0.1; idxs = :hPump) ≈ 293.15

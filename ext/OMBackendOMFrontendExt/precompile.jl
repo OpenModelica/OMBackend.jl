@@ -48,7 +48,7 @@ include_dependency(TRANSLATE_WORKLOAD)
     _precompileTranslateAndSimulate(scode, name::String, arrayCode::Bool) -> Nothing
 
 The model `name` of `scode` translated as OMJL's `translate` does (`_precompileTranslate`), and with `simulate`
-simulated as OMJL's `simulate` does: the build and `simulateModel` with OMJL's keyword arguments, so that the
+simulated as OMJL's `simulate` does: the build and `OMBackend.simulate` with OMJL's keyword arguments, so that the
 keyword calls compile for a session's argument types. `simulate` translates again (the cached build reused). Simulated
 with the default solver and with the DAE fallback (`defaultSolverFor`'s choice for a purely algebraic system or
 discrete algebraic rows), so that both solvers' integrators over the erased problem types compile. `arrayCode`: whether
@@ -63,23 +63,22 @@ function _precompileTranslateAndSimulate(scode::OMFrontend.SCode.Program, name::
   simulate || return nothing
   _precompileTranslate(scode, name, mode)
   for solver in (defaultSolver(), daeFallbackSolver())
-    simulateModel(name; MODE = mode, tspan = (0.0, 1.0), solver = solver, overwriteCache = false)
+    OMBackend.simulate(name; mode, tspan = (0.0, 1.0), solver = solver, overwriteCache = false)
   end
   return nothing
 end
 
 """
 OMJL's `translate` of the model `name` of `scode`: the frontend's flatten with the arrays kept and
-`translateReducedArrays` (the array code, else the scalarized reduced model, else the kept arrays scalarized by the
+`translate(fm; scalarize = false)` (the array code, else the scalarized reduced model, else the kept arrays scalarized by the
 backend); an error where none takes the model (OMJL's `ARRAY_PRESERVING_CODEGEN_NOT_SUPPORTED`: no second flatten).
 """
 function _precompileTranslate(scode::OMFrontend.SCode.Program, name::String,
                               mode::OMBackend.BackendMode)::Union{Nothing, Tuple{String, Expr}}
   local (fm::OMFrontend.Frontend.FlatModel, cache) = OMFrontend.instantiateSCodeToFM(name, scode; scalarize = false)
   local reduced::Union{Nothing, Tuple{String, Expr}} =
-    translateReducedArrays(fm; functionList = OMFrontend.cacheToFunctionList(cache), BackendMode = mode,
-                           warnMissingStartValues = nothing, eliminateNonDynamic = true, observedFilter = nothing,
-                           checkSimCode = true)
+    translate(fm; functionList = OMFrontend.cacheToFunctionList(cache), mode, scalarize = false,
+              warnMissingStartValues = nothing, eliminateNonDynamic = true, observedFilter = nothing, checkSimCode = true)
   reduced === nothing || return reduced
   error("$(name): array preserving codegen not supported ($(OMBackend.scalarizedFallbackReason(canonicalName(name))))")
 end

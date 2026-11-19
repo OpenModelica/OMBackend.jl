@@ -51,7 +51,7 @@
       the simulation;
     * writes to `OMBackend.logPath("backend/mtk", "<filename>.log")`, which
       lands in the per-model run directory (the simulate-time
-      `withLogRunDir` wrap in `simulateModel` pushes the translate-time
+      `withLogRunDir` wrap in `simulate` pushes the translate-time
       runId looked up from `MODEL_RUN_DIRS`).
 =#
 module MTKDump

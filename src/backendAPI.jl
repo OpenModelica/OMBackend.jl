@@ -199,7 +199,7 @@ end
 """
     BackendMode
 
-How a scalar model is built: `BackendMode` of [`translate`](@ref), `MODE` of [`simulateModel`](@ref)
+How a scalar model is built: the keyword `mode` of [`translate`](@ref), [`simulate`](@ref) and [`resimulate`](@ref)
 (`DEFAULT_BACKEND_MODE[]` when not given). [`IMTK_MODE`](@ref) (the default) or [`MTK_MODE`](@ref). A model the
 arrays-kept path translated runs its own code in either mode.
 """
@@ -213,8 +213,8 @@ end
 
 The default [`BackendMode`](@ref): the backend builds the ModelingToolkit system, simplifies it and builds the problem
 at translate time, and caches the build (CodeGeneration/IMTKGen.jl). A simulate remakes the cached problem. The mode
-of tunable parameters: [`withTunableParameters`](@ref), and `parameters` of [`simulateModel`](@ref) and
-[`resimulateModel`](@ref).
+of tunable parameters: [`withTunableParameters`](@ref), and `parameters` of [`simulate`](@ref) and
+[`resimulate`](@ref).
 """
 IMTK_MODE
 
@@ -228,7 +228,7 @@ MTK_MODE
 
 """
 Runtime-toggleable default backend mode used by `OM.translate` / `OM.simulate`
-and `OMBackend.translate` / `OMBackend.simulateModel`. Defaults to `IMTK_MODE`
+and `OMBackend.translate` / `OMBackend.simulate`. Defaults to `IMTK_MODE`
 (cached build fast path). Flip to revert to the lazy-build MTK path:
 
     OMBackend.DEFAULT_BACKEND_MODE[] = OMBackend.MTK_MODE
@@ -341,7 +341,7 @@ function scalarizedFallbackReason(name::String)::String
 end
 
 # Per-model log-run directory captured at translate (`lower`) time. Looked up
-# at simulate time by `simulateModel` so any dumps emitted during the
+# at simulate time by `simulate` so any dumps emitted during the
 # post-MTK / `buildDirectRHSProblem` / `_solveDAEInitialization!` codegen
 # paths land in the same per-model run directory as the OMJLIR/simCode logs,
 # not the session root. Keyed by canonical model name.
@@ -416,18 +416,20 @@ end
 
 
 """
-    translate(model::OMJLIR.Model; BackendMode = DEFAULT_BACKEND_MODE[], warnMissingStartValues = nothing,
+    translate(model::OMJLIR.Model; mode = DEFAULT_BACKEND_MODE[], warnMissingStartValues = nothing,
               eliminateNonDynamic = nothing, observedFilter = nothing, checkSimCode = true)
 
 The target code of a model another frontend lowered to OMJLIR and through its passes
 (`lowerOMCFlatModel`).
 """
 function translate(model::OMJLIR.Model;
-                   BackendMode::OMBackend.BackendMode = DEFAULT_BACKEND_MODE[],
+                   mode::OMBackend.BackendMode = DEFAULT_BACKEND_MODE[],
                    warnMissingStartValues::Union{Nothing, Bool} = nothing,
                    eliminateNonDynamic::Union{Nothing, Bool, SimCode.EliminationOptions} = nothing,
                    observedFilter::Union{Nothing, Vector{String}, Vector{Regex}} = nothing,
-                   checkSimCode::Bool = true)
+                   checkSimCode::Bool = true,
+                   BackendMode::Union{Nothing, OMBackend.BackendMode} = nothing)
+  mode = _deprecatedKeyword(:translate, :BackendMode, BackendMode, :mode, mode)
   local previousWarnSetting = WARN_MISSING_START_VALUES[]
   local runId = createLogRunId(model.name)
   MODEL_RUN_DIRS[canonicalName(model.name)] = runId
@@ -437,7 +439,7 @@ function translate(model::OMJLIR.Model;
     delete!(ARRAY_PRESERVE_DE_MODELS, canonicalName(model.name))
     delete!(ARRAY_REDUCED_MODELS, canonicalName(model.name))
     return withLogRunDir(runId) do
-      generateTargetCode(model; BackendMode, eliminateNonDynamic, observedFilter, checkSimCode)
+      generateTargetCode(model; mode, eliminateNonDynamic, observedFilter, checkSimCode)
     end
   finally
     WARN_MISSING_START_VALUES[] = previousWarnSetting
@@ -452,13 +454,13 @@ and its `NFFunction`s, read through OMCompiler.jl. Defined when OMCompiler.jl is
 """
 function lowerOMCFlatModel end
 
-"The target code of the OMJLIR model `model` for the backend mode `BackendMode`."
-function generateTargetCode(model::OMJLIR.Model; BackendMode::OMBackend.BackendMode,
+"The target code of the OMJLIR model `model` for the backend mode `mode`."
+function generateTargetCode(model::OMJLIR.Model; mode::BackendMode,
                             eliminateNonDynamic::Union{Nothing, Bool, SimCode.EliminationOptions},
                             observedFilter::Union{Nothing, Vector{String}, Vector{Regex}}, checkSimCode::Bool)
   local simCode = mtkSimCode(model; eliminateNonDynamic, observedFilter)
   _checkSimCodeBeforeCodegen(simCode, checkSimCode)
-  local genCode = if BackendMode == IMTK_MODE
+  local genCode = if mode == IMTK_MODE
     @BACKEND_PERFLOG "[backendAPI] generateIMTKTargetCode" generateIMTKTargetCode(simCode)
   else
     @BACKEND_PERFLOG "[backendAPI] generateMTKTargetCode" generateMTKTargetCode(simCode)
@@ -781,7 +783,7 @@ function generateMTKTargetCode(simCode::SimCode.SIM_CODE)::Tuple{String, Expr}
     COMPILED_MODELS_MTK[modelName] = (modelCode, changeDetected, codeHash)
   else
     #= If the module already exists from a previous compilation (e.g. after
-       clearCaches!), mark as needing re-eval so simulateModel picks up the
+       clearCaches!), mark as needing re-eval so simulate picks up the
        new code instead of reusing the stale module. =#
     local moduleAlreadyExists = _modelDefined(Symbol(modelName))
     COMPILED_MODELS_MTK[modelName] = (modelCode, moduleAlreadyExists, codeHash)
@@ -824,7 +826,7 @@ _writtenModel(modelName) = modelName in ARRAY_PRESERVE_DE_MODELS && haskey(COMPI
 
 function getCompiledModel(modelName)
   haskey(COMPILED_MODELS_MTK, modelName) ||
-    error("Model $(modelName) is not compiled (OMBackend.translate first). $(availableModels())")
+    error("Model $(modelName) is not compiled (OMBackend.translate first). Translated: $(join(availableModels(), ", "))")
   return COMPILED_MODELS_MTK[modelName][1]
 end
 
@@ -952,7 +954,7 @@ function printModel(modelName::String; MTK = true, keepComments = true, keepBegi
   try
     println(modelToString(modelName::String; MTK = MTK, keepComments = keepComments, keepBeginBlocks = keepBeginBlocks))
   catch e
-    @error "Model: $(modelName) is not compiled. Available models are: $(availableModels())"
+    @error "Model: $(modelName) is not compiled. Available models are: $(join(availableModels(), ", "))"
     error("Error printing model: $(modelName)")
   end
 end
@@ -988,55 +990,44 @@ end
 
 
 """
-    availableModels() -> String
+    availableModels() -> Vector{String}
 
-The names of the translated models, one per line, under the route that translated them (ModelingToolkit,
-arrayPreserveDE).
+The names of the translated models (the names [`translate`](@ref) recorded, either route), sorted.
 """
-function availableModels()::String
-  str = "Compiled models (MTK-MODE):\n"
-  for m in keys(COMPILED_MODELS_MTK)
-    str *= "  $m\n"
-  end
-  if !isempty(COMPILED_MODELS_ARRAY_PRESERVE_DE)
-    str *= "Compiled models (arrayPreserveDE):\n"
-    for m in keys(COMPILED_MODELS_ARRAY_PRESERVE_DE)
-      str *= "  $m\n"
-    end
-  end
-  return str
+function availableModels()::Vector{String}
+  return sort!(collect(union(keys(COMPILED_MODELS_MTK), keys(COMPILED_MODELS_ARRAY_PRESERVE_DE))))
 end
 
 """
-    simulateModel(modelName::String; MODE = DEFAULT_BACKEND_MODE[], tspan = (0.0, 1.0), solver = defaultSolver(),
-                  overwriteCache = false, kwargs...) -> ODESolution
+    simulate(modelName::String; mode = DEFAULT_BACKEND_MODE[], tspan = (0.0, 1.0), solver = defaultSolver(),
+             overwriteCache = false, kwargs...) -> ODESolution
 
 Simulate the translated model `modelName` (either name form, [`canonicalName`](@ref)) over `tspan` with `solver`
-(an OrdinaryDiffEq algorithm, `Tsit5()`; [`defaultSolver`](@ref)). `MODE` is a [`BackendMode`](@ref).
+(an OrdinaryDiffEq algorithm, `Tsit5()`; [`defaultSolver`](@ref)). `mode` is a [`BackendMode`](@ref).
 `overwriteCache` rebuilds the problem. `parameters` (name => value) sets parameters for this run: any parameter of a
 model the arrays-kept path translated, the parameters kept tunable at translate time ([`withTunableParameters`](@ref),
 [`IMTK_MODE`](@ref) only) of another. The other keyword arguments go to `solve`. A violated
 `assert` throws [`ModelicaAssertionError`](@ref).
 
 ```julia
-OMBackend.simulateModel("HelloWorld"; tspan = (0.0, 2.0), reltol = 1e-6)
+OMBackend.simulate("HelloWorld"; tspan = (0.0, 2.0), reltol = 1e-6)
 ```
 """
-function simulateModel(modelName::String;
-                       MODE = DEFAULT_BACKEND_MODE[],
-                       tspan = (0.0, 1.0),
-                       solver = defaultSolver(),
-                       overwriteCache::Bool = false,
-                       kwargs...)
+function simulate(modelName::String;
+                  mode::BackendMode = DEFAULT_BACKEND_MODE[],
+                  tspan = (0.0, 1.0),
+                  solver = defaultSolver(),
+                  overwriteCache::Bool = false,
+                  kwargs...)
   modelName = canonicalName(modelName)
   local modelCode::Expr
   #= A model translated by arrayPreserveDE runs its own module, whatever the mode. =#
   modelName in ARRAY_PRESERVE_DE_MODELS && return _simulateArrayPreserveDE(modelName, tspan, solver, overwriteCache; kwargs...)
   #= `parameters` (tunable parameter values for this run) is handled by the
      IMTK path only; elsewhere it would reach `solve` as an unknown keyword. =#
-  haskey(kwargs, :parameters) && MODE != IMTK_MODE &&
-    error("simulateModel: `parameters` needs IMTK mode (the default), got $(MODE)")
-  if MODE == MTK_MODE
+  haskey(kwargs, :parameters) && mode != IMTK_MODE &&
+    error("simulate: `parameters` needs IMTK mode (the default), got $(mode)")
+  if mode == MTK_MODE
     #= This does a redundant string conversion for now due to modeling toolkit being as is...=#
     #= An uncompiled model is an error here (it went on to an UndefVarError of modelCode). =#
     modelCode = getCompiledModel(modelName)
@@ -1062,10 +1053,10 @@ function simulateModel(modelName::String;
       _runDir === nothing ? _doSim() : withLogRunDir(_doSim, _runDir)
     catch err
       err isa CodeGeneration.ModelicaAssertionError ||
-        @error "Interactive evaluation failed" exception_type=typeof(err) mode=MODE model=modelName
+        @error "Interactive evaluation failed" exception_type=typeof(err) mode=mode model=modelName
       rethrow(err)
     end
-  elseif MODE == IMTK_MODE
+  elseif mode == IMTK_MODE
     #= overwriteCache forces a fresh build: bypass the codeHash reuse check so the
        cached problem is rebuilt (not just remade) before simulate. A failed
        rebuild warns and forgets the cached build; simulateIMTK then falls back
@@ -1082,18 +1073,18 @@ function simulateModel(modelName::String;
     catch err
       #= A violated assert is the model's result, not a failure of the tool. =#
       err isa CodeGeneration.ModelicaAssertionError ||
-        @error "iMTK simulate failed" exception_type=typeof(err) mode=MODE model=modelName
+        @error "iMTK simulate failed" exception_type=typeof(err) mode=mode model=modelName
       rethrow(err)
     end
   else
-    error("Unsupported mode: $(MODE)")
+    error("Unsupported mode: $(mode)")
   end
 end
 
 """
     _simulateArrayPreserveDE(modelName, tspan, solver, overwriteCache; kwargs...)
 
-`simulateModel` of a model translated by arrayPreserveDE: its module evaluated where it is not yet or its code
+`simulate` of a model translated by arrayPreserveDE: its module evaluated where it is not yet or its code
 changed (or `overwriteCache`), then its own `simulate`.
 """
 function _simulateArrayPreserveDE(modelName::String, tspan, solver, overwriteCache::Bool; kwargs...)
@@ -1275,19 +1266,19 @@ _modelDefined(name::Symbol)::Bool = Base.invokelatest(isdefined, OMBackend, name
 _modelModule(name::Symbol)::Module = Base.invokelatest(getglobal, OMBackend, name)
 
 """
-    resimulateModel(modelName; solver, tspan, parameters = Dict(), kwargs...)
+    resimulate(modelName; solver, mode, tspan, parameters = Dict(), kwargs...)
 
 Simulate an already compiled model again, without recompiling. `parameters`
-(name => value) sets the parameters [`isTunable`](@ref) names, as for [`simulateModel`](@ref); other keyword
+(name => value) sets the parameters [`isTunable`](@ref) names, as for [`simulate`](@ref); other keyword
 arguments go to the solver.
 """
-function resimulateModel(modelName::String;
-                         solver = defaultSolver(),
-                         MODE = DEFAULT_BACKEND_MODE[],
-                         tspan=(0.0, 1.0),
-                         parameters::AbstractDict = Dict(),
-                         kwargs...)
-  return simulateModel(modelName; MODE = MODE, tspan = tspan, solver = solver,
+function resimulate(modelName::String;
+                    solver = defaultSolver(),
+                    mode::BackendMode = DEFAULT_BACKEND_MODE[],
+                    tspan = (0.0, 1.0),
+                    parameters::AbstractDict = Dict(),
+                    kwargs...)
+  return simulate(modelName; mode = mode, tspan = tspan, solver = solver,
                        (isempty(parameters) ? (;) : (; parameters = parameters))..., kwargs...)
 end
 
@@ -1305,16 +1296,16 @@ plot(args...; kwargs...) = throw(ArgumentError(
   "OMBackend.plot needs Plots.jl: run `using Plots` (on Windows before loading OMBackend), or use OM, which loads it"))
 
 """
-    getVariableValues(sol::ODESolution, varName::String) -> Union{Nothing, Vector{Float64}}
+    variableValues(sol::ODESolution, varName::String) -> Union{Nothing, Vector{Float64}}
 
 The values of the variable `varName` (its Modelica name, or `"time"`) at the steps of `sol`, a solution of
-[`simulateModel`](@ref). `nothing`, with a warning, where the model has no such variable.
+[`simulate`](@ref). `nothing`, with a warning, where the model has no such variable.
 
 ```julia
 OM.translate("HelloWorld", "./Models/HelloWorld.mo");
 sol = OM.simulate("HelloWorld");
 
-OM.OMBackend.getVariableValues(sol, "x")
+OMBackend.variableValues(sol, "x")
 11-element Vector{Float64}:
  1.0
  0.7689684977240044
@@ -1329,7 +1320,7 @@ OM.OMBackend.getVariableValues(sol, "x")
  0.006738051637508934
 ```
 """
-function getVariableValues(sol::ODESolution, varName::String)
+function variableValues(sol::ODESolution, varName::String)
   if sol.prob.p isa CodeGeneration.ArrayPreserveDE.ArrayModelParameters
     local vals = CodeGeneration.ArrayPreserveDE.variableValues(sol, varName)
     vals === nothing && @warn "Did not locate a variable named '$(varName)' in the model"
@@ -1351,10 +1342,10 @@ end
 
 """
 ```
-getVariableValues(sols::Vector, variables...)
+variableValues(sols::Vector, variables...)
 ```
 
-Similar to getVariableValues, but for solutions that have went through one or more structural changes.
+Similar to variableValues, but for solutions that have went through one or more structural changes.
 Here the same variable might have slightly different names depending on the context.
 
 For instance it might be called M.A first and then M.B when the structure of the model is changed.
@@ -1363,8 +1354,8 @@ Here you can specify the variables in order, they will be collected and merged i
 
 Example use:
 ```
-julia> OM.OMBackend.getVariableValues(sols, "bouncingBall_x", "pendulum_x")
-vcat(OM.OMBackend.getVariableValues(sols, "pendulum_y", "bouncingBall_y")...)
+julia> OMBackend.variableValues(sols, "bouncingBall_x", "pendulum_x")
+vcat(OMBackend.variableValues(sols, "pendulum_y", "bouncingBall_y")...)
 69-element Vector{Float64}:
   10.0
    ⋮
@@ -1375,7 +1366,7 @@ vcat(OM.OMBackend.getVariableValues(sols, "pendulum_y", "bouncingBall_y")...)
   3.3856338791378615
 ```
 """
-function getVariableValues(sols::Vector, variables...)
+function variableValues(sols::Vector, variables...)
   local vals = Any[]
   for sol in sols
     for v in variables

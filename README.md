@@ -151,7 +151,7 @@ julia> import OMFrontend
 julia> scode = OMFrontend.translateToSCode(OMFrontend.parseFile("BouncingBallReals.mo"))
 julia> (fm, cache) = OMFrontend.instantiateSCodeToFM("BouncingBallReals", scode)
 julia> OMBackend.translate(fm; functionList = OMFrontend.cacheToFunctionList(cache))
-julia> OMBackend.simulateModel("BouncingBallReals"; tspan = (0.0, 2.5))
+julia> OMBackend.simulate("BouncingBallReals"; tspan = (0.0, 2.5))
 ```
 
 ![image](https://user-images.githubusercontent.com/8775827/99516636-b6914280-298e-11eb-85cf-c9041314e9b4.png)
@@ -163,7 +163,7 @@ reference.
 
 * Online: <https://OpenModelica.github.io/OMBackend.jl/> (the development version under `/dev/`, a release
   under `/stable/` and `/vX.Y.Z/`).
-* In Julia: the docstring of every function is in the help mode, for example `?OMBackend.simulateModel`.
+* In Julia: the docstring of every function is in the help mode, for example `?OMBackend.simulate`.
 * Locally, from the repository root (the HTML is written to `docs/build/`):
 
 ```julia

@@ -7,8 +7,8 @@ function _routeRun(model::String, scalarized::Bool; taken::Bool = true, stop::Fl
                    parameters::Dict{String, Any} = Dict{String, Any}())
   local n::String = _arrayPathTranslate("ArrayPath." * model; scalarized)
   (scalarized || !taken) || @test _arrayPathTaken(n)
-  return isempty(parameters) ? OMBackend.simulateModel(n; tspan = (0.0, stop)) :
-                               OMBackend.resimulateModel(n; tspan = (0.0, stop), parameters)
+  return isempty(parameters) ? OMBackend.simulate(n; tspan = (0.0, stop)) :
+                               OMBackend.resimulate(n; tspan = (0.0, stop), parameters)
 end
 
 "The exception of `_routeRun(model, scalarized)`, or `nothing`."
@@ -23,7 +23,7 @@ end
 
 "The values of `var` in `sol` at the times `ts` (the last saved point at or before each)."
 function _at(sol, var::String, ts::Vector{Float64})::Vector{Float64}
-  local v::Vector{Float64} = OMBackend.getVariableValues(sol, var)
+  local v::Vector{Float64} = OMBackend.variableValues(sol, var)
   return [v[findlast(<=(t + 1e-12), sol.t)] for t in ts]
 end
 
@@ -44,7 +44,7 @@ end
     for sol in runs("TerminateInWhenIf")
       @test sol.retcode == ReturnCode.Terminated
       @test sol.t[end] ≈ 0.35 atol = 1e-9
-      @test OMBackend.getVariableValues(sol, "n")[end] == 4.0
+      @test OMBackend.variableValues(sol, "n")[end] == 4.0
     end
     local DE = OMBackend.DifferentialEquations
     #= a terminate() at the initialization: the problem of getMTKProblem ends at its start, on both paths =#
@@ -63,7 +63,7 @@ end
       local n = _arrayPathTranslate("ArrayPath." * model; scalarized)
       scalarized || @test _arrayPathTaken(n)
       local err = try
-        OMBackend.simulateModel(n; tspan = (0.0, 1.0))
+        OMBackend.simulate(n; tspan = (0.0, 1.0))
         nothing
       catch e
         e
@@ -74,7 +74,7 @@ end
     #= x reaches 1 at 0.5 and falls again: x <= 1 holds =#
     for scalarized in ROUTES
       local n = _arrayPathTranslate("ArrayPath.AssertTouch"; scalarized)
-      @test OMBackend.simulateModel(n; tspan = (0.0, 1.0)).retcode == ReturnCode.Success
+      @test OMBackend.simulate(n; tspan = (0.0, 1.0)).retcode == ReturnCode.Success
     end
   end
 
@@ -99,12 +99,12 @@ end
       local wb = _routeRun("WhenIfBeforeAssign", scalarized)
       @test wb.retcode == ReturnCode.Terminated
       @test wb.t[end] ≈ 0.25 atol = 1e-9
-      @test OMBackend.getVariableValues(wb, "n")[end] == 3.0
+      @test OMBackend.variableValues(wb, "n")[end] == 3.0
       #= starts of reductions the evaluation does not take: placeholders were 0 without overrides =#
       @test _values(_routeRun("StartSumNested", scalarized), ["x"]) ≈ [11.0] rtol = 1e-9
       @test _values(_routeRun("StartSumMatrix", scalarized), ["x"]) ≈ [11.0] rtol = 1e-9
       @test _at(_routeRun("DiscreteStartSum", scalarized), "d", [0.2, 1.0]) == [10.0, 11.0]
-      @test OMBackend.getVariableValues(_routeRun("GuessStartSum", scalarized), "x")[1] ≈ -10.0 rtol = 1e-6
+      @test OMBackend.variableValues(_routeRun("GuessStartSum", scalarized), "x")[1] ≈ -10.0 rtol = 1e-6
       #= asserts decided with the discrete values within the step, not those of the event that ended it; omc: the
          first holds, the second fails at 0.6; an if-expression condition; a value set at a sample tick =#
       @test _routeRun("AssertAfterEvent", scalarized).retcode == ReturnCode.Success
@@ -160,12 +160,12 @@ end
       #= ... also where the section assigns it again after the guard (its intermediate value: an operand that jumped onto
          the threshold of a relation; one built from relations and parameters only has no crossing, held between events) =#
       local tb = _routeRun("TermBeforeLastAssignment", scalarized)
-      @test tb.retcode == ReturnCode.Terminated && abs(tb.t[end] - 0.5) < 1e-5 && OMBackend.getVariableValues(tb, "n")[end] == 6.0
+      @test tb.retcode == ReturnCode.Terminated && abs(tb.t[end] - 0.5) < 1e-5 && OMBackend.variableValues(tb, "n")[end] == 6.0
       #= ... against a Real literal or parameter, and of Real values (omc's hysteresis does not fire the last one, MLS
          11.1.2 says it terminates) =#
       for model in ("TermRealThreshold", "TermParamThreshold", "TermRealBranches")
         local tr = _routeRun(model, scalarized)
-        @test tr.retcode == ReturnCode.Terminated && abs(tr.t[end] - 0.5) < 1e-5 && OMBackend.getVariableValues(tr, "n")[end] == 6.0
+        @test tr.retcode == ReturnCode.Terminated && abs(tr.t[end] - 0.5) < 1e-5 && OMBackend.variableValues(tr, "n")[end] == 6.0
       end
       #= an opaque function's Integer result (a continuous argument too) landing on its threshold, through arithmetic
          and a sign change: its crossing relation takes the exact zero (`_relationAt`). The scalarized route's relation
@@ -187,14 +187,14 @@ end
          crossing function positive at both ends: the zero of x is watched too (`_absProbes`, `_withAbsProbe`) =#
       @test _at(_routeRun("AbsWindow", scalarized; stop = 0.05), "n", [0.004, 0.006, 0.016, 0.05]) == [0.0, 1.0, 2.0, 5.0]
       local ri = _routeRun("RoundedIntermediate", scalarized)
-      @test ri.retcode == ReturnCode.Terminated && abs(ri.t[end] - 0.5) < 1e-5 && OMBackend.getVariableValues(ri, "n")[end] == 2.0
-      scalarized || @test OMBackend.getVariableValues(_routeRun("IfNoEventCondition", scalarized), "hits")[end] == 1.0
-      scalarized || @test OMBackend.getVariableValues(_routeRun("IntegerFunctionNeedsCrossing", scalarized), "hits")[end] == 1.0
+      @test ri.retcode == ReturnCode.Terminated && abs(ri.t[end] - 0.5) < 1e-5 && OMBackend.variableValues(ri, "n")[end] == 2.0
+      scalarized || @test OMBackend.variableValues(_routeRun("IfNoEventCondition", scalarized), "hits")[end] == 1.0
+      scalarized || @test OMBackend.variableValues(_routeRun("IntegerFunctionNeedsCrossing", scalarized), "hits")[end] == 1.0
       local ta = _routeRun("TermOpaqueIntegerAbs", scalarized)
-      @test ta.retcode == ReturnCode.Terminated && abs(ta.t[end] - 0.5) < 1e-5 && OMBackend.getVariableValues(ta, "n")[end] == 6.0
+      @test ta.retcode == ReturnCode.Terminated && abs(ta.t[end] - 0.5) < 1e-5 && OMBackend.variableValues(ta, "n")[end] == 6.0
       #= ... also promoted to Real by the frontend's cast in an intermediate-value guard (round 14's symbolic run) =#
       local to = _routeRun("TermOpaqueInteger", scalarized)
-      @test to.retcode == ReturnCode.Terminated && abs(to.t[end] - 0.5) < 1e-5 && OMBackend.getVariableValues(to, "n")[end] == 6.0
+      @test to.retcode == ReturnCode.Terminated && abs(to.t[end] - 0.5) < 1e-5 && OMBackend.variableValues(to, "n")[end] == 6.0
       #= an elseif's condition (a snapshot of the conditions before the branches) and a branch's partial function are
          evaluated only where their guards hold: sqrt of a negative d =#
       local ie = _routeRun("InactiveElseif", scalarized)
@@ -217,7 +217,7 @@ end
       #= a step variable of an argument through an if-equation (the scalarized route's step body read its own triggers,
          pinned after the crossing: 4); one of an inner step (a chain of whens: unbalanced) =#
       local si = _routeRun("StepThroughIfEq", scalarized; stop = 10.0)
-      local (su, sy) = (OMBackend.getVariableValues(si, "u"), OMBackend.getVariableValues(si, "y"))
+      local (su, sy) = (OMBackend.variableValues(si, "u"), OMBackend.variableValues(si, "y"))
       @test all(((a, b),) -> b == (a > 0 ? floor(a + 0.5) : ceil(a - 0.5)) || abs(abs(a) - round(abs(a) - 0.5) - 0.5) < 1e-6,
                 zip(su, sy))
       #= a whole period: the falling crossings (4: 2) and the negative half (6.3: -2, 8: -3), omc =#
@@ -228,8 +228,8 @@ end
       #= ceil, div, mod, rem of an oscillating argument, both signs: each saved point off a jump against the formula =#
       local q = (x::Float64) -> 3.7x
       local saved = (sol, var::String, f::Function, g::Function) -> begin
-        local xs::Vector{Float64} = OMBackend.getVariableValues(sol, "x")
-        local ys::Vector{Float64} = OMBackend.getVariableValues(sol, var)
+        local xs::Vector{Float64} = OMBackend.variableValues(sol, "x")
+        local ys::Vector{Float64} = OMBackend.variableValues(sol, var)
         return maximum(abs(y - f(x)) for (x, y) in zip(xs, ys) if abs(g(x) - round(g(x))) > 1e-5)
       end
       local ef = _routeRun("EventFns", scalarized)
@@ -291,9 +291,9 @@ end
        (UndefVarError). idx: 1, 2 at 0.3, 3 at 0.6, 1 at 0.9 (CDL's Integer TimeTable) =#
     for scalarized in ROUTES
       local rows::String = _translateProgram(program, "ByIndex.TableRow"; scalarized)
-      local sol = OMBackend.simulateModel(rows; tspan = (0.0, 1.0))
+      local sol = OMBackend.simulate(rows; tspan = (0.0, 1.0))
       @test sol.retcode == ReturnCode.Success
-      @test [OMBackend.getVariableValues(sol, "y[2]")[1]; _values(sol, ["y[1]", "y[2]"])] == [4.0, 1.0, 4.0]
+      @test [OMBackend.variableValues(sol, "y[2]")[1]; _values(sol, ["y[1]", "y[2]"])] == [4.0, 1.0, 4.0]
     end
   end
 
@@ -324,14 +324,14 @@ end
         Int(OMBackend.isEventCallback(cb))
     for scalarized in ROUTES
       local asserted::String = _translateProgram(program, "EventKinds.Asserted"; scalarized)
-      local sol = OMBackend.simulateModel(asserted; tspan = (0.0, 1.0))
+      local sol = OMBackend.simulate(asserted; tspan = (0.0, 1.0))
       @test sol.retcode == ReturnCode.Success
       @test OMBackend.eventCallbacks(asserted) !== nothing
       @test events(OMBackend.eventCallbacks(asserted)) == 0
       @test events(get(sol.prob.kwargs, :callback, nothing)) == 0
       local switched::String = _translateProgram(program, "EventKinds.Switched"; scalarized)
       @test events(OMBackend.eventCallbacks(switched)) > 0
-      @test _values(OMBackend.simulateModel(switched; tspan = (0.0, 1.0)), ["y"]) == [0.0]
+      @test _values(OMBackend.simulate(switched; tspan = (0.0, 1.0)), ["y"]) == [0.0]
     end
   end
 
@@ -340,7 +340,7 @@ end
   if true in ROUTES
     @testset "A tuple with fewer targets than outputs" begin
       local fewer = _arrayPathTranslate("ArrayPath.TupleFewerTargets"; scalarized = true)
-      @test _values(OMBackend.simulateModel(fewer; tspan = (0.0, 1.0)), ["q"]) ≈ [3.0]
+      @test _values(OMBackend.simulate(fewer; tspan = (0.0, 1.0)), ["q"]) ≈ [3.0]
     end
   end
 end

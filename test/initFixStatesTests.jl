@@ -21,10 +21,10 @@ import OMFrontend
   for (model, expected) in (("PartlyFixed", ("x" => 1.0, "y" => 4.0)), ("WithAlgebraic", ("x" => 1.0, "y" => 1.5, "z" => 4.0)))
     local (fm, cache) = OMFrontend.instantiateSCodeToFM("InitFixStates." * model, scode)
     OMBackend.translate(fm; functionList = OMFrontend.cacheToFunctionList(cache))
-    local sol = OMBackend.simulateModel(OMBackend.canonicalName("InitFixStates." * model); tspan = (0.0, 1.0))
+    local sol = OMBackend.simulate(OMBackend.canonicalName("InitFixStates." * model); tspan = (0.0, 1.0))
     @test sol.retcode == OMBackend.CodeGeneration.ModelingToolkit.SciMLBase.ReturnCode.Success
     for (name, value) in expected
-      @test OMBackend.getVariableValues(sol, name)[1] ≈ value atol = 1e-8
+      @test OMBackend.variableValues(sol, name)[1] ≈ value atol = 1e-8
     end
   end
 end

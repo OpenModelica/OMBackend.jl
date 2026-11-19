@@ -40,7 +40,7 @@ julia> import OMFrontend, OMBackend
 julia> scode = OMFrontend.translateToSCode(OMFrontend.parseFile("BouncingBallReals.mo"))
 julia> (fm, cache) = OMFrontend.instantiateSCodeToFM("BouncingBallReals", scode)
 julia> OMBackend.translate(fm; functionList = OMFrontend.cacheToFunctionList(cache))
-julia> OMBackend.simulateModel("BouncingBallReals"; tspan = (0.0, 2.5))
+julia> OMBackend.simulate("BouncingBallReals"; tspan = (0.0, 2.5))
 ```
 
 `examples/` in the repository has more models and `examples/simulate_examples.jl`
@@ -49,7 +49,7 @@ runs them.
 ## Documentation in the REPL
 
 Every function of the [API reference](api.md) has its docstring in Julia's help
-mode, for example `?OMBackend.simulateModel`.
+mode, for example `?OMBackend.simulate`.
 
 ## Tests
 

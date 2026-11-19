@@ -30,7 +30,7 @@ _wbcDefinitions(code::Expr)::Int =
                  e.args[2] isa Expr && _wbcCalls(e.args[2], :(OMBackend.CodeGeneration.modelicaFunctionResult)) == 1, code)
 
 "The final value of the variable `v` of `sol`."
-_wbcFinal(sol::WBC_SOLUTION, v::String)::Float64 = OMBackend.getVariableValues(sol, v)[end]
+_wbcFinal(sol::WBC_SOLUTION, v::String)::Float64 = OMBackend.variableValues(sol, v)[end]
 
 @testset "A when body's repeated call evaluated once" begin
   local file::String = joinpath(@__DIR__, "Models", "WhenBodyCalls.mo")
@@ -44,7 +44,7 @@ _wbcFinal(sol::WBC_SOLUTION, v::String)::Float64 = OMBackend.getVariableValues(s
   @test _wbcCalls(code, :(OMBackend.CodeGeneration.tupleArrayElementAt)) == 0
   @test _wbcCalls(code, :(OMBackend.CodeGeneration.tupleElementCall)) == 0
   @test _wbcCalls(code, :(OMBackend.CodeGeneration.modelicaFunctionResult)) == _wbcDefinitions(code) == 3
-  local sol::WBC_SOLUTION = OMBackend.simulateModel(name; tspan = (0.0, 1.0))
+  local sol::WBC_SOLUTION = OMBackend.simulate(name; tspan = (0.0, 1.0))
   @test string(sol.retcode) == "Success"
   @test _wbcFinal(sol, "s2") ≈ 10.0 && [_wbcFinal(sol, "y2[$i]") for i in 1:4] ≈ [3.0, 6.0, 9.0, 12.0]
   @test _wbcFinal(sol, "s") ≈ 10.0 && [_wbcFinal(sol, "y[$i]") for i in 1:4] ≈ [2.0, 4.0, 6.0, 8.0]
@@ -63,7 +63,7 @@ end
   local (fm::OMFrontend.Frontend.FlatModel, cache::OMFrontend.Frontend.FunctionTreeImpl.Tree) =
     OMFrontend.instantiateSCodeToFM("WhenBodyCalls.TwoBodies", OMFrontend.translateToSCode(OMFrontend.parseFile(file)))
   OMBackend.translate(fm; functionList = OMFrontend.cacheToFunctionList(cache))
-  local sol::WBC_SOLUTION = OMBackend.simulateModel(OMBackend.canonicalName("WhenBodyCalls.TwoBodies"); tspan = (0.0, 1.0))
+  local sol::WBC_SOLUTION = OMBackend.simulate(OMBackend.canonicalName("WhenBodyCalls.TwoBodies"); tspan = (0.0, 1.0))
   @test string(sol.retcode) == "Success"
   for (out, k) in (("", 2.0), ("3", 3.0), ("4", 4.0), ("5", 5.0))
     @test _wbcFinal(sol, "s" * out) ≈ 10.0

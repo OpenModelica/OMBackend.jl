@@ -12,7 +12,7 @@ import OMFrontend
   for (name, expected) in values
     local (fm, cache) = OMFrontend.instantiateSCodeToFM(name, OMFrontend.translateToSCode(OMFrontend.parseFile(file)))
     OMBackend.translate(fm; functionList = OMFrontend.cacheToFunctionList(cache))
-    local sol = OMBackend.simulateModel(OMBackend.canonicalName(name); tspan = (0.0, 0.35))
+    local sol = OMBackend.simulate(OMBackend.canonicalName(name); tspan = (0.0, 0.35))
     @test string(sol.retcode) == "Success"
     #= between the ticks: the held value of the last one =#
     @test [sol(t; idxs = :y) for t in (0.05, 0.15, 0.25, 0.35)] ≈ expected atol = 1e-10

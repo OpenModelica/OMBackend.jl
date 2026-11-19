@@ -37,7 +37,7 @@ import OMFrontend
   end
   local (fm, cache) = flat()
   OMBackend.translate(fm; functionList = OMFrontend.cacheToFunctionList(cache))
-  local sol = OMBackend.simulateModel(OMBackend.canonicalName(name); tspan = (0.0, 0.02))
+  local sol = OMBackend.simulate(OMBackend.canonicalName(name); tspan = (0.0, 0.02))
   @test string(sol.retcode) == "Success"
   #= omc: i1, i3, iload at 0.005, 0.01, 0.015, 0.02 =#
   local expected = [(112.3695119406272, -0.1851103830138072, 2.958310250957386),

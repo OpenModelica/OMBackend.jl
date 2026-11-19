@@ -16,8 +16,8 @@ function _eipRun(model::String, v::String)::Tuple{OMBackend.SimCode.SIM_CODE, Fl
     OMFrontend.instantiateSCodeToFM(model, OMFrontend.translateToSCode(OMFrontend.parseFile(file)))
   OMBackend.translate(fm; functionList = OMFrontend.cacheToFunctionList(cache))
   local simCode::OMBackend.SimCode.SIM_CODE = OMBackend.LAST_SIM_CODE[]
-  local sol::EIP_SOLUTION = OMBackend.simulateModel(OMBackend.canonicalName(model); tspan = (0.0, 1.0))
-  return (simCode, OMBackend.getVariableValues(sol, v)[end])
+  local sol::EIP_SOLUTION = OMBackend.simulate(OMBackend.canonicalName(model); tspan = (0.0, 1.0))
+  return (simCode, OMBackend.variableValues(sol, v)[end])
 end
 
 "The keys of the parameters of the simulation code `sc`, sorted."

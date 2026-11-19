@@ -13,9 +13,9 @@ import OMFrontend
   local (fm, cache) = OMFrontend.instantiateSCodeToFM("ObservedFilter.AliasOfObserved",
                                                       OMFrontend.translateToSCode(OMFrontend.parseFile(file)))
   OMBackend.translate(fm; functionList = OMFrontend.cacheToFunctionList(cache), observedFilter = ["^u\$"])
-  local sol = OMBackend.simulateModel(OMBackend.canonicalName("ObservedFilter.AliasOfObserved"); tspan = (0.0, 1.0))
+  local sol = OMBackend.simulate(OMBackend.canonicalName("ObservedFilter.AliasOfObserved"); tspan = (0.0, 1.0))
   @test sol.retcode == OMBackend.CodeGeneration.ModelingToolkit.SciMLBase.ReturnCode.Success
-  @test OMBackend.getVariableValues(sol, "u")[end] ≈ 2 * exp(-1.0) + sin(exp(-1.0)) atol = 1e-5
+  @test OMBackend.variableValues(sol, "u")[end] ≈ 2 * exp(-1.0) + sin(exp(-1.0)) atol = 1e-5
 end
 
 @testset "An observed filter keeps what the events read" begin
@@ -23,7 +23,7 @@ end
   local (fm, cache) = OMFrontend.instantiateSCodeToFM("ObservedFilter.RelationOfObserved",
                                                       OMFrontend.translateToSCode(OMFrontend.parseFile(file)))
   OMBackend.translate(fm; functionList = OMFrontend.cacheToFunctionList(cache), observedFilter = ["^y\$"])
-  local sol = OMBackend.simulateModel(OMBackend.canonicalName("ObservedFilter.RelationOfObserved"); tspan = (0.0, 1.0))
+  local sol = OMBackend.simulate(OMBackend.canonicalName("ObservedFilter.RelationOfObserved"); tspan = (0.0, 1.0))
   @test sol.retcode == OMBackend.CodeGeneration.ModelingToolkit.SciMLBase.ReturnCode.Success
   #= the crossing of time = 0.3 + 0.1 exp(-time), at 0.36913 =#
   local tEvent::Float64 = sol.t[findfirst(iszero, diff(sol.t))]
@@ -43,7 +43,7 @@ end
 
   local (fm, cache) = OMFrontend.instantiateSCodeToFM("ObservedFilter.ClusterOfObserved", scode)
   OMBackend.translate(fm; functionList = OMFrontend.cacheToFunctionList(cache), observedFilter = ["^y\$"])
-  local sol = OMBackend.simulateModel(OMBackend.canonicalName("ObservedFilter.ClusterOfObserved"); tspan = (0.0, 1.0))
+  local sol = OMBackend.simulate(OMBackend.canonicalName("ObservedFilter.ClusterOfObserved"); tspan = (0.0, 1.0))
   @test sol.retcode == success
   #= x rises to reference + 0.1 at time 2/3, then falls: x = 4/3 - time until time 28/33 =#
   @test sol(0.5; idxs = :y) ≈ 1.0 atol = 1e-6
@@ -51,7 +51,7 @@ end
 
   (fm, cache) = OMFrontend.instantiateSCodeToFM("ObservedFilter.ClusterOfConstantObserved", scode)
   OMBackend.translate(fm; functionList = OMFrontend.cacheToFunctionList(cache), observedFilter = ["^y\$"])
-  sol = OMBackend.simulateModel(OMBackend.canonicalName("ObservedFilter.ClusterOfConstantObserved"); tspan = (0.0, 1.0))
+  sol = OMBackend.simulate(OMBackend.canonicalName("ObservedFilter.ClusterOfConstantObserved"); tspan = (0.0, 1.0))
   @test sol.retcode == success
   #= up at x = 0.3 (time 0.3), then der(x) = 2 =#
   @test sol(0.2; idxs = :y) ≈ 0.4 atol = 1e-6

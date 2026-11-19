@@ -67,15 +67,15 @@ import OMFrontend
     local (fm, cache) = OMFrontend.instantiateSCodeToFM("ReferenceLookups." * model, OMFrontend.translateToSCode(OMFrontend.parseFile(file)))
     OMBackend.translate(fm; functionList = OMFrontend.cacheToFunctionList(cache))
     local name::String = OMBackend.canonicalName("ReferenceLookups." * model)
-    (OMBackend.COMPILED_MODELS_MTK[name][1], OMBackend.simulateModel(name; tspan = (0.0, stop)))
+    (OMBackend.COMPILED_MODELS_MTK[name][1], OMBackend.simulate(name; tspan = (0.0, stop)))
   end
-  local value = (sol, v::String, k::Int) -> OMBackend.getVariableValues(sol, v)[k]
+  local value = (sol, v::String, k::Int) -> OMBackend.variableValues(sol, v)[k]
 
   @testset "a parameter table read by a discrete index" begin
     #= the lowering's choice among the elements (an if-equation); its values =#
     local (_, sol) = simulate("DynamicIndex", 1.0)
     @test string(sol.retcode) == "Success"
-    @test value(sol, "y", 1) ≈ 10.0 && OMBackend.getVariableValues(sol, "y")[end] ≈ 30.0
+    @test value(sol, "y", 1) ≈ 10.0 && OMBackend.variableValues(sol, "y")[end] ≈ 30.0
     #= a reference `tab[idx]` the code generation meets (CDL's TimeTable): the table of the elements by their
        references' identifiers, indexed at run time by the variable's symbol =#
     isdefined(@__MODULE__, :BackendTestMocks) || include(joinpath(@__DIR__, "BackendTestMocks.jl"))
@@ -102,14 +102,14 @@ import OMFrontend
        two variables, x = cos(t), der_x = 2 cos(t) =#
     local (_, sol) = simulate("DerivativeAuxiliaryName", 1.0)
     @test string(sol.retcode) == "Success"
-    @test isapprox(OMBackend.getVariableValues(sol, "x")[end], cos(1.0); rtol = 1e-3)
-    @test isapprox(OMBackend.getVariableValues(sol, "der_x")[end], 2 * cos(1.0); rtol = 1e-3)
+    @test isapprox(OMBackend.variableValues(sol, "x")[end], cos(1.0); rtol = 1e-3)
+    @test isapprox(OMBackend.variableValues(sol, "der_x")[end], 2 * cos(1.0); rtol = 1e-3)
   end
 
   @testset "a function over an array of records" begin
     local (_, sol) = simulate("RecordArrayFields", 1.0)
     @test string(sol.retcode) == "Success"
     @test value(sol, "y", 1) ≈ 14.0
-    @test isapprox(OMBackend.getVariableValues(sol, "x")[end], 14.0; atol = 1e-6)
+    @test isapprox(OMBackend.variableValues(sol, "x")[end], 14.0; atol = 1e-6)
   end
 end

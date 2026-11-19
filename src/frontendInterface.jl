@@ -65,27 +65,12 @@ translation would plan it, nothing translated.
 function explainIndexReduction end
 
 """
-    omjlirModel(fm; functionList = nothing, scalarized = true, arrayReduction = true) -> OMJLIR.Model
+    omjlirModel(fm; functionList = nothing) -> OMJLIR.Model
 
-The OMJLIR model of the flat model `fm` and its functions (the frontend's function list),
-through the passes (Passes.PIPELINE): what the simulation code is lowered from. A flat model
-with arrays kept (`scalarized = false`, OM's `scalarize = false`) whose index OMBackend reduces in
-array form is lowered with its arrays (`arrayReducedModel`; not with `arrayReduction` false: a caller
-that tried it); another is scalarized by the backend's element view before the scalar passes
-(`backendScalarizedModel`), by the frontend only where that view does not take the model.
+The OMJLIR model of the scalar flat model `fm` and its functions (the frontend's function list), through the passes
+(Passes.PIPELINE): what the simulation code is lowered from.
 """
 function omjlirModel end
-
-"""
-    arrayReducedModel(fm; functionList = nothing) -> Union{Nothing, OMJLIR.Model}
-
-The OMJLIR model of a flat model with arrays kept whose index OMBackend reduces in array form (the
-switch OMBACKEND_ARRAY_INDEX_REDUCTION, with OMBACKEND_INDEX_REDUCTION), for the scalar simulation
-code: reduced with its arrays (`reducedArrayModel`), then scalarized (`scalarizedReducedModel`).
-`nothing` where the array form does not take the model: the caller scalarizes in the frontend as
-before.
-"""
-function arrayReducedModel end
 
 """
     reducedArrayModel(fm; functionList = nothing) -> Union{Nothing, OMJLIR.Model}
@@ -101,19 +86,6 @@ for-equation's iterator, what it does not handle or the lowering does not suppor
 error: a warning), the reason recorded (`declineArrayPath!`).
 """
 function reducedArrayModel end
-
-"""
-    translateReducedArrays(fm; functionList, BackendMode, warnMissingStartValues, eliminateNonDynamic,
-                           observedFilter, checkSimCode) -> Union{Nothing, Tuple}
-
-`translate` of a flat model with arrays kept: its index reduced in array form (`reducedArrayModel`), to the
-array code (`generateReducedArrayPreserveDETargetCode`), else the reduced model scalarized (`scalarizedReducedModel`);
-where the array form does not take it, or what it made does not translate or build, the model scalarized by the
-backend before the scalar passes (`backendScalarizedModel`, recorded in BACKEND_SCALARIZED_MODELS). `nothing`
-where none of these takes the model (OM's translate then throws `ARRAY_PRESERVING_CODEGEN_NOT_SUPPORTED` with the
-reasons, `scalarizedFallbackReason`).
-"""
-function translateReducedArrays end
 
 """
     resolveModelicaURI(uri::String) -> String

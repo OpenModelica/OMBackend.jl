@@ -4,15 +4,15 @@
 "The public names of OMBackend 1.x."
 const PUBLIC_API_NAMES = Symbol[
   #= translate =#
-  :translate, :translateReducedArrays, :generateTargetCode, :knownValues, :BackendMode, :IMTK_MODE, :MTK_MODE,
-  :EliminationOptions, :explainIndexReduction, :scalarizedFallbackReason, :canonicalName,
+  :translate, :BackendMode, :IMTK_MODE, :MTK_MODE, :EliminationOptions, :explainIndexReduction,
+  :scalarizedFallbackReason, :canonicalName,
   #= simulate =#
-  :simulateModel, :resimulateModel, :getMTKProblem, :defaultSolver, :daeFallbackSolver, :getVariableValues,
+  :simulate, :resimulate, :getMTKProblem, :defaultSolver, :daeFallbackSolver, :variableValues,
   :eventCallbacks, :isEventCallback, :isStepControl, :ModelicaAssertionError, :plot,
   #= tunable parameters (OMSurrogates) =#
   :withTunableParameters, :isTunable, :pristineParameters,
   #= inspect and write models =#
-  :availableModels, :printModel, :modelToString, :writeModelToFile, :dumpGeneratedCode,
+  :availableModels, :printModel, :modelToString, :writeModelToFile,
   #= caches =#
   :clearCaches!, :forgetModel]
 
@@ -26,4 +26,12 @@ const PUBLIC_API_NAMES = Symbol[
   @test filter(n -> Base.isexported(OMBackend, n), names(OMBackend)) == [:OMBackend]
   local apiPage::String = read(joinpath(@__DIR__, "..", "docs", "src", "api.md"), String)
   @test all(n -> occursin("OMBackend.$n\n", apiPage), PUBLIC_API_NAMES)
+end
+
+#= The names of OMBackend 0.x that 1.0 renamed: they still work in 1.x, with a deprecation warning. =#
+@testset "Deprecated names" begin
+  @test all(n -> isdefined(OMBackend, n) && !Base.ispublic(OMBackend, n),
+            [:simulateModel, :resimulateModel, :getVariableValues, :translateReducedArrays])
+  @test OMBackend._deprecatedKeyword(:f, :old, nothing, :new, 1) == 1
+  @test (@test_deprecated OMBackend._deprecatedKeyword(:f, :old, 2, :new, 1)) == 2
 end
