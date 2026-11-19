@@ -3713,4 +3713,71 @@ end DivideInLoop;
     local sol = OMBackend.simulateModel(name; tspan = (0.0, 1.0), reltol = 1e-10, abstol = 1e-12)
     @test _values(sol, ["y", "x"]) ≈ [2.0, 1.0] rtol = 1e-8
   end
+
+  @testset "A discrete Real array of more elements than a literal takes as a function's argument: its buffer" begin
+    #= MSL Rectifier6pulseFFT: RealFFT's 4000-element buffer given to its FFT function (the MTK fallback before), read
+       as one slice of p.d; the 2-D one reshaped to its row-major order. Last sample at 0.75 =#
+    local buffers = Modelica"""
+      package Buf
+        function ramp
+          input Integer n;
+          input Real t;
+          output Real y[n];
+        algorithm
+          for i in 1:n loop
+            y[i] := i * t;
+          end for;
+          annotation(Inline = false);
+        end ramp;
+        function grid
+          input Integer n;
+          input Real t;
+          output Real y[n, 2];
+        algorithm
+          for i in 1:n loop
+            y[i, 1] := i * t;
+            y[i, 2] := -i * t;
+          end for;
+          annotation(Inline = false);
+        end grid;
+        function total
+          input Real x[:];
+          output Real s = 0;
+        algorithm
+          for i in 1:size(x, 1) loop
+            s := s + x[i];
+          end for;
+          annotation(Inline = false);
+        end total;
+        function weighted "the rows weighted by their index, the columns by 1 and 3: the order of the elements"
+          input Real x[:, 2];
+          output Real s = 0;
+        algorithm
+          for i in 1:size(x, 1) loop
+            s := s + i * (x[i, 1] + 3 * x[i, 2]);
+          end for;
+          annotation(Inline = false);
+        end weighted;
+        model Sampled "buffers of 1100 and 600 x 2 elements"
+          parameter Integer n = 1100;
+          parameter Integer m = 600;
+          discrete Real buf[n](each start = 0, each fixed = true);
+          discrete Real mat[m, 2](each start = 0, each fixed = true);
+          Real y;
+          Real z;
+        equation
+          when sample(0, 0.25) then
+            buf = ramp(n, time);
+            mat = grid(m, time);
+          end when;
+          y = total(buf);
+          z = weighted(mat);
+        end Sampled;
+      end Buf;
+      """
+    local name::String = _translateProgram(buffers, "Buf.Sampled"; scalarized = false)
+    @test _arrayPathTaken(name)
+    local sol = OMBackend.simulateModel(name; tspan = (0.0, 0.9))
+    @test _values(sol, ["y", "z"]) ≈ [0.75 * 1100 * 1101 / 2, 0.75 * sum(-2 * i^2 for i in 1:600)] rtol = 1e-12
+  end
 end

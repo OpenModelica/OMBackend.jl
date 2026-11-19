@@ -1760,6 +1760,34 @@ function _subscriptCode(g::Gen, info::VarInfo, name::String, subs::Vector{IR})::
   return idx
 end
 
+"""
+An array value of the elements of one Real array variable, all of them in column-major order (`_wholeArrayIRx`, a
+function's argument `f(x)`): the slice of its buffer (`u`, `du`, `a`, `p.d`; stored row-major), a copy as the array
+literal of its elements was, one expression instead of one per element (MSL RealFFT's 4000-element buffer). `nothing`
+for another array value.
+"""
+function _storageSlice(g::Gen, x::Op)::Union{Nothing, Expr}
+  local dims::Tuple = (x.args[1]::Lit).v
+  length(x.args) == 1 + prod(dims) >= 2 || return nothing
+  local first::IR = x.args[2]
+  first isa Ref || return nothing
+  local info::Union{Nothing, VarInfo} = get(g.vars, first.name, nothing)
+  (info !== nothing && info.kind in (:state, :alg, :discrete) && info.vtype == :real && Tuple(info.dims) == dims) ||
+    return nothing
+  (first.der && info.kind != :state) && return nothing
+  local k::Int = 1
+  for t in Iterators.product((1:d for d in dims)...)   #= column-major: the first index fastest =#
+    k += 1
+    local r::IR = x.args[k]
+    (r isa Ref && r.name == first.name && r.der == first.der && length(r.subs) == length(t) &&
+     all(j::Int -> r.subs[j] isa Lit && (r.subs[j]::Lit).v == t[j], eachindex(t))) || return nothing
+  end
+  local buffer::Union{Symbol, Expr} = info.kind == :state ? (first.der ? :du : :u) : info.kind == :alg ? :a : :(p.d)
+  local range::Expr = :($(info.offset + 1):$(info.offset + prod(dims)))
+  length(dims) == 1 && return :($(buffer)[$(range)])
+  return :(permutedims(reshape($(buffer)[$(range)], $(reverse(dims)...)), $(Tuple(length(dims):-1:1))))
+end
+
 function jl(g::Gen, x::IR)
   if x isa Lit
     return x.v
@@ -1808,6 +1836,10 @@ function jl(g::Gen, x::IR)
     local k = :($(g.relBase) + (_col - 1) * $(g.relCount) + $(x.id))
     return :($(_evfn)(z, p, mode, $k, $(QuoteNode(x.kind)), $(jl(g, x.arg))))
   elseif x isa Op
+    if x.op == :arrayval
+      local slice::Union{Nothing, Expr} = _storageSlice(g, x)
+      slice === nothing || return slice
+    end
     local args = Any[jl(g, a) for a in x.args]
     x.op == :neg && return :(-$(args[1]))
     if x.op == :delay

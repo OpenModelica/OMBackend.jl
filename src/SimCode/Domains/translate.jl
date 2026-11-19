@@ -798,7 +798,10 @@ An array variable of the equations as a whole (a function's argument, `f(x)`): t
 function _wholeArrayIRx(g::Gen, name::String)::Union{Nothing, IR}
   local info::Union{Nothing, VarInfo} = get(g.vars, get(g.derOf, name, name), nothing)
   (info === nothing || isempty(info.dims) || info.kind == :param) && return nothing
-  prod(info.dims) <= Passes.MAX_ELEMENT_TERMS || ns("an array argument of $(prod(info.dims)) elements")
+  #= more elements than a literal takes: a Real array, which the code reads as one slice of its buffer (ArrayPreserveDE
+     `_storageSlice`: MSL RealFFT's 4000-element buffer) =#
+  (prod(info.dims) <= Passes.MAX_ELEMENT_TERMS || info.vtype == :real) ||
+    ns("an array argument of $(prod(info.dims)) elements")
   local elements::Vector{IR} = IR[]
   for t in Iterators.product((1:d for d in info.dims)...)   #= column-major: the first index fastest =#
     push!(elements, _elementRefIR(g, name, IR[Lit(i) for i in t]))
