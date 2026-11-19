@@ -4,7 +4,7 @@
    otherwise, which the precompile turns into a warning only), and they leave OMBackend's registries as they found them. =#
 @testset "Precompile workload: translate and simulate" begin
   local CG = OMBackend.CodeGeneration
-  local registered()::Vector{String} = String[collect(OMBackend.ARRAY_ODE_MODELS); collect(OMBackend.ARRAY_REDUCED_MODELS);
+  local registered()::Vector{String} = String[collect(OMBackend.ARRAY_PRESERVE_DE_MODELS); collect(OMBackend.ARRAY_REDUCED_MODELS);
                                               collect(OMBackend.BACKEND_SCALARIZED_MODELS);
                                               collect(keys(OMBackend.ARRAY_PATH_REASONS)); collect(keys(OMBackend.COMPILED_MODELS_MTK));
                                               collect(keys(OMBackend.IMTKGen.BUILT)); string.(keys(CG.MODELICA_FUNCTION_IMPLS));

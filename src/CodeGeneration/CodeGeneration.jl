@@ -95,10 +95,7 @@ include("./discreteDummyDemotion.jl")
    structural callbacks, CodeGenerationUtil) =#
 include("./codeGen.jl")
 
-#= Direct DifferentialEquations.jl code generation (DEMode, fresh emitter) =#
-include("./DEGen.jl")
-
-#= Array-preserving explicit-ODE code generation (no-scalarize flat models, experimental) =#
-include("./ArrayODEGen.jl")
+#= arrayPreserveDE: array-preserving DifferentialEquations.jl code generation (flat models with their arrays kept) =#
+include("./ArrayPreserveDE.jl")
 
 end #= End CodeGeneration=#

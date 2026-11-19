@@ -135,7 +135,7 @@ function _delayedValue(h::DelayHistory, s::Float64, right::Bool, t::Float64, x::
 end
 
 #= The histories' use and upkeep, shared by the scalarized path's callbacks (below) and the array code's
-   (ArrayODEGen.jl): each reads and fills a `DelayState`; they differ in where the state is kept and in how
+   (ArrayPreserveDE.jl): each reads and fills a `DelayState`; they differ in where the state is kept and in how
    the present values of the arguments are computed. =#
 
 """

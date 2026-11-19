@@ -35,7 +35,7 @@
 
 #= The domain level's classes and their expression form, its passes (rerolling, folding, alias elimination, semiLinear
    chains) and the causal level (elements, matching, scheduling with loops, tearing, solving for an unknown): moved
-   from CodeGeneration's ArrayODEGen.jl (2026-11-01), unchanged. =#
+   from CodeGeneration's ArrayPreserveDE.jl (2026-11-01), unchanged. =#
 
 struct NotSupported <: Exception
   msg::String
@@ -169,7 +169,7 @@ end
 """
     SimVariable(simVar, names, value)
 
-A variable of the simulation code (the front half, ArrayODEGenerationSC.jl): the variable, its elements' names
+A variable of the simulation code (the front half): the variable, its elements' names
 (row-major, as the frontend's `c[2].T`), and a parameter's value (a scalar, or an array row-major) as the lowering
 evaluated it; `nothing` for another variable.
 """

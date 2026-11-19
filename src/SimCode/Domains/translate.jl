@@ -37,7 +37,7 @@
 The domain level's translation (2026-11-01): the simulation code of a model with its arrays kept
 (SimCode.lowerArraySystem: reduced in array form, Passes.IndexReduction.reduceIndexArrays!, its derivative unknowns
 solved in array form, solvedInArrays, in the array code's form, Passes.arrayCodeForm!) to the variables and classes of
-the domain level (`domainSystem`), from which CodeGeneration's ArrayODEGen (_emitModule) generates the module.
+the domain level (`domainSystem`), from which CodeGeneration's ArrayPreserveDE (_emitModule) generates the module.
 
   - Its for-equations are the classes, their iterators the slots; a scalar equation reading
     elements by literal subscripts is a class of one instance (re-rolled with its like ones).

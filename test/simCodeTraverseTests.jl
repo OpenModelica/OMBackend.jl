@@ -284,21 +284,6 @@ isdefined(@__MODULE__, :BackendTestMocks) || include(joinpath(@__DIR__, "Backend
       @test_throws OMBackend.UnsupportedLowering gen(SC.DER(SC.SimCref(:s)))
     end
 
-    @testset "expToJuliaExpDE: states u[i], parameters p[i]" begin
-      local sc = M.mockSimCode([M.simVar("s", SC.STATE()), M.simVar("p", SC.PARAMETER(nothing))])
-      local layout = CG.DEGen.buildDELayout(sc)
-      local de = e -> CG.DEGen.expToJuliaExpDE(e, layout, sc)
-      local (u, p) = ([5.0], [2.0])
-      @test value(de(SC.SCONST("s"))) == "s"
-      @test value(de(SC.CAST(SC.TYPE_REAL(), R(1.0)))) == 1.0
-      @test value(de(call(:sin, R(1.0)))) == sin(1.0)
-      @test value(de(ref("s")); u = u) == 5.0
-      @test value(de(ref("p")); p = p) == 2.0
-      @test value(de(ref("time")); t = 0.5) == 0.5
-      @test value(de(SC.BINARY(ref("s"), SC.OP_MUL, R(2.0))); u = u) == 10.0
-      @test value(de(SC.IFEXP(SC.RELATION(ref("s"), SC.OP_GREATER, R(0.0), 0), ref("s"), R(2.0))); u = u) == 5.0
-    end
-
     @testset "the checks of the simulation code" begin
       #= a residual reading a name that is no variable; a variable name that is not flat =#
       local sc = M.mockSimCode([M.simVar("x", SC.ALG_VARIABLE(0)), M.simVar("a.b", SC.ALG_VARIABLE(0))])

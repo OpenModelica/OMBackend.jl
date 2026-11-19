@@ -45,10 +45,10 @@
 The target code of the flat model `fm` and its functions (the frontend's function list): `fm`
 lowered to OMJLIR and through its passes (`omjlirModel`; `omjlir`: that OMJLIR model, already
 lowered, `translateReducedArrays`), to the simulation code and its
-passes (SimCode.simulationCode; SimCode.deSimulationCode for DEMode), checked
+passes (SimCode.simulationCode), checked
 (`checkSimCode`), and the code generated for the backend mode. A flat model with arrays kept
 (`scalarized = false`) is lowered with its arrays and goes to the array-preserving generation first
-(`reducedArrayModel`, ARRAY_ODE_GENERATION), to this path where it is outside its scope.
+(`reducedArrayModel`, ARRAY_PRESERVE_DE_GENERATION), to this path where it is outside its scope.
 """
 function translate(fm::F.FlatModel;
                    functionList::Union{Nothing, FunctionList} = nothing,
@@ -66,7 +66,7 @@ function translate(fm::F.FlatModel;
   resetFallbacks!()
   warnMissingStartValues === nothing || (WARN_MISSING_START_VALUES[] = warnMissingStartValues)
   try
-    delete!(ARRAY_ODE_MODELS, canonicalName(fm.name))
+    delete!(ARRAY_PRESERVE_DE_MODELS, canonicalName(fm.name))
     omjlir === nothing && delete!(ARRAY_REDUCED_MODELS, canonicalName(fm.name))
     omjlir === nothing && delete!(BACKEND_SCALARIZED_MODELS, canonicalName(fm.name))
     #= an attempt with the arrays kept records its own reasons (as translateReducedArrays); a scalarized translate after
@@ -77,7 +77,7 @@ function translate(fm::F.FlatModel;
     if arrayReduction
       local reduced::Union{Nothing, OMJLIR.Model} = @BACKEND_PERFLOG "[backendAPI] reducedArrayModel" reducedArrayModel(fm; functionList)
       if reduced !== nothing
-        local reducedResult::Union{Nothing, Tuple{String, Expr}} = @BACKEND_PERFLOG "[backendAPI] generateReducedArrayODECode" generateReducedArrayODETargetCode(canonicalName(fm.name), reduced)
+        local reducedResult::Union{Nothing, Tuple{String, Expr}} = @BACKEND_PERFLOG "[backendAPI] generateReducedArrayPreserveDECode" generateReducedArrayPreserveDETargetCode(canonicalName(fm.name), reduced)
         reducedResult === nothing || return reducedResult
         omjlir = scalarizedReducedModel(canonicalName(fm.name), reduced)
       end
@@ -147,7 +147,7 @@ function translateReducedArrays(fm::F.FlatModel;
                                 observedFilter::Union{Nothing, Vector{String}, Vector{Regex}} = nothing,
                                 checkSimCode::Bool = true)::Union{Nothing, Tuple{String, Expr}}
   local name::String = canonicalName(fm.name)
-  delete!(ARRAY_ODE_MODELS, name)
+  delete!(ARRAY_PRESERVE_DE_MODELS, name)
   delete!(ARRAY_PATH_REASONS, name)
   delete!(BACKEND_SCALARIZED_MODELS, name)
   local options = (; functionList, BackendMode, warnMissingStartValues, eliminateNonDynamic, observedFilter,
@@ -156,7 +156,7 @@ function translateReducedArrays(fm::F.FlatModel;
   local reduced::Union{Nothing, OMJLIR.Model} =
     @BACKEND_PERFLOG "[backendAPI] reducedArrayModel" reducedArrayModel(fm; functionList)
   if reduced !== nothing
-    result = @BACKEND_PERFLOG "[backendAPI] generateReducedArrayODECode" generateReducedArrayODETargetCode(name,
+    result = @BACKEND_PERFLOG "[backendAPI] generateReducedArrayPreserveDECode" generateReducedArrayPreserveDETargetCode(name,
                                                                                                            reduced)
     result === nothing || return result
     local model::Union{Nothing, OMJLIR.Model} = scalarizedReducedModel(name, reduced)

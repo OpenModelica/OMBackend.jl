@@ -151,7 +151,7 @@ and symbols, `_paramValue!`; those read structurally, `g.structural`, which a fr
 instances' elements, the matching, the schedule with its loops, the large blocks torn, each batch's explicit solution,
 the state dependencies and the Jacobian's pattern, the initialization's matching (`fixedMask`: the states whose start
 is fixed), the rows the right-hand side and the relations need and the time-invariant ones. `keepsArrays`: the model
-keeps arrays an algebraic loop may go through; `full`: events, asserts and `initial()` taken (`ArrayODEGen.FULL`).
+keeps arrays an algebraic loop may go through; `full`: events, asserts and `initial()` taken (`ArrayPreserveDE.FULL`).
 NotSupported for what the array code does not take.
 """
 function causalSchedule!(g::Gen; keepsArrays::Bool, full::Bool, fixedMask::Vector{Bool})::Schedule

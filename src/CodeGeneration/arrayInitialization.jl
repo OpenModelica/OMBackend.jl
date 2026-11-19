@@ -33,7 +33,7 @@
 *
 */ =#
 
-#= The initialization of the array models (ArrayODEGen): one method for every model, over its parameters `p` and the
+#= The initialization of the array models (ArrayPreserveDE): one method for every model, over its parameters `p` and the
    model's code they hold (`p.code`, ArrayModelCode): the initial system's solve, its redundant equations, the lifted
    clusters' passes, homotopy(). Generated into each model's module before, and compiled again with each
    (PID_Controller: 0.2 s of its first simulate). =#

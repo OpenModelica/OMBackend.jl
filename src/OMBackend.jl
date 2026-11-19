@@ -46,7 +46,6 @@ include("$CURRENT_DIRECTORY/globalConstants.jl")
 include("$CURRENT_DIRECTORY/errorPolicy.jl")
 #= The models kept for the session, within a memory limit. =#
 include("$CURRENT_DIRECTORY/Cache/Cache.jl")
-export PLOT_PACKAGE_GRAPH
 include("$CURRENT_DIRECTORY/BackendUtil/BackendUtil.jl")
 include("$CURRENT_DIRECTORY/IR/Traversal.jl")
 include("$CURRENT_DIRECTORY/IR/OMJLIR.jl")

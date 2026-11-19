@@ -24,7 +24,7 @@ end
                                                       OMFrontend.translateToSCode(OMFrontend.parseFile(file)); scalarize = false)
   OMBackend.translate(fm; functionList = OMFrontend.cacheToFunctionList(cache), scalarized = false)
   local name = OMBackend.canonicalName("ImpureCalls.ImpureSample")
-  @test name in OMBackend.ARRAY_ODE_MODELS
+  @test name in OMBackend.ARRAY_PRESERVE_DE_MODELS
   local expected = _impureDraws(6)
   _impureDraws(0)
   local sol = OMBackend.simulateModel(name; tspan = (0.0, 0.55))

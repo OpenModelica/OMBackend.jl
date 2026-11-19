@@ -36,8 +36,7 @@
 
 #=
   The when-callback emitter the MTK path uses, and expToJuliaExp (SimCode expressions over the
-  solver's arrays) for the structural callbacks and the sample() intervals. The direct
-  DifferentialEquations.jl backend is DEGen.jl.
+  solver's arrays) for the structural callbacks and the sample() intervals.
 
   Author: John Tinnerholm
 =#

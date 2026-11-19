@@ -33,7 +33,7 @@
 *
 */ =#
 
-#= The asserts of the array models (ArrayODEGen) during a solve: one method for every model, over its parameters `p` and
+#= The asserts of the array models (ArrayPreserveDE) during a solve: one method for every model, over its parameters `p` and
    the model's code they hold (`p.code`, ArrayModelCode; its own `checkAsserts` evaluates them). =#
 
 """

@@ -68,18 +68,18 @@ end
   @test c.rel[1]
 end
 
-#= The array code's relation (`ArrayODEGen._rel`, mode = an event pass): a false relation becomes true at an exact
+#= The array code's relation (`ArrayPreserveDE._rel`, mode = an event pass): a false relation becomes true at an exact
    zero where it holds (an operand that jumped onto its threshold: `(if x > 0.5 then 5 else 0) >= 5.0`), a strict one and a
    true one are not changed there (a true one is not turned off at an exact zero: chatter), a landing inside the
    hysteresis band but not exact stays as it was (an operand held between events compares literally by construction,
    `Rel` is made only for continuous ones). =#
 @testset "Array relations at an exact zero" begin
-  local rel = OMBackend.CodeGeneration.ArrayODEGen._rel
+  local rel = OMBackend.CodeGeneration.ArrayPreserveDE._rel
   local H = 1.0e-6
   local run = (old::Bool, op, x::Real, y::Real; mode::Bool = true, H::Float64 = H) -> begin
     local p = (rel = [old], hyst = [H])
     local z = [0.0]
-    local v = rel(OMBackend.CodeGeneration.ArrayODEGen.CrossingOut(z), p, mode, 1, x, y, op)
+    local v = rel(OMBackend.CodeGeneration.ArrayPreserveDE.CrossingOut(z), p, mode, 1, x, y, op)
     return (v, p.rel[1], z[1])
   end
   #= exact zero, positive H: false stays false for a strict relation, becomes true for a closed one; true stays true =#
