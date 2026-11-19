@@ -284,9 +284,8 @@ loops (CodeGeneration.ArrayPreserveDE); other models are scalarized and go the M
 const ARRAY_PRESERVE_DE_GENERATION = Ref{Bool}(true)
 
 """
-`true`: the array-preserving code generation also takes models with events (relations,
-when, sample, initial()), asserts and initial equations (experimental). `false` (the default):
-those go the ModelingToolkit path, whose event and initialization semantics they keep.
+`true` (the default): the array-preserving code generation also takes models with events (relations,
+when, sample, initial()), asserts and initial equations. `false`: those go the ModelingToolkit path.
 """
 const ARRAY_PATH_FULL = CodeGeneration.ArrayPreserveDE.FULL
 
@@ -989,7 +988,10 @@ end
 
 
 """
-    Prints available compiled models to stdout
+    availableModels() -> String
+
+The names of the translated models, one per line, under the route that translated them (ModelingToolkit,
+arrayPreserveDE).
 """
 function availableModels()::String
   str = "Compiled models (MTK-MODE):\n"
@@ -1011,8 +1013,9 @@ end
 
 Simulate the translated model `modelName` (either name form, [`canonicalName`](@ref)) over `tspan` with `solver`
 (an OrdinaryDiffEq algorithm, `Tsit5()`; [`defaultSolver`](@ref)). `MODE` is a [`BackendMode`](@ref).
-`overwriteCache` rebuilds the problem. `parameters` (name => value; [`IMTK_MODE`](@ref) only) sets parameters kept
-tunable at translate time ([`withTunableParameters`](@ref)); the other keyword arguments go to `solve`. A violated
+`overwriteCache` rebuilds the problem. `parameters` (name => value) sets parameters for this run: any parameter of a
+model the arrays-kept path translated, the parameters kept tunable at translate time ([`withTunableParameters`](@ref),
+[`IMTK_MODE`](@ref) only) of another. The other keyword arguments go to `solve`. A violated
 `assert` throws [`ModelicaAssertionError`](@ref).
 
 ```julia
