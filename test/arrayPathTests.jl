@@ -3825,4 +3825,40 @@ end DivideInLoop;
     local sol = OMBackend.simulateModel(name; tspan = (0.0, 1.0), reltol = 1e-10, abstol = 1e-12)
     @test _values(sol, ["c[1].v[1]", "c[1].v[2]", "c[2].v[1]", "c[3].v[2]"]) ≈ exp.(-1 ./ [2.0, 6.0, 1.0, 4.0]) rtol = 1e-9
   end
+
+  @testset "A tuple equation with a record output: its fields" begin
+    #= MSL Spice3's diodes, `(D1.cc, D1.m_dCap) = diodeNoBypassCode(...)`: the record target was "unknown variable
+       D1.cc" (the MTK fallback before); its field variables from the outputs in place (`_recordTargetFields`).
+       der(x) = -x =#
+    local tuples = Modelica"""
+      package RecTuple
+        record Currents "MSL Spice3's CurrentsCapacitances"
+          Real i;
+          Real q;
+        end Currents;
+        function device "a record output before a scalar one"
+          input Real v;
+          output Currents c;
+          output Real g;
+        algorithm
+          c.i := 2 * v;
+          c.q := 5 * v;
+          g := 3 * v;
+          annotation(Inline = false);
+        end device;
+        model Cell
+          Real x(start = 1, fixed = true);
+          Currents c;
+          Real g;
+        equation
+          (c, g) = device(x);
+          der(x) = -c.i + g - 2 * x + c.q - 5 * x;
+        end Cell;
+      end RecTuple;
+      """
+    local name::String = _translateProgram(tuples, "RecTuple.Cell"; scalarized = false)
+    @test _arrayPathTaken(name)
+    local sol = OMBackend.simulateModel(name; tspan = (0.0, 1.0), reltol = 1e-10, abstol = 1e-12)
+    @test _values(sol, ["x", "c.i", "c.q", "g"]) ≈ exp(-1) .* [1.0, 2.0, 5.0, 3.0] rtol = 1e-9
+  end
 end

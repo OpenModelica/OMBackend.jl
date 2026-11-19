@@ -1987,6 +1987,24 @@ function _arrayTarget(g::Gen, e::SC.Exp, ctx::Ctx)::Union{Nothing, ArrayTarget}
 end
 
 """
+The field variables of the record target `e` of a tuple equation, in the record's order (`(D1.cc, D1.m_dCap) =
+diodeNoBypassCode(...)`: MSL Spice3's diodes; a generated function returns a record output's fields in place,
+`SimCode.outputPosition`); nothing for a target that is no record. NotSupported for a field that is a record, an array or
+no variable.
+"""
+function _recordTargetFields(g::Gen, e::SC.Exp)::Union{Nothing, Vector{String}}
+  (e isa SC.EXP_CREF && isempty(e.cref.subs) && e.ty isa SC.TYPE_COMPLEX && e.ty.isRecord) || return nothing
+  local fields::Vector{String} = String[]
+  for (f::String, t::SC.SType) in zip(e.ty.fieldNames, e.ty.fieldTypes)
+    local name::String = string(e.cref.sym, ".", f)
+    local info::Union{Nothing, VarInfo} = get(g.vars, name, nothing)
+    (t isa SC.TYPE_COMPLEX || info === nothing || !isempty(info.dims)) && ns("tuple target $(_str(e)): its field $(f)")
+    push!(fields, name)
+  end
+  return fields
+end
+
+"""
 The statements of `(a, _, c) = call` (a tuple equation): the call once, into a temporary, and an assignment of each
 target that is not a wildcard from its output (at its position in the result, `SimCode.outputPosition` of the call's type
 `callType`: a record output before it is its fields); a whole array target element by element from that output
@@ -2001,6 +2019,14 @@ function _tupleAssignments(g::Gen, lhs::SC.TUPLE, call::IR, callType::SC.SType, 
   for (i, e) in enumerate(lhs.elements)
     (e isa SC.WILD || _isEmptyArray(g, e)) && continue
     _isReference(e) || ns("tuple target $(_str(e))")
+    local fields::Union{Nothing, Vector{String}} = _recordTargetFields(g, e)
+    if fields !== nothing
+      for (k::Int, f::String) in enumerate(fields)
+        g.vars[f].kind in kinds || ns("tuple target $(f)")
+        push!(out, SAssign(Ref(f, IR[], false), Op(:index, IR[res, Lit(SC.outputPosition(callType, i) + k - 1)])))
+      end
+      continue
+    end
     local rows::Union{Nothing, ArrayTarget} = _arrayTarget(g, e, ctx)
     if rows !== nothing
       local (name::String, leading::Vector{IR}, rest::Vector{Int}) = rows
@@ -2032,6 +2058,14 @@ function _whenTupleAssignments(g::Gen, lhs::SC.TUPLE, call::IR, callType::SC.STy
     e isa SC.WILD && continue
     _isReference(e) || ns("tuple target $(_str(e))")
     local output::IR = Op(:index, IR[res, Lit(SC.outputPosition(callType, i))])
+    local fields::Union{Nothing, Vector{String}} = _recordTargetFields(g, e)
+    if fields !== nothing
+      for (k::Int, f::String) in enumerate(fields)
+        g.vars[f].kind == :discrete || ns("when assigns a non-discrete variable: $(f)")
+        push!(out, (:assign, Ref(f, IR[], false), Op(:index, IR[res, Lit(SC.outputPosition(callType, i) + k - 1)])))
+      end
+      continue
+    end
     local rows::Union{Nothing, ArrayTarget} = _arrayTarget(g, e, ctx)
     if rows !== nothing
       local (name::String, leading::Vector{IR}, rest::Vector{Int}) = rows
