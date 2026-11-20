@@ -21,16 +21,34 @@ simulated with DifferentialEquations.jl and ModelingToolkit.jl.
 
 ## Frontends
 
-The backend does not depend on a frontend. A frontend lowers its model to OMJLIR
-through a package extension that Julia loads together with the frontend's package:
+The backend does not depend on a frontend. A frontend's flat model reaches OMJLIR
+through a package extension, which Julia loads when the frontend's package is
+loaded next to OMBackend:
 
-* `OMBackendOMFrontendExt` (loaded with
-  [OMFrontend.jl](https://github.com/OpenModelica/OMFrontend.jl)) lowers
-  OMFrontend's flat model and adds `OMBackend.translate(fm)` and the other entry
-  points on it.
-* `OMBackendOMCompilerExt` (loaded with OMCompiler.jl) takes omc's flat model.
+| Frontend | Load | Extension | Call |
+|---|---|---|---|
+| [OMFrontend.jl](https://github.com/OpenModelica/OMFrontend.jl), in Julia | `import OMFrontend` | `OMBackendOMFrontendExt` | `OMBackend.translate(fm; functionList = ...)`, see [Getting started](getting-started.md) |
+| omc, through [OMCompiler.jl](https://github.com/OpenModelica/OpenModelica/tree/master/OMCompiler/Compiler/OpenModelica.rs/OMCompiler.jl) (experimental) | `import OMCompiler` | `OMBackendOMCompilerExt` | `OMBackend.translate(OMBackend.lowerOMCFlatModel(model, functions))` |
 
-Without either, [`OMBackend.translate`](@ref) takes an `OMJLIR.Model`.
+On both routes [`OMBackend.simulate`](@ref) then runs the model by name.
+
+### omc (experimental)
+
+OMCompiler.jl loads omc's compiler library into Julia. It is not registered:
+develop it from an OpenModelica checkout. It needs the install tree
+(`install_cmake`) of a build with `-DOM_OMC_ENABLE_RUST=ON`, in
+`OPENMODELICAHOME` or passed as `OMCompiler.init(omhome = ...)`.
+`lowerOMCFlatModel` is not yet part of the [public API](api.md).
+
+```julia
+julia> import Pkg; Pkg.develop(path = "<OpenModelica>/OMCompiler/Compiler/OpenModelica.rs/OMCompiler.jl")
+julia> import OMCompiler, OMBackend
+julia> OMCompiler.init()  # the install tree in ENV["OPENMODELICAHOME"]
+julia> OMCompiler.evaluate("loadString(\"model Decay Real x(start = 1, fixed = true); equation der(x) = -x; end Decay;\")")
+julia> (model, functions) = OMCompiler.instantiate("Decay")
+julia> OMBackend.translate(OMBackend.lowerOMCFlatModel(model, functions))
+julia> OMBackend.simulate("Decay"; tspan = (0.0, 1.0))
+```
 
 ## Where to read next
 
