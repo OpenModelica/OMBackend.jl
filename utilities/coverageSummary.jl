@@ -1,9 +1,10 @@
 """
-    julia utilities/coverageSummary.jl merged.info shard1.info [shard2.info ...]
+    julia utilities/coverageSummary.jl [--badge coverage.json] merged.info shard1.info [shard2.info ...]
 
 The lcov files of the CI's test shards merged into `merged.info` (a line's hit counts added), and the summary in
 Markdown on stdout (CI.yml writes it to the job summary): the lines covered of the lines with code, in all and per
-file, least covered first. No external service.
+file, least covered first. With `--badge`, also the total as a shields.io endpoint file (CI.yml publishes it on
+gh-pages for the README's badge). No external service.
 """
 
 "Hit counts by line, by source file."
@@ -43,8 +44,35 @@ end
 
 percent(hit::Int, total::Int)::String = total == 0 ? "-" : string(round(100 * hit / total; digits = 1), " %")
 
-function main(args::Vector{String})::Nothing
-  length(args) >= 1 || error("usage: coverageSummary.jl merged.info shard.info...")
+"""
+The badge's color for `hit` of `total` lines: shields.io's names, from red below 50 % to brightgreen from 90 %.
+"""
+function badgeColor(hit::Int, total::Int)::String
+  local p::Float64 = total == 0 ? 0.0 : 100 * hit / total
+  for (bound::Float64, color::String) in ((90.0, "brightgreen"), (80.0, "green"), (70.0, "yellowgreen"),
+                                          (60.0, "yellow"), (50.0, "orange"))
+    p >= bound && return color
+  end
+  return "red"
+end
+
+"""
+`hit` of `total` lines as a shields.io endpoint file at `path` (https://shields.io/badges/endpoint-badge).
+"""
+function writeBadge(path::String, hit::Int, total::Int)::Nothing
+  local message::String = total == 0 ? "unknown" : string(round(100 * hit / total; digits = 1), "%")
+  write(path, """{"schemaVersion": 1, "label": "coverage", "message": "$(message)", "color": "$(badgeColor(hit, total))"}\n""")
+  return nothing
+end
+
+function main(argv::Vector{String})::Nothing
+  local args::Vector{String} = copy(argv)
+  local badge::Union{Nothing, String} = nothing
+  if length(args) >= 2 && args[1] == "--badge"
+    badge = args[2]
+    args = args[3:end]
+  end
+  length(args) >= 1 || error("usage: coverageSummary.jl [--badge coverage.json] merged.info shard.info...")
   local counts::Counts = Counts()
   for path::String in args[2:end]
     readLcov!(counts, path)
@@ -55,6 +83,7 @@ function main(args::Vector{String})::Nothing
   sort!(rows; by = (r::Tuple{String, Int, Int}) -> (r[3] == 0 ? 1.0 : r[2] / r[3], r[1]))
   local hit::Int = sum(r[2] for r in rows; init = 0)
   local total::Int = sum(r[3] for r in rows; init = 0)
+  badge === nothing || writeBadge(badge, hit, total)
   println("## Coverage of OMBackend.jl/src")
   println()
   println("**$(percent(hit, total))**: $(hit) of $(total) lines, $(length(rows)) files, $(length(args) - 1) test shards merged.")
