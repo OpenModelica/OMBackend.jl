@@ -68,7 +68,7 @@ OMBackend.forgetModel
 The 0.x names still work in 1.x, with a deprecation warning (shown with `--depwarn=yes`).
 
 | 0.x | 1.0 |
-|---|---|
+|:---|:---|
 | `simulateModel(name; MODE)` | `simulate(name; mode)` |
 | `resimulateModel(name; MODE)` | `resimulate(name; mode)` |
 | `getVariableValues` | `variableValues` |

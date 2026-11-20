@@ -15,7 +15,7 @@ makedocs(
         prettyurls = get(ENV, "CI", "false") == "true",
         canonical = "https://OpenModelica.github.io/OMBackend.jl",
         edit_link = "master",
-        assets = String[],
+        assets = ["assets/modelica-highlight.js"],  # Modelica for highlight.js
     ),
     pages = [
         "Home" => "index.md",

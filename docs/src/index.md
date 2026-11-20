@@ -11,8 +11,10 @@ simulated with DifferentialEquations.jl and ModelingToolkit.jl.
 
 ## Pipeline
 
+![From Modelica source to a simulation: frontends, translate, simulate](assets/pipeline.svg)
+
 | Step | Where in the repository |
-|---|---|
+|:---|:---|
 | The model as OMJLIR | `src/IR` |
 | Passes on OMJLIR (index reduction, matching, sorting) | `src/Backend/Passes` |
 | Simulation code (SimCode) | `src/SimCode` |
@@ -26,7 +28,7 @@ through a package extension, which Julia loads when the frontend's package is
 loaded next to OMBackend:
 
 | Frontend | Load | Extension | Call |
-|---|---|---|---|
+|:---|:---|:---|:---|
 | [OMFrontend.jl](https://github.com/OpenModelica/OMFrontend.jl), in Julia | `import OMFrontend` | `OMBackendOMFrontendExt` | `OMBackend.translate(fm; functionList = ...)`, see [Getting started](getting-started.md) |
 | omc, through [OMCompiler.jl](https://github.com/OpenModelica/OpenModelica/tree/master/OMCompiler/Compiler/OpenModelica.rs/OMCompiler.jl) (experimental) | `import OMCompiler` | `OMBackendOMCompilerExt` | `OMBackend.translate(OMBackend.lowerOMCFlatModel(model, functions))` |
 
