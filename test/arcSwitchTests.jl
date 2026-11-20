@@ -21,7 +21,7 @@ import OMFrontend
   local (fm, cache) = OMFrontend.instantiateSCodeToFM("ArcSwitchYD.Switching",
                                                       OMFrontend.translateToSCode(OMFrontend.parseFile(file)))
   OMBackend.translate(fm; functionList = OMFrontend.cacheToFunctionList(cache))
-  local sol = OMBackend.simulateModel(OMBackend.canonicalName("ArcSwitchYD.Switching"); tspan = (0.0, 0.06), reltol = 1.0e-6)
+  local sol = OMBackend.simulate(OMBackend.canonicalName("ArcSwitchYD.Switching"); tspan = (0.0, 0.06), reltol = 1.0e-6)
   @test sol.retcode == OMBackend.CodeGeneration.ModelingToolkit.SciMLBase.ReturnCode.Success
   #= a variable's value at t, interpolated (the saved points are sparse) =#
   local value(name::String, t::Float64)::Float64 = sol(t; idxs = OMBackend.canonicalSymbol(name))
@@ -31,12 +31,12 @@ import OMFrontend
   @test isapprox([value("i[$k]", 0.028) for k in 1:3], [29.49484, -29.49234, -0.002509956]; rtol = 1.0e-4)
   #= the arcs going out: the first time after the opening each opener's `arcOff` holds =#
   local arcOffAt(s, k::Int)::Float64 = begin
-    local q::Vector{Float64} = OMBackend.getVariableValues(s, "opener[$k].arcOff")
+    local q::Vector{Float64} = OMBackend.variableValues(s, "opener[$k].arcOff")
     s.t[findfirst(j::Int -> s.t[j] > 0.025 && q[j] > 0.5, eachindex(s.t))]
   end
   @test isapprox([arcOffAt(sol, k) for k in 1:3], [0.028594113, 0.028594051, 0.025102795]; atol = 1.0e-6)
   #= a second solve of the cached build takes the same path: the event iteration's memory of degenerate step restarts
      (`stall`) was kept from the first, and the arcs of phases 1 and 2 went out at 29.288 ms =#
-  local again = OMBackend.simulateModel(OMBackend.canonicalName("ArcSwitchYD.Switching"); tspan = (0.0, 0.06), reltol = 1.0e-6)
+  local again = OMBackend.simulate(OMBackend.canonicalName("ArcSwitchYD.Switching"); tspan = (0.0, 0.06), reltol = 1.0e-6)
   @test [arcOffAt(again, k) for k in 1:3] == [arcOffAt(sol, k) for k in 1:3]
 end

@@ -37,30 +37,59 @@
    target code; the array-preserving route first where the arrays are kept. Methods of the functions OMBackend
    declares (frontendInterface.jl); the steps on OMJLIR alone are OMBackend's. =#
 
-"""
-    translate(fm; functionList = nothing, BackendMode = DEFAULT_BACKEND_MODE[], warnMissingStartValues = nothing,
-              eliminateNonDynamic = nothing, observedFilter = nothing, checkSimCode = true, scalarized = true,
-              omjlir = nothing)
+"The keyword arguments of `translate` its routes pass on."
+const TranslateOptions = NamedTuple{(:functionList, :mode, :warnMissingStartValues, :eliminateNonDynamic,
+                                     :observedFilter, :checkSimCode)}
 
-The target code of the flat model `fm` and its functions (the frontend's function list): `fm`
-lowered to OMJLIR and through its passes (`omjlirModel`; `omjlir`: that OMJLIR model, already
-lowered, `translateReducedArrays`), to the simulation code and its
-passes (SimCode.simulationCode), checked
-(`checkSimCode`), and the code generated for the backend mode. A flat model with arrays kept
-(`scalarized = false`) is lowered with its arrays and goes to the array-preserving generation first
-(`reducedArrayModel`, ARRAY_PRESERVE_DE_GENERATION), to this path where it is outside its scope.
+"""
+    translate(fm; functionList = nothing, mode = DEFAULT_BACKEND_MODE[], scalarize = true,
+              warnMissingStartValues = nothing, eliminateNonDynamic = nothing, observedFilter = nothing,
+              checkSimCode = true) -> Union{Nothing, Tuple{String, Expr}}
+
+The target code of the flat model `fm` and its functions (the frontend's function list, `functionList`), for the
+backend mode `mode` (a [`BackendMode`](@ref)): the model name and the generated module.
+
+`scalarize = true` (`fm` flattened with its arrays scalarized): `fm` lowered to OMJLIR and through its passes
+(`omjlirModel`), to the simulation code and its passes (SimCode.simulationCode), checked (`checkSimCode`), and the
+code generated for `mode`.
+
+`scalarize = false` (`fm` flattened with its arrays kept): its index reduced in array form (`reducedArrayModel`), to
+the array code (`generateReducedArrayPreserveDETargetCode`), else the reduced model scalarized
+(`scalarizedReducedModel`); where the array form does not take it, or what it made does not translate or build, the
+model scalarized by the backend before the scalar passes (`backendScalarizedModel`, recorded in
+BACKEND_SCALARIZED_MODELS). `nothing` where none of these takes the model; [`scalarizedFallbackReason`](@ref) gives
+the reasons (OM's translate then throws `ARRAY_PRESERVING_CODEGEN_NOT_SUPPORTED`).
 """
 function translate(fm::F.FlatModel;
                    functionList::Union{Nothing, FunctionList} = nothing,
-                   BackendMode::OMBackend.BackendMode = DEFAULT_BACKEND_MODE[],
+                   mode::OMBackend.BackendMode = DEFAULT_BACKEND_MODE[],
+                   scalarize::Bool = true,
                    warnMissingStartValues::Union{Nothing, Bool} = nothing,
                    eliminateNonDynamic::Union{Nothing, Bool, SimCode.EliminationOptions} = nothing,
                    observedFilter::Union{Nothing, Vector{String}, Vector{Regex}} = nothing,
                    checkSimCode::Bool = true,
-                   scalarized::Bool = true,
-                   omjlir::Union{Nothing, OMJLIR.Model} = nothing)
-  local previousWarnSetting = WARN_MISSING_START_VALUES[]
-  local modelName = string(fm.name)
+                   BackendMode::Union{Nothing, OMBackend.BackendMode} = nothing,
+                   scalarized::Union{Nothing, Bool} = nothing)::Union{Nothing, Tuple{String, Expr}}
+  mode = OMBackend._deprecatedKeyword(:translate, :BackendMode, BackendMode, :mode, mode)
+  scalarize = OMBackend._deprecatedKeyword(:translate, :scalarized, scalarized, :scalarize, scalarize)
+  local options::TranslateOptions = (; functionList, mode, warnMissingStartValues, eliminateNonDynamic, observedFilter,
+                                     checkSimCode)
+  return scalarize ? _translateScalar(fm, nothing; options...) : _translateArraysKept(fm; options...)
+end
+
+"""
+`translate` of the scalar flat model `fm`: lowered to OMJLIR and through its passes (`omjlirModel`), or `omjlir`, the
+OMJLIR model a route with the arrays kept made of it, to the code for `mode`.
+"""
+function _translateScalar(fm::F.FlatModel, omjlir::Union{Nothing, OMJLIR.Model};
+                          functionList::Union{Nothing, FunctionList},
+                          mode::OMBackend.BackendMode,
+                          warnMissingStartValues::Union{Nothing, Bool},
+                          eliminateNonDynamic::Union{Nothing, Bool, SimCode.EliminationOptions},
+                          observedFilter::Union{Nothing, Vector{String}, Vector{Regex}},
+                          checkSimCode::Bool)::Tuple{String, Expr}
+  local previousWarnSetting::Bool = WARN_MISSING_START_VALUES[]
+  local modelName::String = string(fm.name)
   local runId = createLogRunId(modelName)
   MODEL_RUN_DIRS[canonicalName(modelName)] = runId
   resetFallbacks!()
@@ -69,26 +98,13 @@ function translate(fm::F.FlatModel;
     delete!(ARRAY_PRESERVE_DE_MODELS, canonicalName(fm.name))
     omjlir === nothing && delete!(ARRAY_REDUCED_MODELS, canonicalName(fm.name))
     omjlir === nothing && delete!(BACKEND_SCALARIZED_MODELS, canonicalName(fm.name))
-    #= an attempt with the arrays kept records its own reasons (as translateReducedArrays); a scalarized translate after
-       it, or the reduced model's (`omjlir`), keeps them for OM's report =#
-    (scalarized || omjlir !== nothing) || delete!(ARRAY_PATH_REASONS, canonicalName(fm.name))
-    #= the index reduced in array form: its array code, else its scalarized form =#
-    local arrayReduction::Bool = !scalarized && omjlir === nothing
-    if arrayReduction
-      local reduced::Union{Nothing, OMJLIR.Model} = @BACKEND_PERFLOG "[backendAPI] reducedArrayModel" reducedArrayModel(fm; functionList)
-      if reduced !== nothing
-        local reducedResult::Union{Nothing, Tuple{String, Expr}} = @BACKEND_PERFLOG "[backendAPI] generateReducedArrayPreserveDECode" generateReducedArrayPreserveDETargetCode(canonicalName(fm.name), reduced)
-        reducedResult === nothing || return reducedResult
-        omjlir = scalarizedReducedModel(canonicalName(fm.name), reduced)
-      end
-    end
     return withLogRunDir(runId) do
       #= The flat model with its functions as it arrives from the frontend =#
       @BACKEND_LOGGING debugWrite(logPath("backend/simCode", "frontend_initialModel.log"),
         replace(F.toFlatString(fm, functionList === nothing ? MetaModelica.nil : functionList), "\\n" => "\n"))
       local model::OMJLIR.Model = omjlir !== nothing ? omjlir :
-        @BACKEND_PERFLOG "[backendAPI] lower" omjlirModel(fm; functionList, scalarized, arrayReduction = !arrayReduction)
-      return generateTargetCode(model; BackendMode, eliminateNonDynamic, observedFilter, checkSimCode)
+        @BACKEND_PERFLOG "[backendAPI] lower" omjlirModel(fm; functionList)
+      return generateTargetCode(model; mode, eliminateNonDynamic, observedFilter, checkSimCode)
     end
   finally
     WARN_MISSING_START_VALUES[] = previousWarnSetting
@@ -103,26 +119,9 @@ function explainIndexReduction(fm::F.FlatModel;
   return Passes.IndexReduction.explain(model)
 end
 
-function omjlirModel(fm::F.FlatModel; functionList::Union{Nothing, FunctionList} = nothing,
-                     scalarized::Bool = true, arrayReduction::Bool = true)::OMJLIR.Model
-  if !scalarized && arrayReduction
-    local reduced = arrayReducedModel(fm; functionList)
-    reduced === nothing || return reduced
-  end
-  if !scalarized
-    #= the kept arrays scalarized by the backend; by the frontend where its element view does not take the model =#
-    local scalar::Union{Nothing, OMJLIR.Model} = backendScalarizedModel(fm; functionList)
-    scalar === nothing || return scalar
-    fm = @BACKEND_PERFLOG "[backendAPI] scalarizeKeptArrays" F.scalarizeKeptArrays(fm)
-  end
+function omjlirModel(fm::F.FlatModel; functionList::Union{Nothing, FunctionList} = nothing)::OMJLIR.Model
   local model = lowerFlatModel(fm; functions = something(functionList, MetaModelica.nil))
   return Passes.runPasses!(model)
-end
-
-function arrayReducedModel(fm::F.FlatModel;
-                           functionList::Union{Nothing, FunctionList} = nothing)::Union{Nothing, OMJLIR.Model}
-  local reduced::Union{Nothing, OMJLIR.Model} = reducedArrayModel(fm; functionList)
-  return reduced === nothing ? nothing : scalarizedReducedModel(canonicalName(fm.name), reduced)
 end
 
 function reducedArrayModel(fm::F.FlatModel;
@@ -139,19 +138,20 @@ function backendScalarizedModel(fm::F.FlatModel;
   end
 end
 
-function translateReducedArrays(fm::F.FlatModel;
-                                functionList::Union{Nothing, FunctionList} = nothing,
-                                BackendMode::OMBackend.BackendMode = DEFAULT_BACKEND_MODE[],
-                                warnMissingStartValues::Union{Nothing, Bool} = nothing,
-                                eliminateNonDynamic::Union{Nothing, Bool, SimCode.EliminationOptions} = nothing,
-                                observedFilter::Union{Nothing, Vector{String}, Vector{Regex}} = nothing,
-                                checkSimCode::Bool = true)::Union{Nothing, Tuple{String, Expr}}
+"`translate(fm; scalarize = false)`: the routes with the arrays kept, in order; `nothing` where none takes `fm`."
+function _translateArraysKept(fm::F.FlatModel;
+                              functionList::Union{Nothing, FunctionList},
+                              mode::OMBackend.BackendMode,
+                              warnMissingStartValues::Union{Nothing, Bool},
+                              eliminateNonDynamic::Union{Nothing, Bool, SimCode.EliminationOptions},
+                              observedFilter::Union{Nothing, Vector{String}, Vector{Regex}},
+                              checkSimCode::Bool)::Union{Nothing, Tuple{String, Expr}}
   local name::String = canonicalName(fm.name)
   delete!(ARRAY_PRESERVE_DE_MODELS, name)
   delete!(ARRAY_PATH_REASONS, name)
   delete!(BACKEND_SCALARIZED_MODELS, name)
-  local options = (; functionList, BackendMode, warnMissingStartValues, eliminateNonDynamic, observedFilter,
-                   checkSimCode)
+  local options::TranslateOptions = (; functionList, mode, warnMissingStartValues, eliminateNonDynamic, observedFilter,
+                                     checkSimCode)
   local result::Union{Nothing, Tuple{String, Expr}} = nothing
   local reduced::Union{Nothing, OMJLIR.Model} =
     @BACKEND_PERFLOG "[backendAPI] reducedArrayModel" reducedArrayModel(fm; functionList)
@@ -183,7 +183,7 @@ them (Rotational Friction, CoupledClutches, Translational Brake).
 """
 function _translateKept(fm::F.FlatModel, model::OMJLIR.Model, path::String, subject::String;
                         functionList::Union{Nothing, FunctionList},
-                        BackendMode::OMBackend.BackendMode,
+                        mode::OMBackend.BackendMode,
                         warnMissingStartValues::Union{Nothing, Bool},
                         eliminateNonDynamic::Union{Nothing, Bool, SimCode.EliminationOptions},
                         observedFilter::Union{Nothing, Vector{String}, Vector{Regex}},
@@ -192,9 +192,9 @@ function _translateKept(fm::F.FlatModel, model::OMJLIR.Model, path::String, subj
   local reason::String = ""
   try
     local result::Tuple{String, Expr} =
-      translate(fm; functionList, BackendMode, warnMissingStartValues, eliminateNonDynamic, observedFilter,
-                checkSimCode, omjlir = model)
-    (BackendMode == IMTK_MODE && !haskey(IMTKGen.BUILT, name) && !(name in IMTKGen.BUILT_AT_SIMULATE)) || return result
+      _translateScalar(fm, model; functionList, mode, warnMissingStartValues, eliminateNonDynamic, observedFilter,
+                       checkSimCode)
+    (mode == IMTK_MODE && !haskey(IMTKGen.BUILT, name) && !(name in IMTKGen.BUILT_AT_SIMULATE)) || return result
     reason = "does not build"
   catch err
     isFatal(err) && rethrow()

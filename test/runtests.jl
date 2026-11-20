@@ -152,9 +152,9 @@ TEST_GROUP == "kept" || @testset "OMBackend" begin
         include("src/OMBackend.jl")
         println("same_module=", OMBackend === OMBackend.CodeGeneration.OMBackend)
         model() = OMBackend.Passes.runPasses!(OMBackend._irDecay("Examples.HelloWorld"))
-        OMBackend.translate(model(); BackendMode = OMBackend.MTK_MODE)
+        OMBackend.translate(model(); mode = OMBackend.MTK_MODE)
         sleep(1)
-        OMBackend.translate(model(); BackendMode = OMBackend.MTK_MODE)
+        OMBackend.translate(model(); mode = OMBackend.MTK_MODE)
         runDirs = sort(filter(name -> startswith(name, "Examples_HelloWorld_"), readdir(ENV["OMJL_LOG_DIR"])))
         println("run_count=", length(runDirs))
         println("root_codegen=", isfile(joinpath(ENV["OMJL_LOG_DIR"], "backend", "codeGen", "equationFirstStageCodeGen.log")))
@@ -267,7 +267,7 @@ TEST_GROUP == "kept" || @testset "OMBackend" begin
     for name in ("HelloWorld", "LotkaVolterra", "VanDerPol")
       @testset "$name translates" begin
         local (fm, functions) = ExampleModels.flatModel(name)
-        local (modelName, code) = OMBackend.translate(fm; functionList = functions, BackendMode = OMBackend.MTK_MODE)
+        local (modelName, code) = OMBackend.translate(fm; functionList = functions, mode = OMBackend.MTK_MODE)
         @test modelName == "Examples_" * name
         @test code isa Expr
       end
@@ -331,8 +331,8 @@ TEST_GROUP == "kept" || @testset "OMBackend" begin
     OMBackend.clearCaches!()
     local simulated = name -> begin
       local (fm, functions) = ExampleModels.flatModel(name)
-      OMBackend.translate(fm; functionList = functions, BackendMode = OMBackend.MTK_MODE)
-      OMBackend.simulateModel("Examples_" * name; MODE = OMBackend.MTK_MODE, tspan = (0.0, 1.0))
+      OMBackend.translate(fm; functionList = functions, mode = OMBackend.MTK_MODE)
+      OMBackend.simulate("Examples_" * name; mode = OMBackend.MTK_MODE, tspan = (0.0, 1.0))
     end
 
     @testset "HelloWorld: der(x) = -a*x" begin
@@ -350,6 +350,9 @@ TEST_GROUP == "kept" || @testset "OMBackend" begin
       @test simulated("VanDerPol").retcode == ReturnCode.Success
     end
   end
+
+  #= ── The public API: the names, documented, nothing exported ──── =#
+  include("publicAPITests.jl")
 
   #= ── 6. SimCode Exp traversal + alias substitution ────────────── =#
   include("simCodeTraverseTests.jl")

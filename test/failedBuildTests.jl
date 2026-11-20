@@ -13,7 +13,7 @@ import OMFrontend
   OMBackend.translate(fm; functionList = OMFrontend.cacheToFunctionList(cache))
   local err::Union{Nothing, Exception} =
     try
-      OMBackend.simulateModel(OMBackend.canonicalName("FailedBuild.TableAtFailedBuild"); tspan = (0.0, 1.0))
+      OMBackend.simulate(OMBackend.canonicalName("FailedBuild.TableAtFailedBuild"); tspan = (0.0, 1.0))
       nothing
     catch e
       e

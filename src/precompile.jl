@@ -257,11 +257,11 @@ function _precompileIRModel(model::Function, name::String, arrayCode::Bool)::Not
     (reduced !== nothing && generateReducedArrayPreserveDETargetCode(name, reduced) !== nothing) ||
       error("$(name): no array code ($(get(ARRAY_PATH_REASONS, name, "-")))")
   else
-    translate(Passes.runPasses!(model(name)); BackendMode = mode, warnMissingStartValues = nothing,
+    translate(Passes.runPasses!(model(name)); mode, warnMissingStartValues = nothing,
               eliminateNonDynamic = true, observedFilter = nothing, checkSimCode = true)
   end
   for solver in (defaultSolver(), daeFallbackSolver())
-    simulateModel(name; MODE = mode, tspan = (0.0, 1.0), solver = solver, overwriteCache = false)
+    simulate(name; mode, tspan = (0.0, 1.0), solver = solver, overwriteCache = false)
   end
   return nothing
 end

@@ -1462,24 +1462,15 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SC.SIM_CODE, modelName::String, 
       #= Add ifCond discrete parameter values to pars dict =#
       $(generateIfCondParamAssignments(ifCondParamPairs))
       startEquationComponents = Any[]
-      $(decomposeStartEquationsInline(INITIAL_GUESS_EQUATIONS))
-      for constructor in startEquationConstructors
-        push!(startEquationComponents, Base.invokelatest(constructor))
-      end
+      $(decomposeStartEquationsInline(INITIAL_GUESS_EQUATIONS, :startEquationComponents))
       initialValues = collect(Iterators.flatten(startEquationComponents))
       #= Process the final initial guesses =#
       startEquationComponents = Any[]
-      $(decomposeStartEquationsInline(INITIAL_VALUE_EQUATIONS; functionSuffix = "Final"))
-      for constructor in startEquationConstructors
-        push!(startEquationComponents, Base.invokelatest(constructor))
-      end
+      $(decomposeStartEquationsInline(INITIAL_VALUE_EQUATIONS, :startEquationComponents))
       finalInitialValues = collect(Iterators.flatten(startEquationComponents))
       #= Equations =#
       equationComponents = Any[]
-      $(stripBeginBlocks(decomposeEquationsInline(EQUATIONS, PARAMETER_ASSIGNMENTS)))
-      for constructor in equationConstructorCalls
-        push!(equationComponents, Base.invokelatest(constructor))
-      end
+      $(decomposeEquationsInline(EQUATIONS, PARAMETER_ASSIGNMENTS, :equationComponents))
       eqs = collect(Iterators.flatten(equationComponents))
       eqs = Base.invokelatest(OMBackend.CodeGeneration.filterConstantEquations, eqs)
       eqs = Base.invokelatest(OMBackend.CodeGeneration.expandExpressionDerivatives, eqs)

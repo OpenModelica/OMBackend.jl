@@ -11,7 +11,7 @@ import OMFrontend
   local file = joinpath(@__DIR__, "Models", "DiscreteAliases.mo")
   local (fm, cache) = OMFrontend.instantiateSCodeToFM("DiscreteAliases.Three", OMFrontend.translateToSCode(OMFrontend.parseFile(file)))
   OMBackend.translate(fm; functionList = OMFrontend.cacheToFunctionList(cache))
-  local sol = OMBackend.simulateModel(OMBackend.canonicalName("DiscreteAliases.Three"); tspan = (0.0, 4.0))
+  local sol = OMBackend.simulate(OMBackend.canonicalName("DiscreteAliases.Three"); tspan = (0.0, 4.0))
   @test string(sol.retcode) == "Success"
   @test [sol(t; idxs = v) for (v, t) in ((:start_on, 1.5), (:start_on, 2.5), (:stop_on, 2.5), (:stop_on, 3.5), (:shut_on, 3.5), (:start_on, 3.5))] ==
         [1.0, 0.0, 1.0, 0.0, 1.0, 0.0]

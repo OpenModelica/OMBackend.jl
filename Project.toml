@@ -1,6 +1,6 @@
 name = "OMBackend"
 uuid = "9400bd5f-7561-42f6-8760-03756753da50"
-version = "0.12.1"
+version = "1.0.0"
 authors = ["John Tinnerholm <johti17@liu.se>", "Karim Abdelhak <karim.abdelhak@fh-bielefeld.de>", "AnHeuermann <andreas.heuermann@fh-bielefeld.de>"]
 
 [deps]
@@ -45,7 +45,7 @@ OMBackendPlotsExt = "Plots"
 ADTypes = "1"
 OMParser = "1"
 DiffEqBase = "7.21.2"
-MetaModelica = "0.4.2, 0.5"
+MetaModelica = "0.5, 1"
 ModelingToolkit = "11.21"
 NonlinearSolve = "4"
 OMCompiler = "0.1"

@@ -17,7 +17,7 @@ function _eoSimulate(name::String)::EO_SOLUTION
   local (fm::OMFrontend.Frontend.FlatModel, cache::OMFrontend.Frontend.FunctionTreeImpl.Tree) =
     OMFrontend.instantiateSCodeToFM(name, OMFrontend.translateToSCode(OMFrontend.parseFile(EO_FILE)))
   OMBackend.translate(fm; functionList = OMFrontend.cacheToFunctionList(cache))
-  return OMBackend.simulateModel(OMBackend.canonicalName(name); tspan = (0.0, 2.0), reltol = 1.0e-6)
+  return OMBackend.simulate(OMBackend.canonicalName(name); tspan = (0.0, 2.0), reltol = 1.0e-6)
 end
 
 @testset "Event iteration order" begin

@@ -40,7 +40,7 @@ function _ccDiscreteConditions(sol::CC_SOLUTION)::Vector{Any}
 end
 
 "The final value of the variable `v` of `sol`."
-_ccFinal(sol::CC_SOLUTION, v::String)::Float64 = OMBackend.getVariableValues(sol, v)[end]
+_ccFinal(sol::CC_SOLUTION, v::String)::Float64 = OMBackend.variableValues(sol, v)[end]
 
 @testset "When conditions compiled" begin
   local CG = OMBackend.CodeGeneration
@@ -48,7 +48,7 @@ _ccFinal(sol::CC_SOLUTION, v::String)::Float64 = OMBackend.getVariableValues(sol
   local (fm::OMFrontend.Frontend.FlatModel, cache::OMFrontend.Frontend.FunctionTreeImpl.Tree) =
     OMFrontend.instantiateSCodeToFM("CompiledConditions.Whens", OMFrontend.translateToSCode(OMFrontend.parseFile(file)))
   OMBackend.translate(fm; functionList = OMFrontend.cacheToFunctionList(cache))
-  local sol::CC_SOLUTION = OMBackend.simulateModel(OMBackend.canonicalName("CompiledConditions.Whens"); tspan = (0.0, 1.0))
+  local sol::CC_SOLUTION = OMBackend.simulate(OMBackend.canonicalName("CompiledConditions.Whens"); tspan = (0.0, 1.0))
   @test string(sol.retcode) == "Success"
   local callbacks::Vector{Any} = _ccContinuousCallbacks(sol)
   local whens::Vector{Any} = filter(c -> c.condition isa CG.WhenCondition, callbacks)
@@ -67,7 +67,7 @@ _ccFinal(sol::CC_SOLUTION, v::String)::Float64 = OMBackend.getVariableValues(sol
   local tiered::Vector{Any} = filter(c -> c isa CG.TieredCondition, _ccDiscreteConditions(sol))
   @test !isempty(tiered) && all(c -> c.compiled isa CG.RuntimeGeneratedFunctions.RuntimeGeneratedFunction, tiered)
   foreach(c -> c.tier.compiled = true, tiered)
-  local compiled::CC_SOLUTION = OMBackend.simulateModel(OMBackend.canonicalName("CompiledConditions.Whens"); tspan = (0.0, 1.0))
+  local compiled::CC_SOLUTION = OMBackend.simulate(OMBackend.canonicalName("CompiledConditions.Whens"); tspan = (0.0, 1.0))
   @test all(c -> c.tier.compiled, filter(c -> c isa CG.TieredCondition, _ccDiscreteConditions(compiled)))
   @test compiled.t == sol.t && compiled.u == sol.u
 end

@@ -10,9 +10,9 @@ import OMFrontend
   local file = joinpath(@__DIR__, "Models", "RecordArrayLocals.mo")
   local (fm, cache) = OMFrontend.instantiateSCodeToFM("RecordArrayLocals.M", OMFrontend.translateToSCode(OMFrontend.parseFile(file)))
   OMBackend.translate(fm; functionList = OMFrontend.cacheToFunctionList(cache))
-  local sol = OMBackend.simulateModel(OMBackend.canonicalName("RecordArrayLocals.M"); tspan = (0.0, 1.0))
+  local sol = OMBackend.simulate(OMBackend.canonicalName("RecordArrayLocals.M"); tspan = (0.0, 1.0))
   @test sol.retcode == OMBackend.CodeGeneration.ModelingToolkit.SciMLBase.ReturnCode.Success
   #= c[1].re + c[2].im = 1 + 4 =#
-  @test OMBackend.getVariableValues(sol, "y")[1] ≈ 5.0
-  @test OMBackend.getVariableValues(sol, "y")[end] ≈ 10.0
+  @test OMBackend.variableValues(sol, "y")[1] ≈ 5.0
+  @test OMBackend.variableValues(sol, "y")[end] ≈ 10.0
 end

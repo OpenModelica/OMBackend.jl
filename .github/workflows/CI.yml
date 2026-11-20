@@ -240,6 +240,8 @@ jobs:
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      contents: write  # the badge file on gh-pages
     steps:
       - name: Checkout OMBackend.jl
         uses: actions/checkout@v4
@@ -259,7 +261,8 @@ jobs:
         shell: bash
         run: |
           shopt -s nullglob
-          julia --startup-file=no utilities/coverageSummary.jl lcov.info shards/*/lcov.info >> "$GITHUB_STEP_SUMMARY"
+          julia --startup-file=no utilities/coverageSummary.jl --badge coverage.json lcov.info shards/*/lcov.info \
+            >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload the merged coverage
         uses: actions/upload-artifact@v4
@@ -267,3 +270,26 @@ jobs:
           name: coverage-merged
           path: lcov.info
           retention-days: 30
+
+      # The README's badge reads coverage.json on gh-pages (shields.io endpoint; no external service). Master only, and
+      # only when all shards passed: the coverage of a partial run is not the package's. Documenter deploys to the same
+      # branch (its own directories): a rejected push starts again from the branch's new tip.
+      - name: Publish the coverage badge (master)
+        if: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/master' && needs.test.result == 'success' }}
+        shell: bash
+        run: |
+          message=$(sed -n 's/.*"message": "\([^"]*\)".*/\1/p' coverage.json)
+          for attempt in 1 2 3; do
+            git fetch --depth=1 origin gh-pages
+            rm -rf pages && git worktree prune
+            git worktree add --detach pages FETCH_HEAD
+            cp coverage.json pages/coverage.json
+            git -C pages add coverage.json
+            if git -C pages diff --cached --quiet; then echo "coverage unchanged: $message"; exit 0; fi
+            git -C pages -c user.name="github-actions[bot]" \
+              -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+              commit -q -m "Coverage badge: $message (${GITHUB_SHA::8})"
+            git -C pages push origin HEAD:gh-pages && exit 0
+            sleep $((attempt * 10))
+          done
+          exit 1

@@ -123,6 +123,41 @@ Whether a callback is the algebraic step control of a mass-matrix build
 """
 isStepControl(@nospecialize(cb)) = cb isa DiffEqBase.DiscreteCallback && cb.condition isa AlgebraicStepControl
 
+"""
+    NotAnEvent(f)
+
+The condition `f` of a callback that is no event of the model: it changes no variable at an instant of the model's
+own (assert checks, a run's bookkeeping: its start state, its first step, the delays' histories, the loops' roots).
+Called as `f`. [`isEventCallback`](@ref) tells such callbacks from events.
+"""
+struct NotAnEvent{F} <: Function
+  f::F
+end
+
+(c::NotAnEvent)(args...) = c.f(args...)
+
+"""
+    isEventCallback(callback) -> Bool
+
+Whether `callback` (of [`getMTKProblem`](@ref OMBackend.getMTKProblem)'s or [`eventCallbacks`](@ref OMBackend.eventCallbacks)'
+callbacks, or of a problem's) is an event
+of the model: a relation's crossing, a when-condition, a sample, a delay's jump, a structural change. False for the
+algebraic step control ([`isStepControl`](@ref)), the assert checks and a run's bookkeeping callbacks (`NotAnEvent`).
+Counting the event callbacks of a model, one callback can hold several events (a vector of crossings). A solved
+problem's continuous callbacks merged into one (`_eraseContinuousCallbacks`) are an event where one of them is.
+"""
+function isEventCallback(@nospecialize(cb))::Bool
+  cb isa Union{DiffEqBase.DiscreteCallback, DiffEqBase.ContinuousCallback, DiffEqBase.VectorContinuousCallback} ||
+    return false
+  local condition::Any = _conditionFunction(cb.condition)
+  condition isa _MergedContinuousCondition && return any(isEventCallback, condition.subs)
+  return !(condition isa AlgebraicStepControl || condition isa NotAnEvent)
+end
+
+"A callback's condition behind the wrappers of a type-erased callback (`_ErasedCall`, a FunctionWrapper)."
+_conditionFunction(@nospecialize(c))::Any =
+  c isa _ErasedCall ? c.f : c isa DiffEqBase.FunctionWrapper ? c.obj[] : c
+
 #= Exponent of the step-size rule: the dense output's error is taken to grow
    like dt^4. Limits of the factor on the next step, as a step-size
    controller's. Where in the step the dense output is checked (its error

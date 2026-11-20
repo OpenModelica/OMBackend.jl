@@ -1041,6 +1041,42 @@ function _parameterIndex(model::Module)::Dict{String, Int}
 end
 
 """
+    areTunable(model, names) -> Bool
+
+Whether the generated array model `model` takes overrides of all `names` (`simulate(...; parameters)`, as
+`parameterValues` and `modelParameters` apply them): each the name of a parameter or element it has (Modelica's or
+canonical), not structural (`FIXED_PARAMETERS`, `FIXED_STRINGS`), and no structural parameter or one without a rule
+(that is not `START_OPAQUE`'s) reads them, also through other parameters' bindings. Each reader counts as changed, as
+for a value that changes it.
+"""
+function areTunable(model::Module, names::Vector{String})::Bool
+  local changed::Set{Symbol} = Set{Symbol}()
+  local fixedStrings::Set{Int} = model.FIXED_STRINGS
+  for name::String in names
+    local k::Int = get(model.STRING_PARAMETERS, name, 0)
+    if k != 0
+      k in fixedStrings && return false
+    elseif haskey(model.PARAMETER_NAMES, name)
+      push!(changed, model.PARAMETER_NAMES[name]::Symbol)
+    elseif haskey(model.PARAMETER_ELEMENTS, name)
+      push!(changed, first(model.PARAMETER_ELEMENTS[name])::Symbol)
+    else
+      return false
+    end
+  end
+  local opaque::Set{Symbol} = model.START_OPAQUE
+  for (sym::Symbol, deps::Vector{Symbol}, rule::Union{Nothing, Function}) in model.PARAMETER_RULES
+    (sym in changed || !any(d -> d in changed, deps)) && continue
+    if rule === nothing
+      all(d -> !(d in changed) || d in opaque, deps) && continue
+      return false
+    end
+    push!(changed, sym)
+  end
+  return !any(s -> s in changed, model.FIXED_PARAMETERS)
+end
+
+"""
     variableValues(sol, name)
 
 The values of a state, algebraic or discrete variable element (`"c[2].T"`), or a parameter, at the time
@@ -3358,19 +3394,19 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
       N_SAMPLES == 0 || push!(cbs, DiscreteCallback(_sampleDue, affectSample!; initialize = _sampleStart!))
       if !isempty(ASSERTS) || FUNCTION_ASSERTS
         $(nCross == 0 ?
-          :(push!(cbs, DiscreteCallback(_assertStep, integrator -> nothing;
+          :(push!(cbs, DiscreteCallback($(_OMBACKEND.CodeGeneration.NotAnEvent)(_assertStep), integrator -> nothing;
                                         initialize = (c, u, t, integrator) -> (integrator.p.state.stepStart = $(_discreteState)(integrator.p);
                                                                                checkAsserts(u, integrator.p, t)),
                                         save_positions = (false, false)))) :
           quote
-            push!(cbs, DiscreteCallback(_assertStep, integrator -> nothing;
+            push!(cbs, DiscreteCallback($(_OMBACKEND.CodeGeneration.NotAnEvent)(_assertStep), integrator -> nothing;
                                         initialize = (c, u, t, integrator) -> (integrator.p.state.pending = (NaN, Float64[]);
                                                                                integrator.p.state.stepStart = $(_discreteState)(integrator.p);
                                                                                checkAsserts(u, integrator.p, t)),
                                         finalize = (c, u, t, integrator) -> _assertPendingAtEnd!(integrator),
                                         save_positions = (false, false)))
             #= the sign at the step ends only (no points within a step: an equations! each) =#
-            push!(cbs, VectorContinuousCallback(assertCrossings!, affectAssertCrossing!, $nCross;
+            push!(cbs, VectorContinuousCallback($(_OMBACKEND.CodeGeneration.NotAnEvent)(assertCrossings!), affectAssertCrossing!, $nCross;
                                                 rootfind = DifferentialEquations.SciMLBase.RightRootFind,
                                                 interp_points = 0, save_positions = (false, false)))
           end)
@@ -3380,7 +3416,7 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
       #= after the others, its condition at each accepted step: the loops' roots of that time, for the reads after
          the run =#
       (isempty(p.loops) && isempty(p.blocks)) ||
-        push!(cbs, DiscreteCallback((u, t, integrator) -> (logStepRoots!(integrator); false), integrator -> nothing;
+        push!(cbs, DiscreteCallback($(_OMBACKEND.CodeGeneration.NotAnEvent)((u, t, integrator) -> (logStepRoots!(integrator); false)), integrator -> nothing;
                                     save_positions = (false, false)))
       if N_DELAYS > 0
         #= delay() (delays.jl, as the scalarized path's callbacks): first the step's end as the solver took it (the
@@ -3388,21 +3424,21 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
            jump is due again its delay time later) and, at the start, each history's first point =#
         pushfirst!(cbs, DiscreteCallback((u, t, integrator) -> $(delayJumpsDue!)(integrator.p.state.delays, Float64(t)),
                                          affectDelay!; save_positions = (false, false)))
-        pushfirst!(cbs, DiscreteCallback((u, t, integrator) -> _delayLeft!(integrator), integrator -> nothing;
+        pushfirst!(cbs, DiscreteCallback($(_OMBACKEND.CodeGeneration.NotAnEvent)((u, t, integrator) -> _delayLeft!(integrator)), integrator -> nothing;
                                          save_positions = (false, false)))
-        push!(cbs, DiscreteCallback((u, t, integrator) -> _delayJumps!(integrator), integrator -> nothing;
+        push!(cbs, DiscreteCallback($(_OMBACKEND.CodeGeneration.NotAnEvent)((u, t, integrator) -> _delayJumps!(integrator)), integrator -> nothing;
                                     initialize = (c, u, t, integrator) -> _delayStart!(integrator),
                                     save_positions = (false, false)))
       end
-      pushfirst!(cbs, DiscreteCallback((u, t, integrator) -> false, integrator -> nothing;
+      pushfirst!(cbs, DiscreteCallback($(_OMBACKEND.CodeGeneration.NotAnEvent)((u, t, integrator) -> false), integrator -> nothing;
                                        initialize = (c, u, t, integrator) -> $(_restoreStart!)(integrator.p),
                                        save_positions = (false, false)))
       #= the first step, after the other callbacks' initializations: finite (`_finiteFirstStep!`) =#
-      push!(cbs, DiscreteCallback((u, t, integrator) -> false, integrator -> nothing;
+      push!(cbs, DiscreteCallback($(_OMBACKEND.CodeGeneration.NotAnEvent)((u, t, integrator) -> false), integrator -> nothing;
                                   initialize = (c, u, t, integrator) -> $(_finiteFirstStep!)(integrator),
                                   save_positions = (false, false)))
       #= the terminal event, after the last step (a solve's end: its stop time, a terminate()) =#
-      $(usesTerminal ? :(push!(cbs, DiscreteCallback((u, t, integrator) -> false, integrator -> nothing;
+      $(usesTerminal ? :(push!(cbs, DiscreteCallback($(_OMBACKEND.CodeGeneration.NotAnEvent)((u, t, integrator) -> false), integrator -> nothing;
                                                      finalize = (c, u, t, integrator) -> _terminalEvent!(integrator),
                                                      save_positions = (false, false)))) : nothing)
       #= one callback type for every model (`_erasedCallbacks`): the solver's callback functions compiled once =#

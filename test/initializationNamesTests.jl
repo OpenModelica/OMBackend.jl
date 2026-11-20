@@ -9,12 +9,12 @@ import OMFrontend
   local (fm, cache) = OMFrontend.instantiateSCodeToFM("InitializationNames.FreeArrayParameter",
                                                       OMFrontend.translateToSCode(OMFrontend.parseFile(file)))
   OMBackend.translate(fm; functionList = OMFrontend.cacheToFunctionList(cache))
-  local sol = OMBackend.simulateModel(OMBackend.canonicalName("InitializationNames.FreeArrayParameter");
+  local sol = OMBackend.simulate(OMBackend.canonicalName("InitializationNames.FreeArrayParameter");
                                       tspan = (0.0, 1.0), reltol = 1e-8, abstol = 1e-8)
   @test sol.retcode == OMBackend.CodeGeneration.ModelingToolkit.SciMLBase.ReturnCode.Success
   #= k = {3, 4} from y = k .* x = {3, 8} at x = {1, 2}: x = {exp(-3 t), 2 exp(-4 t)} =#
-  @test OMBackend.getVariableValues(sol, "x[1]")[end] ≈ exp(-3) rtol = 1e-6
-  @test OMBackend.getVariableValues(sol, "x[2]")[end] ≈ 2 * exp(-4) rtol = 1e-6
+  @test OMBackend.variableValues(sol, "x[1]")[end] ≈ exp(-3) rtol = 1e-6
+  @test OMBackend.variableValues(sol, "x[2]")[end] ≈ 2 * exp(-4) rtol = 1e-6
 end
 
 @testset "The initialization's relations by their parameters' names" begin
@@ -22,9 +22,9 @@ end
   local (fm, cache) = OMFrontend.instantiateSCodeToFM("InitializationNames.RelationAtStart",
                                                       OMFrontend.translateToSCode(OMFrontend.parseFile(file)))
   OMBackend.translate(fm; functionList = OMFrontend.cacheToFunctionList(cache))
-  local sol = OMBackend.simulateModel(OMBackend.canonicalName("InitializationNames.RelationAtStart"); tspan = (0.0, 1.0))
+  local sol = OMBackend.simulate(OMBackend.canonicalName("InitializationNames.RelationAtStart"); tspan = (0.0, 1.0))
   @test sol.retcode == OMBackend.CodeGeneration.ModelingToolkit.SciMLBase.ReturnCode.Success
-  @test OMBackend.getVariableValues(sol, "y")[1] ≈ 1.0 atol = 1e-6
+  @test OMBackend.variableValues(sol, "y")[1] ≈ 1.0 atol = 1e-6
 end
 
 #= mergeSoftGuesses takes names: the if-equations' relay guesses (Strings), the trusted t0 values (Symbols). =#

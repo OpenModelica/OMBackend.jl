@@ -1,4 +1,4 @@
-#= Variable structure systems on the arrays-kept route (OM's translate: `translateReducedArrays`): the backend
+#= Variable structure systems on the arrays-kept route (OM's translate: `translate(fm; scalarize = false)`): the backend
    scalarizes the models the array form does not take, also their structural modes and a for-equation over a
    structural parameter (`1:N`, N the target of a recompilation). Analytic values. =#
 
@@ -6,12 +6,12 @@
 function _vssTranslate(program, model::String)::String
   local scode = OMFrontend.translateToSCode(program)
   local (fm, cache) = OMFrontend.instantiateSCodeToFM(model, scode; scalarize = false)
-  @test OMBackend.translateReducedArrays(fm; functionList = OMFrontend.cacheToFunctionList(cache)) !== nothing
+  @test OMBackend.translate(fm; scalarize = false, functionList = OMFrontend.cacheToFunctionList(cache)) !== nothing
   return OMBackend.canonicalName(model)
 end
 
 "The value of `name` at the end of the solution `sol` of a mode."
-_vssValue(sol, name::String)::Float64 = OMBackend.getVariableValues(sol, name)[end]
+_vssValue(sol, name::String)::Float64 = OMBackend.variableValues(sol, name)[end]
 
 @testset "Variable structure systems, scalarized by the backend" begin
   @testset "Structural modes with arrays: the state carried over" begin
@@ -39,7 +39,7 @@ _vssValue(sol, name::String)::Float64 = OMBackend.getVariableValues(sol, name)[e
     local name::String = _vssTranslate(program, "VSSModes")
     @test name in OMBackend.BACKEND_SCALARIZED_MODELS
     OMBackend.resetFallbacks!()
-    local sols = OMBackend.simulateModel(name; tspan = (0.0, 1.0), reltol = 1e-10, abstol = 1e-10)
+    local sols = OMBackend.simulate(name; tspan = (0.0, 1.0), reltol = 1e-10, abstol = 1e-10)
     @test length(sols) == 2
     #= b's problem rebuilt from its system at the transition (MTK's initialization with the carried values): not the
        vector u0 fallback, whose problem starts at 0 =#
@@ -68,7 +68,7 @@ _vssValue(sol, name::String)::Float64 = OMBackend.getVariableValues(sol, name)[e
     local name::String = _vssTranslate(program, "VSSGrow")
     @test name in OMBackend.BACKEND_SCALARIZED_MODELS
     #= solver options reach the recompiled mode's integrator (reinit! takes none of them) =#
-    local sols = OMBackend.simulateModel(name; tspan = (0.0, 1.0), reltol = 1e-10, abstol = 1e-10)
+    local sols = OMBackend.simulate(name; tspan = (0.0, 1.0), reltol = 1e-10, abstol = 1e-10)
     @test length(sols) == 2
     @test length(sols[1].u[end]) == 2 && length(sols[2].u[end]) == 3
     #= x[1], x[2] carried over; x[3] from its start value 3 at the recompilation =#

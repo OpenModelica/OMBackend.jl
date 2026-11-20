@@ -11,12 +11,12 @@ import OMFrontend
   local file = joinpath(@__DIR__, "Models", "WorkArrayLocals.mo")
   local (fm, cache) = OMFrontend.instantiateSCodeToFM("WorkArrayLocals.M", OMFrontend.translateToSCode(OMFrontend.parseFile(file)))
   OMBackend.translate(fm; functionList = OMFrontend.cacheToFunctionList(cache))
-  local sol = OMBackend.simulateModel(OMBackend.canonicalName("WorkArrayLocals.M"); tspan = (0.0, 1.0))
+  local sol = OMBackend.simulate(OMBackend.canonicalName("WorkArrayLocals.M"); tspan = (0.0, 1.0))
   @test sol.retcode == OMBackend.CodeGeneration.ModelingToolkit.SciMLBase.ReturnCode.Success
   #= f(x) = 2 (x^2 + 1) - x^2 = x^2 + 2 at x = 1, 2; g(x) = 3 x =#
-  @test OMBackend.getVariableValues(sol, "y")[1] ≈ 3.0
-  @test OMBackend.getVariableValues(sol, "y")[end] ≈ 6.0
-  @test OMBackend.getVariableValues(sol, "z")[end] ≈ 3.0
+  @test OMBackend.variableValues(sol, "y")[1] ≈ 3.0
+  @test OMBackend.variableValues(sol, "y")[end] ≈ 6.0
+  @test OMBackend.variableValues(sol, "z")[end] ≈ 3.0
   local code(name::Symbol)::String = string(CG.COMPILED_BODIES[name].code)
   @test !occursin("zeros(", code(:WorkArrayLocals_f)) && !occursin("ensureAlgArrayLength!", code(:WorkArrayLocals_f))
   @test occursin("zeros(", code(:WorkArrayLocals_g))

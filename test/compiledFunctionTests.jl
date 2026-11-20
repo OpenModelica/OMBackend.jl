@@ -99,7 +99,7 @@ import OMFrontend
     withenv("OMBACKEND_COMPILED_FUNCTIONS" => on) do
       local (fm, cache) = OMFrontend.instantiateSCodeToFM("CompiledFunctions.M", OMFrontend.translateToSCode(OMFrontend.parseFile(file)))
       OMBackend.translate(fm; functionList = OMFrontend.cacheToFunctionList(cache))
-      local sol = OMBackend.simulateModel(OMBackend.canonicalName("CompiledFunctions.M"); tspan = (0.0, 1.0))
+      local sol = OMBackend.simulate(OMBackend.canonicalName("CompiledFunctions.M"); tspan = (0.0, 1.0))
       @test sol.retcode == OMBackend.CodeGeneration.ModelingToolkit.SciMLBase.ReturnCode.Success
       @test (CG.MODELICA_FUNCTION_IMPLS[:CompiledFunctions_norm2] isa CG.CompiledModelicaFunction) == (on == "true")
       #= the symbolic evaluations of the build called the closures: no body compiled for Symbolics' types
@@ -112,8 +112,8 @@ import OMFrontend
                                T.parameters), argTypes)
       end
       #= y = 2 sqrt((3t)^2 + 4^2) =#
-      @test OMBackend.getVariableValues(sol, "y")[1] ≈ 8.0
-      @test OMBackend.getVariableValues(sol, "y")[end] ≈ 10.0
+      @test OMBackend.variableValues(sol, "y")[1] ≈ 8.0
+      @test OMBackend.variableValues(sol, "y")[end] ≈ 10.0
     end
   end
   #= translated twice: the second translate reuses the module and its build, and its functions
@@ -125,11 +125,11 @@ import OMFrontend
     withenv("OMBACKEND_COMPILED_FUNCTIONS" => on) do
       local (fm, cache) = OMFrontend.instantiateSCodeToFM("CompiledFunctions.WithConstant", OMFrontend.translateToSCode(OMFrontend.parseFile(file)))
       OMBackend.translate(fm; functionList = OMFrontend.cacheToFunctionList(cache))
-      local sol = OMBackend.simulateModel(name; tspan = (0.0, 1.0))
+      local sol = OMBackend.simulate(name; tspan = (0.0, 1.0))
       @test sol.retcode == OMBackend.CodeGeneration.ModelingToolkit.SciMLBase.ReturnCode.Success
-      @test OMBackend.getVariableValues(sol, "h.s")[end] ≈ exp(-1) rtol = 1e-4
-      @test OMBackend.getVariableValues(sol, "h.y")[end] ≈ 10.0
-      @test OMBackend.getVariableValues(sol, "h.w")[end] ≈ 10.0
+      @test OMBackend.variableValues(sol, "h.s")[end] ≈ exp(-1) rtol = 1e-4
+      @test OMBackend.variableValues(sol, "h.y")[end] ≈ 10.0
+      @test OMBackend.variableValues(sol, "h.w")[end] ≈ 10.0
       #= the module this translate evaluated: read in the latest world (the loop runs in an older one) =#
       @test CG.MODELICA_FUNCTION_OWNERS[:h_Med_g] === OMBackend._modelModule(Symbol(name))
       @test Base.invokelatest(CG.MODELICA_FUNCTION_IMPLS[:h_Med_g], 1.0, [1.0, 2.0, 4.0]) == 7.0

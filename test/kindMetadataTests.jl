@@ -10,7 +10,7 @@ function kindModel(name::String, stop::Float64)
   local (fm, cache) = OMFrontend.instantiateSCodeToFM("KindMetadata." * name,
                                                       OMFrontend.translateToSCode(OMFrontend.parseFile(file)))
   OMBackend.translate(fm; functionList = OMFrontend.cacheToFunctionList(cache))
-  return OMBackend.simulateModel(OMBackend.canonicalName("KindMetadata." * name); tspan = (0.0, stop))
+  return OMBackend.simulate(OMBackend.canonicalName("KindMetadata." * name); tspan = (0.0, stop))
 end
 
 #= MTK's derived variables keep the metadata of the variable they derive from (Symbolics' rename: `xˍt` from `x`):

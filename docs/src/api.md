@@ -4,28 +4,47 @@ CurrentModule = OMBackend
 
 # API reference
 
-The functions below are the user-facing part of the package (`src/backendAPI.jl`).
-The package has no `export` list for them: call them as `OMBackend.name`.
+The names on this page are OMBackend's public API: they are marked `public` and hold for all of 1.x.
+Nothing is exported: call them as `OMBackend.name`. Every other name is internal and may change in any release.
 
 ## Translate
 
 ```@docs
 OMBackend.translate
-OMBackend.generateTargetCode
-OMBackend.knownValues
+OMBackend.BackendMode
+OMBackend.IMTK_MODE
+OMBackend.MTK_MODE
+OMBackend.EliminationOptions
+OMBackend.explainIndexReduction
+OMBackend.scalarizedFallbackReason
+OMBackend.canonicalName
 ```
 
 ## Simulate
 
 ```@docs
-OMBackend.simulateModel
-OMBackend.resimulateModel
+OMBackend.simulate
+OMBackend.resimulate
 OMBackend.getMTKProblem
+OMBackend.defaultSolver
+OMBackend.daeFallbackSolver
+OMBackend.variableValues
+OMBackend.eventCallbacks
+OMBackend.isEventCallback
+OMBackend.isStepControl
+OMBackend.ModelicaAssertionError
+OMBackend.plot
+```
+
+## Tunable parameters
+
+Parameters kept symbolic at translate time, set again at each simulate without a new translation. OMSurrogates
+builds on these (parametric models, surrogates, neural blocks trained in the compiled model).
+
+```@docs
 OMBackend.withTunableParameters
 OMBackend.isTunable
-OMBackend.eventCallbacks
 OMBackend.pristineParameters
-OMBackend.plot
 ```
 
 ## Inspect and write models
@@ -35,7 +54,6 @@ OMBackend.availableModels
 OMBackend.printModel
 OMBackend.modelToString
 OMBackend.writeModelToFile
-OMBackend.dumpGeneratedCode
 ```
 
 ## Caches
@@ -44,6 +62,21 @@ OMBackend.dumpGeneratedCode
 OMBackend.clearCaches!
 OMBackend.forgetModel
 ```
+
+## Renamed in 1.0
+
+The 0.x names still work in 1.x, with a deprecation warning (shown with `--depwarn=yes`).
+
+| 0.x | 1.0 |
+|---|---|
+| `simulateModel(name; MODE)` | `simulate(name; mode)` |
+| `resimulateModel(name; MODE)` | `resimulate(name; mode)` |
+| `getVariableValues` | `variableValues` |
+| `translate(fm; BackendMode, scalarized)` | `translate(fm; mode, scalarize)` |
+| `translateReducedArrays(fm; BackendMode)` | `translate(fm; scalarize = false, mode)` |
+
+`availableModels` returns a `Vector{String}` (0.x: one `String` with headings). `generateTargetCode`, `knownValues`
+and `dumpGeneratedCode` are internal.
 
 ## Index
 

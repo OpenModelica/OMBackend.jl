@@ -228,7 +228,7 @@ function withAssertCallback(callbacks, problem, asserts::Vector; discrete::Vecto
     end
     return false
   end
-  local cb = DiffEqBase.DiscreteCallback((u, t, integrator) -> check!(integrator, false), integrator -> nothing;
+  local cb = DiffEqBase.DiscreteCallback(NotAnEvent((u, t, integrator) -> check!(integrator, false)), integrator -> nothing;
                                          initialize = function (c, u, t, integrator)
                                            fill!(violated, false)
                                            fill!(pending, NaN)
@@ -271,7 +271,7 @@ function withAssertCallback(callbacks, problem, asserts::Vector; discrete::Vecto
     foreach(i -> checkOne!(integrator, i, false, true), unique(first(crossing[j]) for j in fired))
     SciMLBase.derivative_discontinuity!(integrator, false)
   end
-  local zc = DiffEqBase.VectorContinuousCallback(crossingCondition, crossingAffect!, length(crossing);
+  local zc = DiffEqBase.VectorContinuousCallback(NotAnEvent(crossingCondition), crossingAffect!, length(crossing);
                                                  rootfind = ModelingToolkit.SciMLBase.RightRootFind,
                                                  save_positions = (false, false))
   return _joinCallbacks(callbacks, zc, cb)

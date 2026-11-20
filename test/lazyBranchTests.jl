@@ -35,7 +35,7 @@ import OMFrontend
     local file = joinpath(@__DIR__, "Models", "LazyBranches.mo")
     local (fm, cache) = OMFrontend.instantiateSCodeToFM("LazyBranches.Guarded", OMFrontend.translateToSCode(OMFrontend.parseFile(file)))
     OMBackend.translate(fm; functionList = OMFrontend.cacheToFunctionList(cache))
-    local sol = OMBackend.simulateModel(OMBackend.canonicalName("LazyBranches.Guarded"); tspan = (0.0, 1.0))
+    local sol = OMBackend.simulate(OMBackend.canonicalName("LazyBranches.Guarded"); tspan = (0.0, 1.0))
     @test string(sol.retcode) == "Success"
     @test sol(0.0; idxs = :y) == 0.0
     @test sol(1.0; idxs = :y) ≈ log(1.0) atol = 1e-6

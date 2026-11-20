@@ -22,12 +22,12 @@ end
   local file = joinpath(@__DIR__, "Models", "ImpureCalls.mo")
   local (fm, cache) = OMFrontend.instantiateSCodeToFM("ImpureCalls.ImpureSample",
                                                       OMFrontend.translateToSCode(OMFrontend.parseFile(file)); scalarize = false)
-  OMBackend.translate(fm; functionList = OMFrontend.cacheToFunctionList(cache), scalarized = false)
+  OMBackend.translate(fm; functionList = OMFrontend.cacheToFunctionList(cache), scalarize = false)
   local name = OMBackend.canonicalName("ImpureCalls.ImpureSample")
   @test name in OMBackend.ARRAY_PRESERVE_DE_MODELS
   local expected = _impureDraws(6)
   _impureDraws(0)
-  local sol = OMBackend.simulateModel(name; tspan = (0.0, 0.55))
+  local sol = OMBackend.simulate(name; tspan = (0.0, 0.55))
   @test sol.retcode == OMBackend.CodeGeneration.ModelingToolkit.SciMLBase.ReturnCode.Success
   #= id is assigned, no unknown of the initialization's Newton (INIT_PARAMS of the model's module,
      evaluated by the simulation) =#

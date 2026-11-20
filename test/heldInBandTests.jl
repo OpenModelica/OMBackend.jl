@@ -13,7 +13,7 @@ import OMFrontend
   local (fm, cache) = OMFrontend.instantiateSCodeToFM("HeldInBand.Port",
                                                       OMFrontend.translateToSCode(OMFrontend.parseFile(file)))
   OMBackend.translate(fm; functionList = OMFrontend.cacheToFunctionList(cache))
-  local sol = OMBackend.simulateModel(OMBackend.canonicalName("HeldInBand.Port"); tspan = (0.0, 1.0))
+  local sol = OMBackend.simulate(OMBackend.canonicalName("HeldInBand.Port"); tspan = (0.0, 1.0))
   @test string(sol.retcode) == "Success"
   @test sol(0.05; idxs = :level) ≈ 5.95 atol = 1.0e-6
   @test sol(1.0; idxs = :level) ≈ 6.45 atol = 1.0e-6

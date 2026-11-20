@@ -64,7 +64,7 @@ import OMFrontend
       @test !haskey(OMBackend.COMPILED_MODELS_MTK, "ExactZeroRelations_Latch")
       @test haskey(OMBackend.COMPILED_MODELS_MTK, "SampleClusters_FlipFlop")
     end
-    local sol = OMBackend.simulateModel("SampleClusters_FlipFlop"; tspan = (0.0, 1.2))
+    local sol = OMBackend.simulate("SampleClusters_FlipFlop"; tspan = (0.0, 1.2))
     @test string(sol.retcode) == "Success"
     #= a forgotten model is no translated array model either (a simulate by name looked for its code) =#
     push!(OMBackend.ARRAY_PRESERVE_DE_MODELS, "Forgotten_ArrayModel")

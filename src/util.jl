@@ -129,6 +129,13 @@ end
 
 const COMPONENT_SEPARATOR = "_"
 
+"""
+    canonicalName(name::AbstractString) -> String
+
+The name OMBackend keeps a model or a variable under: the dots of `name` replaced by `_`
+(`"Modelica.Blocks.Examples.PID_Controller"` → `"Modelica_Blocks_Examples_PID_Controller"`), inside `der(...)` too.
+A quoted name (`'a.b'`) stays as it is. The public functions take either form; the caches are keyed by this one.
+"""
 function canonicalName(name::AbstractString)::String
   local s = String(name)
   if startswith(s, "der(") && endswith(s, ")")

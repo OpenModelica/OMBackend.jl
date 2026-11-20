@@ -11,11 +11,11 @@ import OMFrontend
   local (fm, cache) = OMFrontend.instantiateSCodeToFM("InitialAlgorithms.AssignedParameter",
                                                       OMFrontend.translateToSCode(OMFrontend.parseFile(file)))
   OMBackend.translate(fm; functionList = OMFrontend.cacheToFunctionList(cache))
-  local sol = OMBackend.simulateModel(OMBackend.canonicalName("InitialAlgorithms.AssignedParameter"); tspan = (0.0, 1.0),
+  local sol = OMBackend.simulate(OMBackend.canonicalName("InitialAlgorithms.AssignedParameter"); tspan = (0.0, 1.0),
                                       reltol = 1e-8, abstol = 1e-8)
   @test sol.retcode == OMBackend.CodeGeneration.ModelingToolkit.SciMLBase.ReturnCode.Success
   #= ind = 2, k = 4: x = exp(-4 t), y + y^3 = 4 at the start =#
-  @test OMBackend.getVariableValues(sol, "x")[end] ≈ exp(-4) rtol = 1e-6
-  local y0 = OMBackend.getVariableValues(sol, "y")[1]
+  @test OMBackend.variableValues(sol, "x")[end] ≈ exp(-4) rtol = 1e-6
+  local y0 = OMBackend.variableValues(sol, "y")[1]
   @test y0 + y0^3 ≈ 4 rtol = 1e-6
 end
