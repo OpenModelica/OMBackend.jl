@@ -24,7 +24,8 @@ const PUBLIC_API_NAMES = Symbol[
     @test Docs.hasdoc(OMBackend, n)
   end
   @test filter(n -> Base.isexported(OMBackend, n), names(OMBackend)) == [:OMBackend]
-  local apiPage::String = read(joinpath(@__DIR__, "..", "docs", "src", "api.md"), String)
+  #= CRLF on a Windows checkout =#
+  local apiPage::String = replace(read(joinpath(@__DIR__, "..", "docs", "src", "api.md"), String), "\r\n" => "\n")
   @test all(n -> occursin("OMBackend.$n\n", apiPage), PUBLIC_API_NAMES)
 end
 
