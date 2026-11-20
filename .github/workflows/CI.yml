@@ -1,12 +1,35 @@
 name: CI
 
 on:
+  # Changes that cannot change a test's outcome run no CI: the docs (Documenter.yml builds them), Markdown, the
+  # citation, the other workflows. docs/src/api.md stays: test/publicAPITests.jl reads it. Patterns apply in
+  # order (a later one wins); tag pushes ignore them.
   pull_request:
+    paths:
+      - '**'
+      - '!docs/**'
+      - '!**.md'
+      - '!CITATION.bib'
+      - '!.gitignore'
+      - '!.github/workflows/Documenter.yml'
+      - '!.github/workflows/release.yml'
+      - '!.github/workflows/check-license.yml'
+      - 'docs/src/api.md'
   push:
     branches:
       - master
       - "1.13"
     tags: '*'
+    paths:
+      - '**'
+      - '!docs/**'
+      - '!**.md'
+      - '!CITATION.bib'
+      - '!.gitignore'
+      - '!.github/workflows/Documenter.yml'
+      - '!.github/workflows/release.yml'
+      - '!.github/workflows/check-license.yml'
+      - 'docs/src/api.md'
   schedule:
     # Nightly run against master at 03:17 UTC. The odd minute avoids the
     # top-of-the-hour queue spike on GitHub-hosted runners.
