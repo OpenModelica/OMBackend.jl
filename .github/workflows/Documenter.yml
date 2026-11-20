@@ -37,7 +37,7 @@ jobs:
       - name: Checkout sibling OM*.jl packages
         uses: JKRT/OM.jl/.github/actions/checkout-siblings@master
         with:
-          packages: ImmutableList MetaModelica OMFrontend OMParser OMRuntimeExternalC
+          packages: ImmutableList MetaModelica OMFrontend OpenModelicaParser OMRuntimeExternalC
 
       - name: Setup Julia
         uses: julia-actions/setup-julia@v2
@@ -58,7 +58,7 @@ jobs:
             Pkg.Registry.add("General")
             Pkg.Registry.add(Pkg.RegistrySpec(url = "https://github.com/OpenModelica/OpenModelicaRegistry.git"))
             siblings = ["../ImmutableList.jl", "../MetaModelica.jl", "../OMFrontend.jl",
-                        "../OMParser.jl", "../OMRuntimeExternalC.jl"]
+                        "../OpenModelicaParser.jl", "../OMRuntimeExternalC.jl"]
             specs = [Pkg.PackageSpec(path = p) for p in siblings]
             push!(specs, Pkg.PackageSpec(path = pwd()))
             Pkg.develop(specs)

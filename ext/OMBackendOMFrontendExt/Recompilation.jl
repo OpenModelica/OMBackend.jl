@@ -43,7 +43,7 @@ with (a library: the MSL for a model using it), and through the backend (`recomp
 """
 module Recompilation
 
-import OpenModelicaParser.Absyn
+import OMFrontend.Absyn
 import OMFrontend
 import OMFrontend.Frontend
 import OMFrontend.Frontend.AbsynUtil
