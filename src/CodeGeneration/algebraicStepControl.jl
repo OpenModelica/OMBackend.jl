@@ -139,7 +139,8 @@ end
 """
     isEventCallback(callback) -> Bool
 
-Whether `callback` (of [`getMTKProblem`](@ref)'s or [`eventCallbacks`](@ref)' callbacks, or of a problem's) is an event
+Whether `callback` (of [`getMTKProblem`](@ref OMBackend.getMTKProblem)'s or [`eventCallbacks`](@ref OMBackend.eventCallbacks)'
+callbacks, or of a problem's) is an event
 of the model: a relation's crossing, a when-condition, a sample, a delay's jump, a structural change. False for the
 algebraic step control ([`isStepControl`](@ref)), the assert checks and a run's bookkeeping callbacks (`NotAnEvent`).
 Counting the event callbacks of a model, one callback can hold several events (a vector of crossings). A solved
