@@ -3541,7 +3541,7 @@ end DivideInLoop;
 
   @testset "A translate of unchanged code keeps the module; changed code evaluates it again" begin
     #= a model of a file simulated again is translated again: its module was compiled again (BouncingBall: 0.7 s) =#
-    local decay(rate::String) = OMFrontend.OMParser.@Modelica """
+    local decay(rate::String) = OMFrontend.OpenModelicaParser.@Modelica """
       model KeptDecay
         Real x[2](each start = 1.0, each fixed = true);
       equation
