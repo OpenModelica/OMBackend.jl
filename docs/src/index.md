@@ -41,13 +41,19 @@ develop it from an OpenModelica checkout. It needs the install tree
 `lowerOMCFlatModel` is not yet part of the [public API](api.md).
 
 ```julia
-julia> import Pkg; Pkg.develop(path = "<OpenModelica>/OMCompiler/Compiler/OpenModelica.rs/OMCompiler.jl")
-julia> import OMCompiler, OMBackend
-julia> OMCompiler.init()  # the install tree in ENV["OPENMODELICAHOME"]
-julia> OMCompiler.evaluate("loadString(\"model Decay Real x(start = 1, fixed = true); equation der(x) = -x; end Decay;\")")
-julia> (model, functions) = OMCompiler.instantiate("Decay")
-julia> OMBackend.translate(OMBackend.lowerOMCFlatModel(model, functions))
-julia> OMBackend.simulate("Decay"; tspan = (0.0, 1.0))
+import Pkg  # once
+Pkg.develop(path = "<OpenModelica>/OMCompiler/Compiler/OpenModelica.rs/OMCompiler.jl")
+```
+
+```julia
+begin
+  import OMCompiler, OMBackend
+  OMCompiler.init()  # the install tree in ENV["OPENMODELICAHOME"]
+  OMCompiler.evaluate("loadString(\"model Decay Real x(start = 1, fixed = true); equation der(x) = -x; end Decay;\")")
+  (model, functions) = OMCompiler.instantiate("Decay")
+  OMBackend.translate(OMBackend.lowerOMCFlatModel(model, functions))
+  OMBackend.simulate("Decay"; tspan = (0.0, 1.0))
+end
 ```
 
 ## Where to read next
