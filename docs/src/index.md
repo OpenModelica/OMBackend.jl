@@ -49,7 +49,14 @@ Pkg.develop(path = "<OpenModelica>/OMCompiler/Compiler/OpenModelica.rs/OMCompile
 begin
   import OMCompiler, OMBackend
   OMCompiler.init()  # the install tree in ENV["OPENMODELICAHOME"]
-  OMCompiler.evaluate("loadString(\"model Decay Real x(start = 1, fixed = true); equation der(x) = -x; end Decay;\")")
+  write("Decay.mo", """
+    model Decay
+      Real x(start = 1, fixed = true);
+    equation
+      der(x) = -x;
+    end Decay;
+    """)
+  OMCompiler.evaluate("""loadFile("Decay.mo")""")
   (model, functions) = OMCompiler.instantiate("Decay")
   OMBackend.translate(OMBackend.lowerOMCFlatModel(model, functions))
   OMBackend.simulate("Decay"; tspan = (0.0, 1.0))
