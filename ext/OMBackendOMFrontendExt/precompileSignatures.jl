@@ -38,7 +38,7 @@
    a --trace-compile trace (the closures' and the invalidated ones left out). Their compile moves into the extension's
    image. =#
 precompile(Tuple{typeof(OMFrontend.Frontend.Util.getOption), MetaModelica.SOME{OMFrontend.Frontend.Expression}})
-precompile(Tuple{typeof(OMFrontend.Frontend.fillNamedArg), Tuple{String, OMFrontend.Frontend.INTEGER_EXPRESSION{Int64}, OMFrontend.Frontend.ModelicaType, Int64}, Array{OMFrontend.Frontend.Slot, 1}, OMFrontend.Frontend.MODELICA_FUNCTION, OMFrontend.Absyn.SOURCEINFO})
+precompile(Tuple{typeof(OMFrontend.Frontend.fillNamedArg), Tuple{String, OMFrontend.Frontend.INTEGER_EXPRESSION{Int64}, OMFrontend.Frontend.ModelicaType, Int64}, Array{OMFrontend.Frontend.SLOT, 1}, OMFrontend.Frontend.MODELICA_FUNCTION, OMFrontend.Absyn.SOURCEINFO})
 precompile(Tuple{typeof(OMFrontend.Frontend.matchExpressions_cast), OMFrontend.Frontend.CALL_EXPRESSION, OMFrontend.Frontend.ModelicaType, OMFrontend.Frontend.ARRAY_EXPRESSION, OMFrontend.Frontend.ModelicaType, Bool})
 precompile(Tuple{Type{MetaModelica.SOME{T} where T}, Tuple{OMFrontend.Frontend.INTEGER_EXPRESSION{Int64}, OMFrontend.Frontend.ModelicaType, Int8}})
 precompile(Tuple{typeof(OMFrontend.Frontend.COMPONENT_REF_CREF), OMFrontend.Frontend.InstNode, MetaModelica.ImmutableList.ListDef.Cons{OMFrontend.Frontend.SUBSCRIPT_UNTYPED{OMFrontend.Frontend.RANGE_EXPRESSION}}, OMFrontend.Frontend.ModelicaType, Int64, OMFrontend.Frontend.ComponentRef})

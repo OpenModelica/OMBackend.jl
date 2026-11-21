@@ -72,7 +72,7 @@ function recompiledSimCode(metaModel::SCode.CLASS, activeModeName::String, eleme
   local newProgram::SCode.Program = setElementInSCodeProgram!(activeModeName, elementToChange, newValue, metaModel) <|
     OMFrontend.recompilationProgram(SCodeUtil.elementName(metaModel))
   @VSS_DEBUG @info "[RECOMPILATION] step 2/7: SCode mutated" elapsed_s=round(time()-started, digits=2)
-  local (flatModelica::F.FlatModel, functionCache) = OMFrontend.instantiateSCodeToFM(modelicaActiveModeName, newProgram)
+  local (flatModelica::F.FLAT_MODEL, functionCache) = OMFrontend.instantiateSCodeToFM(modelicaActiveModeName, newProgram)
   @VSS_DEBUG @info "[RECOMPILATION] step 3/7: frontend (instantiateSCodeToFM) done" elapsed_s=round(time()-started, digits=2)
   return translateToSimCode(flatModelica, OMFrontend.cacheToFunctionList(functionCache))
 end
@@ -83,7 +83,7 @@ end
 The SimCode of a recompiled model with its functions (`functionList`, the frontend's), as a
 translate's (OMBackend.omjlirModel, OMBackend.mtkSimCode).
 """
-translateToSimCode(flatModelica::F.FlatModel, functionList::Union{Nothing, FunctionList})::SimCode.SIM_CODE =
+translateToSimCode(flatModelica::F.FLAT_MODEL, functionList::Union{Nothing, FunctionList})::SimCode.SIM_CODE =
   OMBackend.mtkSimCode(OMBackend.omjlirModel(flatModelica; functionList))
 
 """

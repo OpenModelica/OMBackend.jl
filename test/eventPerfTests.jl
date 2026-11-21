@@ -20,7 +20,7 @@ const EP_FILE = joinpath(@__DIR__, "Models", "EventPerf.mo")
 
 "Translate the model `name` of Models/EventPerf.mo."
 function _epTranslate(name::String)::Nothing
-  local (fm::OMFrontend.Frontend.FlatModel, cache::OMFrontend.Frontend.FunctionTreeImpl.Tree) =
+  local (fm::OMFrontend.Frontend.FLAT_MODEL, cache::OMFrontend.Frontend.FunctionTreeImpl.Tree) =
     OMFrontend.instantiateSCodeToFM(name, OMFrontend.translateToSCode(OMFrontend.parseFile(EP_FILE)))
   OMBackend.translate(fm; functionList = OMFrontend.cacheToFunctionList(cache))
   return nothing
