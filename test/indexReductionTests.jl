@@ -50,8 +50,8 @@ function _irArraySimulate(name::String, names::Vector{String}, stop::Float64; ke
   return Float64[OMBackend.variableValues(sol, n)[end] for n in names]
 end
 
-#= A test's own models written beside it, `Modelica"""..."""` (OMParser 1.0), as in arrayPathTests.jl =#
-const var"@Modelica_str" = OMFrontend.OMParser.var"@Modelica_str"
+#= A test's own models written beside it, `Modelica"""..."""` as in arrayPathTests.jl =#
+const var"@Modelica_str" = OMFrontend.OpenModelicaParser.var"@Modelica_str"
 
 "The OMJLIR model of the model `name` of the Modelica text `program` before index reduction (as `_irUnreduced`)."
 function _irUnreducedOf(program, name::String)::_IRM.Model

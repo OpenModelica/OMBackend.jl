@@ -39,18 +39,19 @@ precompilation of OMBackend alone short; `OM` loads the first two itself):
   runtime must be loaded before OMRuntimeExternalC's (OMBackend.jl#101).
 * JuliaFormatter.jl: the formatted generated code of `printModel`, `modelToString` and `writeModelToFile`; without it
   the code is written as it is (`OMBackendJuliaFormatterExt`).
-* OMFrontend.jl with OMParser.jl and MetaModelica.jl: the lowering of the frontend's flat model (`OMBackendOMFrontendExt`).
+* OMFrontend.jl with MetaModelica.jl: the lowering of the frontend's flat model (`OMBackendOMFrontendExt`).
 
 The OMJL ecosystem packages are developed from sibling checkouts next to
 `OMBackend.jl`, as the CI does (`Pkg.develop` of each, `.github/workflows/CI.yml`).
-OMBackend depends on OMRuntimeExternalC; OMFrontend (with its `SCode` module), OMParser (its `Absyn` module)
-and MetaModelica are weak dependencies, the triggers of `OMBackendOMFrontendExt`, and the tests use OMFrontend;
-ImmutableList is OMFrontend's (ArrayUtil and ListUtil are modules of OMFrontend):
+OMBackend depends on OMRuntimeExternalC; OMFrontend (with its `SCode` module and the parser's `Absyn` module) and
+MetaModelica are weak dependencies, the triggers of `OMBackendOMFrontendExt`, and the tests use OMFrontend.
+OMBackend does not depend on the parser: ImmutableList and OpenModelicaParser are OMFrontend's (ArrayUtil and
+ListUtil are modules of OMFrontend):
 
 * ImmutableList.jl
 * MetaModelica.jl
 * OMFrontend.jl
-* OMParser.jl
+* OpenModelicaParser.jl
 * OMRuntimeExternalC.jl
 
 Layout:
@@ -61,7 +62,7 @@ OMJL-workspace/
 ├── MetaModelica.jl/
 ├── OMBackend.jl/        <-- this repository
 ├── OMFrontend.jl/
-├── OMParser.jl/
+├── OpenModelicaParser.jl/
 └── OMRuntimeExternalC.jl/
 ```
 
@@ -87,7 +88,7 @@ julia> import Pkg
 julia> Pkg.activate(".")
 julia> Pkg.develop([Pkg.PackageSpec(path = joinpath("..", p)) for p in
                     ("ImmutableList.jl", "MetaModelica.jl", "OMFrontend.jl",
-                     "OMParser.jl", "OMRuntimeExternalC.jl")])
+                     "OpenModelicaParser.jl", "OMRuntimeExternalC.jl")])
 ```
 
 Then load the package:

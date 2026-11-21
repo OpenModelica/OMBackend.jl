@@ -38,7 +38,7 @@
    a --trace-compile trace (the closures' and the invalidated ones left out). Their compile moves into the extension's
    image. =#
 precompile(Tuple{typeof(OMFrontend.Frontend.Util.getOption), MetaModelica.SOME{OMFrontend.Frontend.NFExpression}})
-precompile(Tuple{typeof(OMFrontend.Frontend.fillNamedArg), Tuple{String, OMFrontend.Frontend.INTEGER_EXPRESSION{Int64}, OMFrontend.Frontend.NFType, Int64}, Array{OMFrontend.Frontend.Slot, 1}, OMFrontend.Frontend.M_FUNCTION, MetaModelica.SOURCEINFO})
+precompile(Tuple{typeof(OMFrontend.Frontend.fillNamedArg), Tuple{String, OMFrontend.Frontend.INTEGER_EXPRESSION{Int64}, OMFrontend.Frontend.NFType, Int64}, Array{OMFrontend.Frontend.Slot, 1}, OMFrontend.Frontend.M_FUNCTION, OMFrontend.Absyn.SOURCEINFO})
 precompile(Tuple{typeof(OMFrontend.Frontend.matchExpressions_cast), OMFrontend.Frontend.CALL_EXPRESSION, OMFrontend.Frontend.NFType, OMFrontend.Frontend.ARRAY_EXPRESSION, OMFrontend.Frontend.NFType, Bool})
 precompile(Tuple{Type{MetaModelica.SOME{T} where T}, Tuple{OMFrontend.Frontend.INTEGER_EXPRESSION{Int64}, OMFrontend.Frontend.NFType, Int8}})
 precompile(Tuple{typeof(OMFrontend.Frontend.COMPONENT_REF_CREF), OMFrontend.Frontend.InstNode, MetaModelica.ImmutableList.ListDef.Cons{OMFrontend.Frontend.SUBSCRIPT_UNTYPED{OMFrontend.Frontend.RANGE_EXPRESSION}}, OMFrontend.Frontend.NFType, Int64, OMFrontend.Frontend.NFComponentRefData})
@@ -46,10 +46,10 @@ precompile(Tuple{typeof(OMFrontend.Frontend.matchArrayExpressions), OMFrontend.F
 precompile(Tuple{typeof(Base.convert), Type{Union{MetaModelica.ImmutableList.ListDef.Cons{OMFrontend.Frontend.NFExpression}, MetaModelica.ImmutableList.ListDef.Nil{T} where T}}, MetaModelica.ImmutableList.ListDef.Cons{OMFrontend.Frontend.RELATION_EXPRESSION}})
 precompile(Tuple{typeof(OMFrontend.Frontend.hasDimensions), OMFrontend.Frontend.EXPANDED_DERIVED})
 precompile(Tuple{typeof(MetaModelica.ImmutableList.ListDef.list), Tuple{OMFrontend.Frontend.NFComponentRefData, Int64}, Tuple{OMFrontend.Frontend.NFComponentRefData, Int64}, Tuple{OMFrontend.Frontend.NFComponentRefData, Int64}, Vararg{Tuple{OMFrontend.Frontend.NFComponentRefData, Int64}}})
-precompile(Tuple{typeof(OMFrontend.Frontend.checkCyclicDimension), OMFrontend.Frontend.NFDimensionImpl, OMFrontend.Frontend.InstNode, Int64, MetaModelica.SOURCEINFO})
+precompile(Tuple{typeof(OMFrontend.Frontend.checkCyclicDimension), OMFrontend.Frontend.NFDimensionImpl, OMFrontend.Frontend.InstNode, Int64, OMFrontend.Absyn.SOURCEINFO})
 precompile(Tuple{typeof(OMFrontend.Frontend.ParameterTreeImpl.add), Base.Dict{String, OMFrontend.Frontend.NFExpression}, String, OMFrontend.Frontend.ARRAY_EXPRESSION, typeof(OMFrontend.Frontend.ParameterTreeImpl.addConflictReplace)})
 precompile(Tuple{typeof(Base.vcat), Array{OMFrontend.Frontend.NFEquationImpl, 1}, Array{Any, 1}})
-precompile(Tuple{typeof(OMFrontend.Frontend.typeDimension), Array{OMFrontend.Frontend.NFDimensionImpl, 1}, Int64, OMFrontend.Frontend.InstNode, OMFrontend.Frontend.NFBindingImpl, Int64, MetaModelica.SOURCEINFO})
+precompile(Tuple{typeof(OMFrontend.Frontend.typeDimension), Array{OMFrontend.Frontend.NFDimensionImpl, 1}, Int64, OMFrontend.Frontend.InstNode, OMFrontend.Frontend.NFBindingImpl, Int64, OMFrontend.Absyn.SOURCEINFO})
 precompile(Tuple{typeof(Base._array_for), Type{Int64}, MetaModelica.ImmutableList.ListDef.Cons{Tuple{Int64, String, Int64}}, Base.HasLength})
 precompile(Tuple{typeof(OMFrontend.Frontend.ParameterTreeImpl.add), Base.Dict{String, OMFrontend.Frontend.NFExpression}, String, OMFrontend.Frontend.ARRAY_EXPRESSION})
 precompile(Tuple{typeof(Core.kwcall), NamedTuple{(:dims,), Tuple{Int64}}, typeof(Base.cat), Array{OMFrontend.Frontend.NFExpression, 2}, Array{OMFrontend.Frontend.NFExpression, 2}, Vararg{Array{OMFrontend.Frontend.NFExpression, 2}}})

@@ -11,9 +11,9 @@ function _arrayPathTranslate(model::String; scalarized::Bool)
   return OMBackend.canonicalName(model)
 end
 
-#= A test's own models written beside it, `Modelica"""..."""` (OMParser 1.0: parsed when this file is loaded), for
+#= A test's own models written beside it, `Modelica"""..."""` (the parser package: parsed when this file is loaded), for
    `_bothWaysOf`; the models of Models/ArrayPath.mo are those of the tests before. =#
-const var"@Modelica_str" = OMFrontend.OMParser.var"@Modelica_str"
+const var"@Modelica_str" = OMFrontend.OpenModelicaParser.var"@Modelica_str"
 
 "The model `model` of the Modelica text `program` translated (as `_arrayPathTranslate`); its name."
 function _translateProgram(program, model::String; scalarized::Bool)::String

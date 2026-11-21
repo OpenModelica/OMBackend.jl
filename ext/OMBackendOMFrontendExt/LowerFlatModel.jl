@@ -60,7 +60,7 @@ the iterator), `r.x[2]` (a record's field in a function).
 """
 module LowerFlatModel
 
-import OMParser.Absyn
+import OMFrontend.Absyn
 import MetaModelica
 import MetaModelica: isvariant
 import OMFrontend
@@ -84,7 +84,7 @@ const FunctionList = MetaModelica.List{F.M_FUNCTION}
 pathName(path::Absyn.Path)::Symbol = Symbol(F.AbsynUtil.pathString(path))
 
 "The location in the Modelica source, from a frontend `SourceInfo`."
-lowerSource(info::MetaModelica.SourceInfo)::IR.Source = IR.Source(info.fileName, info.lineNumberStart, info.columnNumberStart)
+lowerSource(info::Absyn.SourceInfo)::IR.Source = IR.Source(info.fileName, info.lineNumberStart, info.columnNumberStart)
 
 "The frontend's element source of an equation or a statement (its location)."
 const ElementSource = fieldtype(F.NFEquationImpl, :source)
@@ -224,7 +224,7 @@ lowerExps(es::Expressions)::Vector{IR.Expression} = IR.Expression[lowerExp(e) fo
 
 "An optional expression (a MetaModelica `Option`): lowered, or `nothing`."
 lowerOptExp(o::MetaModelica.Option{<:F.NFExpression})::Union{Nothing, IR.Expression} =
-  o isa MetaModelica.SOME ? lowerExp(o.data) : nothing
+  o isa MetaModelica.SOME ? lowerExp(o.value) : nothing
 
 "The OMJLIR expression of the frontend expression `e`."
 lowerExp(e::F.INTEGER_EXPRESSION)::IR.Expression = IR.INTEGER(e.value)
@@ -374,7 +374,7 @@ function lowerStatement(s::F.Statement)::IR.Statement
   elseif isvariant(s, F.ALG_FOR)
     local name = Symbol(F.name(s.iterator))
     MetaModelica.isSome(s.range) || error("OMJLIR lowering: a for-statement without a range")
-    local iterator = IR.Iterator(name, lowerExp(s.range.data))
+    local iterator = IR.Iterator(name, lowerExp(s.range.value))
     return IR.FOR_STATEMENT(iterator, lowerStatements(s.body), source)
   elseif isvariant(s, F.ALG_WHILE)
     return IR.WHILE_STATEMENT(lowerExp(s.condition), lowerStatements(s.body), source)
@@ -438,7 +438,7 @@ function lowerEquation(eq::F.Equation)::Union{Nothing, IR.Equation}
   elseif isvariant(eq, F.EQUATION_FOR)
     local name = Symbol(F.name(eq.iterator))
     MetaModelica.isSome(eq.range) || error("OMJLIR lowering: a for-equation without a range")
-    local iterator = IR.Iterator(name, lowerExp(eq.range.data))
+    local iterator = IR.Iterator(name, lowerExp(eq.range.value))
     return IR.FOR_EQUATION(iterator, lowerEquations(eq.body; reversed = true), source, ATTRIBUTES)
   elseif isvariant(eq, F.EQUATION_IF)
     return lowerIfEquation(eq, source)
@@ -552,8 +552,8 @@ with the variables it may change, its prompt and the initial equations for the n
 function lowerReconfigureEquation(eq::F.Equation, source::IR.Source)::IR.WHEN_EQUATION
   local condition = lowerExp(eq.whenConditions[1])
   local components = IR.ComponentRef[IR.ComponentRef(Symbol(n)) for n in reconfigureVariableNames(eq.variables)]
-  local prompt = MetaModelica.isSome(eq.prompt) ? promptString(eq.prompt.data) : nothing
-  local initialEquations = MetaModelica.isSome(eq.initialEquations) ? serializeInitialEquations(eq.initialEquations.data) : nothing
+  local prompt = MetaModelica.isSome(eq.prompt) ? promptString(eq.prompt.value) : nothing
+  local initialEquations = MetaModelica.isSome(eq.initialEquations) ? serializeInitialEquations(eq.initialEquations.value) : nothing
   local body = IR.Statement[IR.AGENTIC_RECOMPILATION(components, prompt, initialEquations)]
   return IR.WHEN_EQUATION([whenBranch(condition, body)], IR.STRUCTURAL_WHEN, source, ATTRIBUTES)
 end
@@ -840,7 +840,7 @@ function lowerFlatModel(fm::F.FlatModel; functions::FunctionList = MetaModelica.
   end
   return IR.Model(fm.name, variables, IR.Partition[system], IR.Partition[], IR.ClockKind[],
                   lowerFunctions(functions), initialMode, modes, transitions,
-                  fm.scodeProgram === nothing ? nothing : fm.scodeProgram.data)
+                  fm.scodeProgram === nothing ? nothing : fm.scodeProgram.value)
 end
 
 end # module LowerFlatModel
