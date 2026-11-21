@@ -279,7 +279,7 @@ end
 """
     legacyName(cref)
 
-The previous backend's name of a reference (BDAE's `string` of a DAE reference): the parts
+The previous backend's name of a reference (BDAE's `string` of a reference): the parts
 joined by `_`, each subscript in brackets of its own, an enumeration literal as its type's
 last name, the literal and its index (`Logic.'1'(4)`): `a.b[1,2]` was `a_b[1][2]`. Where an
 order sorted by name must be the previous one, and the names of the simulation code.

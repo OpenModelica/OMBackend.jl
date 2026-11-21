@@ -63,7 +63,7 @@ isScalarType(ty::IR.ModelicaType)::Bool = ty isa Union{IR.T_REAL, IR.T_INTEGER, 
 """
     lowerAssignment(lhs, rhs, source)
 
-An assignment, a tuple's as the frontend's DAE conversion made it: `() := f(x)` the call as a
+An assignment, a tuple's as the previous backend had it: `() := f(x)` the call as a
 statement, `(a) := f(x)` the assignment of the call's first output.
 """
 function lowerAssignment(@nospecialize(lhs::IR.Expression), @nospecialize(rhs::IR.Expression),

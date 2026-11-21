@@ -42,13 +42,12 @@ representation, in the extension OMBackendOMFrontendExt. `lowerFlatModel(fm)` (`
 
 The lowering translates; it does not transform. One equation of the flat model is one
 equation of OMJLIR (a connection equality `a = b` is the residual `a + (-b) = 0`, as the
-frontend's DAE conversion made it), a when-equation's body is statements, the algorithm
+previous backend had it), a when-equation's body is statements, the algorithm
 sections are ALGORITHM equations and the initial algorithm sections ALGORITHM initial
 equations. Derivatives stay `der(x)` calls; the passes after the lowering introduce the
 derivative variables, decompose the record equations and normalize the when-equations.
 
-The order of the equations is the order the previous backend (BDAE, through the frontend's
-DAE conversion) had, so that the code generated from OMJLIR is the code generated before:
+The order of the equations is the order the previous backend (BDAE) had, so that the code generated from OMJLIR is the code generated before:
 the equations and the initial equations of the flat model in reverse; the equations of an
 if-equation's branches and of a when-equation's body in their order, the else-branch's in
 reverse. The variables are in their order. An array equation `lhs = rhs` is `rhs = lhs`, the
@@ -422,7 +421,7 @@ function lowerEquation(eq::F.Equation)::Union{Nothing, IR.Equation}
     ty isa IR.T_ARRAY && return IR.ARRAY_EQUATION(rhs, lhs, ty, source, ATTRIBUTES)
     return IR.SCALAR_EQUATION(lhs, rhs, ty, source, ATTRIBUTES)
   elseif isvariant(eq, F.EQUATION_CREF_EQUALITY)
-    #= A connection's equality, as the frontend's DAE conversion made it: a + (-b) = 0, of the
+    #= A connection's equality, as the previous backend had it: a + (-b) = 0, of the
        type of `a` with its subscripts (the reference's own is its last part's declared one:
        `vol.ports[1].Xi_outflow[1]` of a scalarized kept array would be `Real[1]`) =#
     local ty = lowerType(F.getSubscriptedType(eq.lhs))
@@ -455,7 +454,7 @@ end
 
 """
 An if-equation: the branches in order, a last branch of condition `true` as the else-branch
-(as the frontend's DAE conversion did).
+(as the previous backend had it).
 """
 function lowerIfEquation(eq::F.Equation, source::IR.Source)::IR.IF_EQUATION
   local branches = IR.EquationBranch[]
