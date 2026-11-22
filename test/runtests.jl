@@ -424,6 +424,8 @@ TEST_GROUP == "kept" || @testset "OMBackend" begin
 
   #= ── 20d. Parameters an initial algorithm assigns ───────────────── =#
   include("initialAlgorithmParameterTests.jl")
+  #= Parametric initial equations that call the model's functions =#
+  include("parametricInitFunctionTests.jl")
 
   #= ── 20e. Impure calls on the array path ───────────────────────── =#
   include("impureCallTests.jl")
