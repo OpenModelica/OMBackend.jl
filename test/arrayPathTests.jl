@@ -3931,4 +3931,29 @@ end DivideInLoop;
     local sol = OMBackend.simulate(name; tspan = (0.0, 1.0), reltol = 1e-10, abstol = 1e-12)
     @test _values(sol, ["x", "y"]) ≈ [exp(-1), 2 * exp(-1) + 3] rtol = 1e-9
   end
+
+  #= `./` and `.^` of two arrays come from the frontend as Op.DIV_EW and Op.POW_EW (before: Op.DIV and Op.POW with an
+     array type, as omc 1.27 types them). x = exp(-(k ./ e) t), y = x .^ e, z = y ./ x = x .^ (e .- 1). =#
+  @testset "Element-wise division and power of two arrays" begin
+    local ew = Modelica"""
+      model EwDivPow
+        parameter Real k[2] = {1, 2};
+        parameter Real e[2] = {2, 3};
+        Real x[2](each start = 1, each fixed = true);
+        Real y[2];
+        Real z[2];
+      equation
+        der(x) = -(k ./ e) .* x;
+        y = x .^ e;
+        z = y ./ x;
+      end EwDivPow;
+      """
+    local expected::Vector{Float64} = [exp(-2 / 3), exp(-1), exp(-2), exp(-4 / 3)]
+    for kept in (false, true)
+      local name::String = _translateProgram(ew, "EwDivPow"; scalarized = !kept)
+      kept && @test _arrayPathTaken(name)
+      local sol = OMBackend.simulate(name; tspan = (0.0, 1.0), reltol = 1e-10, abstol = 1e-12)
+      @test _values(sol, ["x[2]", "y[1]", "y[2]", "z[2]"]) ≈ expected rtol = 1e-8
+    end
+  end
 end
