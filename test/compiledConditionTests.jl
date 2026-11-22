@@ -45,7 +45,7 @@ _ccFinal(sol::CC_SOLUTION, v::String)::Float64 = OMBackend.variableValues(sol, v
 @testset "When conditions compiled" begin
   local CG = OMBackend.CodeGeneration
   local file::String = joinpath(@__DIR__, "Models", "CompiledConditions.mo")
-  local (fm::OMFrontend.Frontend.FlatModel, cache::OMFrontend.Frontend.FunctionTreeImpl.Tree) =
+  local (fm::OMFrontend.Frontend.FLAT_MODEL, cache::OMFrontend.Frontend.FunctionTreeImpl.Tree) =
     OMFrontend.instantiateSCodeToFM("CompiledConditions.Whens", OMFrontend.translateToSCode(OMFrontend.parseFile(file)))
   OMBackend.translate(fm; functionList = OMFrontend.cacheToFunctionList(cache))
   local sol::CC_SOLUTION = OMBackend.simulate(OMBackend.canonicalName("CompiledConditions.Whens"); tspan = (0.0, 1.0))

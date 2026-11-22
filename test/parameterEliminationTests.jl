@@ -12,7 +12,7 @@ const EIP_SOLUTION = OMBackend.CodeGeneration.ModelingToolkit.SciMLBase.Abstract
 "The simulation code and the final value of `v` of `model` of Models/EnumIndexedParameters.mo, simulated to 1."
 function _eipRun(model::String, v::String)::Tuple{OMBackend.SimCode.SIM_CODE, Float64}
   local file::String = joinpath(@__DIR__, "Models", "EnumIndexedParameters.mo")
-  local (fm::OMFrontend.Frontend.FlatModel, cache::OMFrontend.Frontend.FunctionTreeImpl.Tree) =
+  local (fm::OMFrontend.Frontend.FLAT_MODEL, cache::OMFrontend.Frontend.FunctionTreeImpl.Tree) =
     OMFrontend.instantiateSCodeToFM(model, OMFrontend.translateToSCode(OMFrontend.parseFile(file)))
   OMBackend.translate(fm; functionList = OMFrontend.cacheToFunctionList(cache))
   local simCode::OMBackend.SimCode.SIM_CODE = OMBackend.LAST_SIM_CODE[]

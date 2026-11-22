@@ -60,7 +60,7 @@ model scalarized by the backend before the scalar passes (`backendScalarizedMode
 BACKEND_SCALARIZED_MODELS). `nothing` where none of these takes the model; [`scalarizedFallbackReason`](@ref) gives
 the reasons (OM's translate then throws `ARRAY_PRESERVING_CODEGEN_NOT_SUPPORTED`).
 """
-function translate(fm::F.FlatModel;
+function translate(fm::F.FLAT_MODEL;
                    functionList::Union{Nothing, FunctionList} = nothing,
                    mode::OMBackend.BackendMode = DEFAULT_BACKEND_MODE[],
                    scalarize::Bool = true,
@@ -81,7 +81,7 @@ end
 `translate` of the scalar flat model `fm`: lowered to OMJLIR and through its passes (`omjlirModel`), or `omjlir`, the
 OMJLIR model a route with the arrays kept made of it, to the code for `mode`.
 """
-function _translateScalar(fm::F.FlatModel, omjlir::Union{Nothing, OMJLIR.Model};
+function _translateScalar(fm::F.FLAT_MODEL, omjlir::Union{Nothing, OMJLIR.Model};
                           functionList::Union{Nothing, FunctionList},
                           mode::OMBackend.BackendMode,
                           warnMissingStartValues::Union{Nothing, Bool},
@@ -111,7 +111,7 @@ function _translateScalar(fm::F.FlatModel, omjlir::Union{Nothing, OMJLIR.Model};
   end
 end
 
-function explainIndexReduction(fm::F.FlatModel;
+function explainIndexReduction(fm::F.FLAT_MODEL;
                                functionList::Union{Nothing, FunctionList} = nothing)::Passes.IndexReduction.Explanation
   local model = lowerFlatModel(fm; functions = something(functionList, MetaModelica.nil))
   #= the passes but index reduction (it runs after the last one) =#
@@ -119,19 +119,19 @@ function explainIndexReduction(fm::F.FlatModel;
   return Passes.IndexReduction.explain(model)
 end
 
-function omjlirModel(fm::F.FlatModel; functionList::Union{Nothing, FunctionList} = nothing)::OMJLIR.Model
+function omjlirModel(fm::F.FLAT_MODEL; functionList::Union{Nothing, FunctionList} = nothing)::OMJLIR.Model
   local model = lowerFlatModel(fm; functions = something(functionList, MetaModelica.nil))
   return Passes.runPasses!(model)
 end
 
-function reducedArrayModel(fm::F.FlatModel;
+function reducedArrayModel(fm::F.FLAT_MODEL;
                            functionList::Union{Nothing, FunctionList} = nothing)::Union{Nothing, OMJLIR.Model}
   return reducedArrayModel(canonicalName(fm.name)) do
     lowerFlatModel(fm; functions = something(functionList, MetaModelica.nil))
   end
 end
 
-function backendScalarizedModel(fm::F.FlatModel;
+function backendScalarizedModel(fm::F.FLAT_MODEL;
                                 functionList::Union{Nothing, FunctionList} = nothing)::Union{Nothing, OMJLIR.Model}
   return backendScalarizedModel(canonicalName(fm.name)) do
     lowerFlatModel(fm; functions = something(functionList, MetaModelica.nil))
@@ -139,7 +139,7 @@ function backendScalarizedModel(fm::F.FlatModel;
 end
 
 "`translate(fm; scalarize = false)`: the routes with the arrays kept, in order; `nothing` where none takes `fm`."
-function _translateArraysKept(fm::F.FlatModel;
+function _translateArraysKept(fm::F.FLAT_MODEL;
                               functionList::Union{Nothing, FunctionList},
                               mode::OMBackend.BackendMode,
                               warnMissingStartValues::Union{Nothing, Bool},
@@ -181,7 +181,7 @@ next route. Coverage 21 (the array form's first): a lifted if-expression left a 
 (UndefVarError), a build failed (BoundsError) and the tables it had allocated were freed under the problem that read
 them (Rotational Friction, CoupledClutches, Translational Brake).
 """
-function _translateKept(fm::F.FlatModel, model::OMJLIR.Model, path::String, subject::String;
+function _translateKept(fm::F.FLAT_MODEL, model::OMJLIR.Model, path::String, subject::String;
                         functionList::Union{Nothing, FunctionList},
                         mode::OMBackend.BackendMode,
                         warnMissingStartValues::Union{Nothing, Bool},

@@ -903,7 +903,7 @@ function handleArrayExp(e::SC.ARRAY_EXP, simCode::SC.SIM_CODE)::Expr
   local values = nothing
   if all(_isConstantExp, e.elements)
     values = try
-      Any[eval(x) for x in elemExprs]
+      Any[_evalInCodeGeneration(x) for x in elemExprs]
     catch err
       OMBackend._fallback(err, :constantArrayElements; expect = Union{UndefVarError, MethodError})
       nothing
@@ -1144,6 +1144,16 @@ end
 #= ==================================================================================== =#
 
 """
+    _evalInCodeGeneration(ex)
+
+The lowered expression `ex` evaluated in CodeGeneration, where the model's function wrappers
+are bound (createModelicaFunctionWrapper). Evaluated in this module, a call of one of the
+model's functions was an UndefVarError: MSL Fluid HeatExchangerSimulation's `dp_nominal`
+from `sum(WallFriction.pressureLoss_m_flow(...))` kept its start value.
+"""
+_evalInCodeGeneration(@nospecialize(ex::Any))::Any = Core.eval(parentmodule(@__MODULE__), ex)
+
+"""
     evalExpression(e, simCode; keepTunable = false)
 
 `e` evaluated at the build: its parameters replaced by their bindings, recursively (a
@@ -1157,7 +1167,7 @@ function evalExpression(e::SC.Exp, simCode::SC.SIM_CODE; keepTunable::Bool = fal
   local jl = expToJuliaExpMTK(substituted, simCode)
   shouldEval[] || return quote $(jl) end
   local value = try
-    eval(jl)
+    _evalInCodeGeneration(jl)
   catch err
     #= left unevaluated: it reads a name that is not a constant here =#
     OMBackend._fallback(err, :evalExpression; expect = Union{UndefVarError, MethodError})
@@ -1310,7 +1320,7 @@ Without them a discrete set imperatively in an `initial algorithm` (no `start` a
 0.0 where the initial branches of if-equations are chosen: the wrong branch. Not the `initial()`
 arms of when-equations and discrete clusters: the DAE initialization starts their discretes at
 their start values and the clusters settle them after it, so the branches must read those (as
-the old pipeline did: only its sections had DAE statements); seeded, MSL 4.1.0 IMC_YD's main
+the old pipeline did: only its sections had statements); seeded, MSL 4.1.0 IMC_YD's main
 switches started open in the branches and closed in the initialization, which then failed and
 moved the logical delays' tSwitch.
 """
@@ -1483,8 +1493,7 @@ function evalCausalRHSAtT0(@nospecialize(rhsExpr), valMap::Dict{Symbol, Float64}
   _exprSymbolsExplicit(rhsExpr, explicit) || return nothing
   local numExpr = _intifyFloatIndices(_substituteExprValues(rhsExpr, valMap))
   try
-    #= generated Modelica function bindings live in the parent CodeGeneration module =#
-    local result = Core.eval(parentmodule(@__MODULE__), numExpr)
+    local result = _evalInCodeGeneration(numExpr)
     local value = result isa Number ? Float64(result) : Base.invokelatest(SymbolicUtils.unwrap, result)
     value isa Number || return nothing
     return isfinite(value) ? Float64(value) : nothing
@@ -1569,12 +1578,12 @@ evaluated.
 function evalInitialCondition(mtkCond::Expr, simCode::SC.SIM_CODE; closedBoundary::Bool = false,
                               extraVals::Union{Nothing, AbstractDict{Symbol, Float64}} = nothing)::Bool
   #= under another package's precompile, eval would mutate this closed module's bindings =#
-  OMBackend.evaluationRejected(@__MODULE__) && return true
+  OMBackend.evaluationRejected(parentmodule(@__MODULE__)) && return true
   local valMap = _buildT0ValueMap(simCode)
   extraVals === nothing || merge!(valMap, extraVals)
   local numExpr = _substituteExprValues(_extractZeroCrossingLHS(mtkCond), valMap)
   local value = try
-    _numberOf(eval(numExpr))
+    _numberOf(_evalInCodeGeneration(numExpr))
   catch err
     #= a name without a t0 value, a Modelica function outside its domain =#
     OMBackend._fallback(err, :evalInitialCondition; expect = Union{UndefVarError, MethodError}, impact = :result)
@@ -1765,7 +1774,7 @@ function solveParametricInitialEquations!(simCode::SC.SIM_CODE)::Nothing
       local lhsVal = SC.valueAtBuildStart(lhsSubst, simCode)
       if lhsVal === nothing
         lhsVal = try
-          local raw = eval(expToJuliaExpMTK(lhsSubst, simCode))
+          local raw = _evalInCodeGeneration(expToJuliaExpMTK(lhsSubst, simCode))
           raw isa Symbolics.Num ? Float64(Symbolics.unwrap(raw)) : Float64(raw)
         catch err
           OMBackend._fallback(err, :parametricInitLhs; expect = Union{UndefVarError, MethodError}, impact = :result)
@@ -1787,7 +1796,7 @@ function solveParametricInitialEquations!(simCode::SC.SIM_CODE)::Nothing
       local rhsJl = expToJuliaExpMTK(rhsSubst, simCode)
       #= f(x) = lhsVal - rhs(x) =#
       local residualFn = try
-        eval(Expr(:->, freeSymbol, Expr(:call, :-, lhsVal, rhsJl)))
+        _evalInCodeGeneration(Expr(:->, freeSymbol, Expr(:call, :-, lhsVal, rhsJl)))
       catch e
         OMBackend._fallback(e, :parametricInitResidual; expect = Union{UndefVarError, MethodError}, impact = :result)
         @warn "[SIMCODE: solveParametricInitialEquations] could not build residual" freeName e
@@ -1869,7 +1878,7 @@ function _solveCoupledParametricInitialEquations!(simCode::SC.SIM_CODE)::Nothing
     push!(residuals, :($(expToJuliaExpMTK(l, simCode)) - $(expToJuliaExpMTK(r, simCode))))
   end
   local residualFn = try
-    eval(Expr(:->, Expr(:tuple, Symbol.(names)...), Expr(:vect, residuals...)))
+    _evalInCodeGeneration(Expr(:->, Expr(:tuple, Symbol.(names)...), Expr(:vect, residuals...)))
   catch err
     OMBackend._fallback(err, :coupledParametricInitResidual; expect = Union{UndefVarError, MethodError}, impact = :result)
     return nothing

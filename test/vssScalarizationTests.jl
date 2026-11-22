@@ -15,7 +15,7 @@ _vssValue(sol, name::String)::Float64 = OMBackend.variableValues(sol, name)[end]
 
 @testset "Variable structure systems, scalarized by the backend" begin
   @testset "Structural modes with arrays: the state carried over" begin
-    local program = OMFrontend.OMParser.Modelica"""
+    local program = OMFrontend.OpenModelicaParser.Modelica"""
       model VSSModes
         model A
           Real x[2](start = {1.0, 2.0});
@@ -52,7 +52,7 @@ _vssValue(sol, name::String)::Float64 = OMBackend.variableValues(sol, name)[end]
   end
 
   @testset "Recompilation of an array size: a for-equation over 1:N" begin
-    local program = OMFrontend.OMParser.Modelica"""
+    local program = OMFrontend.OpenModelicaParser.Modelica"""
       model VSSGrow
         parameter Integer N = 2;
         Real x[N](start = {i for i in 1:N});

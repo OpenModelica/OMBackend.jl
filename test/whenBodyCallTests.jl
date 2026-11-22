@@ -34,7 +34,7 @@ _wbcFinal(sol::WBC_SOLUTION, v::String)::Float64 = OMBackend.variableValues(sol,
 
 @testset "A when body's repeated call evaluated once" begin
   local file::String = joinpath(@__DIR__, "Models", "WhenBodyCalls.mo")
-  local (fm::OMFrontend.Frontend.FlatModel, cache::OMFrontend.Frontend.FunctionTreeImpl.Tree) =
+  local (fm::OMFrontend.Frontend.FLAT_MODEL, cache::OMFrontend.Frontend.FunctionTreeImpl.Tree) =
     OMFrontend.instantiateSCodeToFM("WhenBodyCalls.Sampled", OMFrontend.translateToSCode(OMFrontend.parseFile(file)))
   OMBackend.translate(fm; functionList = OMFrontend.cacheToFunctionList(cache))
   local name::String = OMBackend.canonicalName("WhenBodyCalls.Sampled")
@@ -60,7 +60,7 @@ end
    got the second's values, the then arm the elsewhen's). =#
 @testset "Repeated calls of bodies that share a scope" begin
   local file::String = joinpath(@__DIR__, "Models", "WhenBodyCalls.mo")
-  local (fm::OMFrontend.Frontend.FlatModel, cache::OMFrontend.Frontend.FunctionTreeImpl.Tree) =
+  local (fm::OMFrontend.Frontend.FLAT_MODEL, cache::OMFrontend.Frontend.FunctionTreeImpl.Tree) =
     OMFrontend.instantiateSCodeToFM("WhenBodyCalls.TwoBodies", OMFrontend.translateToSCode(OMFrontend.parseFile(file)))
   OMBackend.translate(fm; functionList = OMFrontend.cacheToFunctionList(cache))
   local sol::WBC_SOLUTION = OMBackend.simulate(OMBackend.canonicalName("WhenBodyCalls.TwoBodies"); tspan = (0.0, 1.0))

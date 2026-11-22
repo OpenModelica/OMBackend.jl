@@ -112,7 +112,7 @@ jobs:
       - name: Checkout sibling OM*.jl packages
         uses: JKRT/OM.jl/.github/actions/checkout-siblings@master
         with:
-          packages: ImmutableList MetaModelica OMFrontend OMParser OMRuntimeExternalC
+          packages: ImmutableList MetaModelica OMFrontend OpenModelicaParser OMRuntimeExternalC
 
       - name: Set up Julia ${{ matrix.version }}
         uses: julia-actions/setup-julia@v2
@@ -177,7 +177,7 @@ jobs:
           import Pkg
           Pkg.develop([Pkg.PackageSpec(path = p) for p in
                        ("ImmutableList.jl", "MetaModelica.jl", "OMFrontend.jl",
-                        "OMParser.jl", "OMRuntimeExternalC.jl")])
+                        "OpenModelicaParser.jl", "OMRuntimeExternalC.jl")])
 
       - name: Instantiate and build
         uses: julia-actions/julia-buildpkg@v1
@@ -195,7 +195,7 @@ jobs:
           COVERAGE_FLAG: ${{ runner.os == 'Linux' && format('--code-coverage=@{0}/OMBackend.jl', github.workspace) || '' }}
         run: |
           julia --color=yes --project=OMBackend.jl --depwarn=yes $COVERAGE_FLAG -e '
-            for name in ("ImmutableList", "MetaModelica", "OMParser", "OMFrontend", "OMRuntimeExternalC", "OMBackend")
+            for name in ("ImmutableList", "MetaModelica", "OpenModelicaParser", "OMFrontend", "OMRuntimeExternalC", "OMBackend")
               local id = Base.identify_package(name)
               println(name, ": ", Base.isprecompiled(id; ignore_loaded = true) ? "cached" : "to precompile")
             end'
@@ -255,8 +255,8 @@ jobs:
             Matrix:       ${{ matrix.os }} / Julia ${{ matrix.version }} / ${{ matrix.arch }}
 
   # The Linux shards' coverage merged: the percentage and a table per file in the job summary, the merged lcov file
-  # an artifact (utilities/coverageSummary.jl; no external service). Also after a failed shard: the coverage of
-  # what ran.
+  # an artifact; on master, when all shards passed, coverage.json on gh-pages for the README's badge (the action is
+  # shared by the OM.jl packages; no external service). Also after a failed shard: the coverage of what ran.
   coverage:
     name: Coverage
     needs: test
@@ -280,39 +280,18 @@ jobs:
         with:
           version: '1.13'
 
-      - name: Merge and summarize
-        shell: bash
-        run: |
-          shopt -s nullglob
-          julia --startup-file=no utilities/coverageSummary.jl --badge coverage.json lcov.info shards/*/lcov.info \
-            >> "$GITHUB_STEP_SUMMARY"
+      - name: Summary and badge
+        id: coverage
+        uses: JKRT/OM.jl/.github/actions/coverage@master
+        with:
+          lcov: shards/*/lcov.info
+          name: OMBackend.jl/src
+          publish: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/master' && needs.test.result == 'success' }}
 
       - name: Upload the merged coverage
+        if: steps.coverage.outputs.lcov != ''
         uses: actions/upload-artifact@v4
         with:
           name: coverage-merged
-          path: lcov.info
+          path: ${{ steps.coverage.outputs.lcov }}
           retention-days: 30
-
-      # The README's badge reads coverage.json on gh-pages (shields.io endpoint; no external service). Master only, and
-      # only when all shards passed: the coverage of a partial run is not the package's. Documenter deploys to the same
-      # branch (its own directories): a rejected push starts again from the branch's new tip.
-      - name: Publish the coverage badge (master)
-        if: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/master' && needs.test.result == 'success' }}
-        shell: bash
-        run: |
-          message=$(sed -n 's/.*"message": "\([^"]*\)".*/\1/p' coverage.json)
-          for attempt in 1 2 3; do
-            git fetch --depth=1 origin gh-pages
-            rm -rf pages && git worktree prune
-            git worktree add --detach pages FETCH_HEAD
-            cp coverage.json pages/coverage.json
-            git -C pages add coverage.json
-            if git -C pages diff --cached --quiet; then echo "coverage unchanged: $message"; exit 0; fi
-            git -C pages -c user.name="github-actions[bot]" \
-              -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
-              commit -q -m "Coverage badge: $message (${GITHUB_SHA::8})"
-            git -C pages push origin HEAD:gh-pages && exit 0
-            sleep $((attempt * 10))
-          done
-          exit 1

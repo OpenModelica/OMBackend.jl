@@ -75,7 +75,7 @@ backend); an error where none takes the model (OMJL's `ARRAY_PRESERVING_CODEGEN_
 """
 function _precompileTranslate(scode::OMFrontend.SCode.Program, name::String,
                               mode::OMBackend.BackendMode)::Union{Nothing, Tuple{String, Expr}}
-  local (fm::OMFrontend.Frontend.FlatModel, cache) = OMFrontend.instantiateSCodeToFM(name, scode; scalarize = false)
+  local (fm::OMFrontend.Frontend.FLAT_MODEL, cache) = OMFrontend.instantiateSCodeToFM(name, scode; scalarize = false)
   local reduced::Union{Nothing, Tuple{String, Expr}} =
     translate(fm; functionList = OMFrontend.cacheToFunctionList(cache), mode, scalarize = false,
               warnMissingStartValues = nothing, eliminateNonDynamic = true, observedFilter = nothing, checkSimCode = true)

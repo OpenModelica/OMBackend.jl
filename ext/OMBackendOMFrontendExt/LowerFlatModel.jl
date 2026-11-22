@@ -42,13 +42,12 @@ representation, in the extension OMBackendOMFrontendExt. `lowerFlatModel(fm)` (`
 
 The lowering translates; it does not transform. One equation of the flat model is one
 equation of OMJLIR (a connection equality `a = b` is the residual `a + (-b) = 0`, as the
-frontend's DAE conversion made it), a when-equation's body is statements, the algorithm
+previous backend had it), a when-equation's body is statements, the algorithm
 sections are ALGORITHM equations and the initial algorithm sections ALGORITHM initial
 equations. Derivatives stay `der(x)` calls; the passes after the lowering introduce the
 derivative variables, decompose the record equations and normalize the when-equations.
 
-The order of the equations is the order the previous backend (BDAE, through the frontend's
-DAE conversion) had, so that the code generated from OMJLIR is the code generated before:
+The order of the equations is the order the previous backend (BDAE) had, so that the code generated from OMJLIR is the code generated before:
 the equations and the initial equations of the flat model in reverse; the equations of an
 if-equation's branches and of a when-equation's body in their order, the else-branch's in
 reverse. The variables are in their order. An array equation `lhs = rhs` is `rhs = lhs`, the
@@ -60,7 +59,7 @@ the iterator), `r.x[2]` (a record's field in a function).
 """
 module LowerFlatModel
 
-import OMParser.Absyn
+import OMFrontend.Absyn
 import MetaModelica
 import MetaModelica: isvariant
 import OMFrontend
@@ -74,7 +73,7 @@ const IR = OMJLIR
 export lowerFlatModel, FunctionList
 
 "The frontend's list of the functions a model calls (OMFrontend.cacheToFunctionList)."
-const FunctionList = MetaModelica.List{F.M_FUNCTION}
+const FunctionList = MetaModelica.List{F.MODELICA_FUNCTION}
 
 #= ==================================================================================== =#
 #= Names and sources                                                                    =#
@@ -84,20 +83,14 @@ const FunctionList = MetaModelica.List{F.M_FUNCTION}
 pathName(path::Absyn.Path)::Symbol = Symbol(F.AbsynUtil.pathString(path))
 
 "The location in the Modelica source, from a frontend `SourceInfo`."
-lowerSource(info::MetaModelica.SourceInfo)::IR.Source = IR.Source(info.fileName, info.lineNumberStart, info.columnNumberStart)
-
-"The frontend's element source of an equation or a statement (its location)."
-const ElementSource = fieldtype(F.NFEquationImpl, :source)
-
-"The location of an equation or a statement, from the frontend's element source."
-lowerElementSource(source::ElementSource)::IR.Source = lowerSource(source.info)
+lowerSource(info::Absyn.SourceInfo)::IR.Source = IR.Source(info.fileName, info.lineNumberStart, info.columnNumberStart)
 
 #= ==================================================================================== =#
 #= Types, dimensions and subscripts                                                     =#
 #= ==================================================================================== =#
 
 "The OMJLIR type of the frontend type `ty`."
-function lowerType(ty::F.NFType)::IR.ModelicaType
+function lowerType(ty::F.ModelicaType)::IR.ModelicaType
   isvariant(ty, F.TYPE_REAL) && return IR.T_REAL()
   isvariant(ty, F.TYPE_INTEGER) && return IR.T_INTEGER()
   isvariant(ty, F.TYPE_BOOLEAN) && return IR.T_BOOLEAN()
@@ -117,7 +110,7 @@ function lowerType(ty::F.NFType)::IR.ModelicaType
   return IR.T_UNKNOWN()
 end
 
-enumerationType(ty::F.NFType)::IR.T_ENUMERATION =
+enumerationType(ty::F.ModelicaType)::IR.T_ENUMERATION =
   IR.T_ENUMERATION(pathName(ty.typePath), Symbol[Symbol(l) for l in ty.literals])
 
 """
@@ -127,7 +120,7 @@ field's dimension reads again (`a[size(r.b, 1)]` in a function on `r`: Buildings
 towers, Movers, HydronicConfigurations) is there without its fields: lowering them again
 recursed without end.
 """
-function complexType(ty::F.NFType)::IR.ModelicaType
+function complexType(ty::F.ModelicaType)::IR.ModelicaType
   local cls = ty.cls
   local name = pathName(F.scopePath(cls; includeRoot = true))
   isvariant(ty.complexTy, F.COMPLEX_EXTERNAL_OBJECT) && return IR.T_EXTERNAL_OBJECT(name)
@@ -148,7 +141,7 @@ function complexType(ty::F.NFType)::IR.ModelicaType
 end
 
 "The type of a function value: its name, its inputs' and its outputs' types."
-function functionType(fn::F.M_Function)::IR.T_FUNCTION
+function functionType(fn::F.MODELICA_FUNCTION)::IR.T_FUNCTION
   local inputs = IR.ModelicaType[lowerType(F.getType(F.component(n))) for n in fn.inputs]
   local outputs = IR.ModelicaType[lowerType(F.getType(F.component(n))) for n in fn.outputs]
   return IR.T_FUNCTION(pathName(F.nameConsiderBuiltin(fn)), inputs, outputs)
@@ -207,24 +200,24 @@ const OPS = let ops = Dict{Int, IR.Op}()
 end
 
 "The OMJLIR operator of the frontend operator `operator`."
-function lowerOp(operator::F.Operator)::IR.Op
+function lowerOp(operator::F.OPERATOR)::IR.Op
   local op = get(OPS, Int(operator.op), nothing)
   op === nothing && error("OMJLIR lowering: a user-defined operator the frontend did not resolve")
   return op
 end
 
 "The OMJLIR type of the frontend expression `e`."
-typeOfExp(e::F.NFExpression)::IR.ModelicaType = lowerType(F.typeOf(e))
+typeOfExp(e::F.Expression)::IR.ModelicaType = lowerType(F.typeOf(e))
 
 "The frontend's expressions, of a vector or a MetaModelica list."
-const Expressions = Union{AbstractVector{<:F.NFExpression}, MetaModelica.List{<:F.NFExpression}}
+const Expressions = Union{AbstractVector{<:F.Expression}, MetaModelica.List{<:F.Expression}}
 
 "The OMJLIR expressions of the frontend expressions `es`."
 lowerExps(es::Expressions)::Vector{IR.Expression} = IR.Expression[lowerExp(e) for e in es]
 
 "An optional expression (a MetaModelica `Option`): lowered, or `nothing`."
-lowerOptExp(o::MetaModelica.Option{<:F.NFExpression})::Union{Nothing, IR.Expression} =
-  o isa MetaModelica.SOME ? lowerExp(o.data) : nothing
+lowerOptExp(o::MetaModelica.Option{<:F.Expression})::Union{Nothing, IR.Expression} =
+  o isa MetaModelica.SOME ? lowerExp(o.value) : nothing
 
 "The OMJLIR expression of the frontend expression `e`."
 lowerExp(e::F.INTEGER_EXPRESSION)::IR.Expression = IR.INTEGER(e.value)
@@ -312,17 +305,17 @@ every value is a value: the code generation always took the boxed expression its
 lowerExp(e::F.BOX_EXPRESSION)::IR.Expression = lowerExp(e.exp)
 lowerExp(e::F.UNBOX_EXPRESSION)::IR.Expression = lowerExp(e.exp)
 lowerExp(e::F.MUTABLE_EXPRESSION)::IR.Expression = lowerExp(F.P_Pointer.access(e.exp))
-lowerExp(e::F.NFExpression)::IR.Expression =
+lowerExp(e::F.Expression)::IR.Expression =
   error("OMJLIR lowering: the expression $(F.toString(e)) ($(nameof(typeof(e)))) has no OMJLIR form")
 
-"`inline`: the frontend's inline types that inline the function."
-const INLINE_TYPES = (:NORM_INLINE, :BUILTIN_EARLY_INLINE, :EARLY_INLINE)
+"`inline`: the frontend's inline types (`F.InlineType`) that inline the function."
+const INLINE_TYPES = (F.NORM_INLINE, F.BUILTIN_EARLY_INLINE, F.EARLY_INLINE)
 
 "A typed call, array constructor or reduction."
 function lowerCall(call::F.Call)::IR.Expression
   if isvariant(call, F.TYPED_CALL)
     local a = call.attributes
-    local attributes = IR.CallAttributes(a.builtin, a.isImpure, nameof(typeof(a.inlineType)) in INLINE_TYPES)
+    local attributes = IR.CallAttributes(a.builtin, a.isImpure, a.inlineType in INLINE_TYPES)
     return IR.CALL(pathName(F.nameConsiderBuiltin(call.fn)), lowerExps(call.arguments),
                    lowerType(call.ty), attributes)
   elseif isvariant(call, F.TYPED_ARRAY_CONSTRUCTOR)
@@ -357,7 +350,7 @@ lowerStatements(stmts::Union{AbstractVector{<:F.Statement}, MetaModelica.List{<:
 
 "The OMJLIR statement of the frontend statement `s`."
 function lowerStatement(s::F.Statement)::IR.Statement
-  local source = lowerElementSource(s.source)
+  local source = lowerSource(s.source)
   if isvariant(s, F.ALG_ASSIGNMENT)
     return lowerAssignment(lowerExp(s.lhs), lowerExp(s.rhs), source)
   elseif isvariant(s, F.ALG_IF)
@@ -374,7 +367,7 @@ function lowerStatement(s::F.Statement)::IR.Statement
   elseif isvariant(s, F.ALG_FOR)
     local name = Symbol(F.name(s.iterator))
     MetaModelica.isSome(s.range) || error("OMJLIR lowering: a for-statement without a range")
-    local iterator = IR.Iterator(name, lowerExp(s.range.data))
+    local iterator = IR.Iterator(name, lowerExp(s.range.value))
     return IR.FOR_STATEMENT(iterator, lowerStatements(s.body), source)
   elseif isvariant(s, F.ALG_WHILE)
     return IR.WHILE_STATEMENT(lowerExp(s.condition), lowerStatements(s.body), source)
@@ -418,7 +411,7 @@ end
 
 "The OMJLIR equation of the frontend equation `eq`; `nothing` for a connect equation."
 function lowerEquation(eq::F.Equation)::Union{Nothing, IR.Equation}
-  local source = lowerElementSource(eq.source)
+  local source = lowerSource(eq.source)
   if isvariant(eq, F.EQUATION_EQUALITY) || isvariant(eq, F.EQUATION_ARRAY_EQUALITY)
     local ty = lowerType(eq.ty)
     local lhs = lowerExp(eq.lhs)
@@ -428,7 +421,7 @@ function lowerEquation(eq::F.Equation)::Union{Nothing, IR.Equation}
     ty isa IR.T_ARRAY && return IR.ARRAY_EQUATION(rhs, lhs, ty, source, ATTRIBUTES)
     return IR.SCALAR_EQUATION(lhs, rhs, ty, source, ATTRIBUTES)
   elseif isvariant(eq, F.EQUATION_CREF_EQUALITY)
-    #= A connection's equality, as the frontend's DAE conversion made it: a + (-b) = 0, of the
+    #= A connection's equality, as the previous backend had it: a + (-b) = 0, of the
        type of `a` with its subscripts (the reference's own is its last part's declared one:
        `vol.ports[1].Xi_outflow[1]` of a scalarized kept array would be `Real[1]`) =#
     local ty = lowerType(F.getSubscriptedType(eq.lhs))
@@ -438,7 +431,7 @@ function lowerEquation(eq::F.Equation)::Union{Nothing, IR.Equation}
   elseif isvariant(eq, F.EQUATION_FOR)
     local name = Symbol(F.name(eq.iterator))
     MetaModelica.isSome(eq.range) || error("OMJLIR lowering: a for-equation without a range")
-    local iterator = IR.Iterator(name, lowerExp(eq.range.data))
+    local iterator = IR.Iterator(name, lowerExp(eq.range.value))
     return IR.FOR_EQUATION(iterator, lowerEquations(eq.body; reversed = true), source, ATTRIBUTES)
   elseif isvariant(eq, F.EQUATION_IF)
     return lowerIfEquation(eq, source)
@@ -461,7 +454,7 @@ end
 
 """
 An if-equation: the branches in order, a last branch of condition `true` as the else-branch
-(as the frontend's DAE conversion did).
+(as the previous backend had it).
 """
 function lowerIfEquation(eq::F.Equation, source::IR.Source)::IR.IF_EQUATION
   local branches = IR.EquationBranch[]
@@ -495,7 +488,7 @@ end
 function whenStatements(eqs::Vector{F.Equation})::Vector{IR.Statement}
   local out = IR.Statement[]
   for eq in eqs
-    local source = lowerElementSource(eq.source)
+    local source = lowerSource(eq.source)
     if isvariant(eq, F.EQUATION_EQUALITY) || isvariant(eq, F.EQUATION_ARRAY_EQUALITY)
       push!(out, IR.ASSIGNMENT(lowerExp(eq.lhs), lowerExp(eq.rhs), source))
     elseif isvariant(eq, F.EQUATION_CREF_EQUALITY)
@@ -552,8 +545,8 @@ with the variables it may change, its prompt and the initial equations for the n
 function lowerReconfigureEquation(eq::F.Equation, source::IR.Source)::IR.WHEN_EQUATION
   local condition = lowerExp(eq.whenConditions[1])
   local components = IR.ComponentRef[IR.ComponentRef(Symbol(n)) for n in reconfigureVariableNames(eq.variables)]
-  local prompt = MetaModelica.isSome(eq.prompt) ? promptString(eq.prompt.data) : nothing
-  local initialEquations = MetaModelica.isSome(eq.initialEquations) ? serializeInitialEquations(eq.initialEquations.data) : nothing
+  local prompt = MetaModelica.isSome(eq.prompt) ? promptString(eq.prompt.value) : nothing
+  local initialEquations = MetaModelica.isSome(eq.initialEquations) ? serializeInitialEquations(eq.initialEquations.value) : nothing
   local body = IR.Statement[IR.AGENTIC_RECOMPILATION(components, prompt, initialEquations)]
   return IR.WHEN_EQUATION([whenBranch(condition, body)], IR.STRUCTURAL_WHEN, source, ATTRIBUTES)
 end
@@ -653,7 +646,7 @@ function lowerAttributes(typeAttributes::Vector{Tuple{String, F.Binding}})::IR.V
 end
 
 "The OMJLIR variable of the frontend variable `v`."
-function lowerVariable(v::F.Variable)::IR.Variable
+function lowerVariable(v::F.VARIABLE)::IR.Variable
   local cref = lowerCref(v.name)
   local ty = lowerType(v.ty)
   local a = v.attributes
@@ -668,11 +661,11 @@ end
 #= ==================================================================================== =#
 
 "The algorithm sections as ALGORITHM equations, their assigned variables their outputs."
-function lowerAlgorithms(algorithms::Vector{F.Algorithm})::Vector{IR.Equation}
+function lowerAlgorithms(algorithms::Vector{F.ALGORITHM})::Vector{IR.Equation}
   local out = IR.Equation[]
   for alg in algorithms
     local statements = lowerStatements(alg.statements)
-    push!(out, IR.ALGORITHM(statements, assignedCrefs(statements), lowerElementSource(alg.source), ATTRIBUTES))
+    push!(out, IR.ALGORITHM(statements, assignedCrefs(statements), lowerSource(alg.source), ATTRIBUTES))
   end
   return out
 end
@@ -683,8 +676,8 @@ end
 A continuous-time partition: the equations, then the algorithm sections; the initial
 equations, then the initial algorithm sections.
 """
-function lowerSystem(eqs::Vector{F.Equation}, initialEqs::Vector{F.Equation}, algorithms::Vector{F.Algorithm},
-                     initialAlgorithms::Vector{F.Algorithm})::IR.Partition
+function lowerSystem(eqs::Vector{F.Equation}, initialEqs::Vector{F.Equation}, algorithms::Vector{F.ALGORITHM},
+                     initialAlgorithms::Vector{F.ALGORITHM})::IR.Partition
   local equations = lowerEquations(eqs; reversed = true)
   append!(equations, lowerAlgorithms(algorithms))
   local initialEquations = lowerEquations(initialEqs; reversed = true)
@@ -694,7 +687,7 @@ function lowerSystem(eqs::Vector{F.Equation}, initialEqs::Vector{F.Equation}, al
 end
 
 "The variables of a flat model."
-function lowerVariables(fm::F.FlatModel)::IR.VariableSet
+function lowerVariables(fm::F.FLAT_MODEL)::IR.VariableSet
   local variables = IR.VariableSet()
   for v in fm.variables
     local lowered = lowerVariable(v)
@@ -747,7 +740,7 @@ A function in OMJLIR: its variables, its algorithm or its external clause, its d
 annotations of order 1 (the inputs zeroDerivative or noDerivative exclude by position), its
 prefixes.
 """
-function lowerFunction(fn::F.M_FUNCTION)::IR.ModelicaFunction
+function lowerFunction(fn::F.MODELICA_FUNCTION)::IR.ModelicaFunction
   local external = F.isExternal(fn) ? lowerExternal(fn) : nothing
   local body = external === nothing ? lowerStatements(F.getBody(fn)) : IR.Statement[]
   local derivatives = IR.FunctionDerivative[]
@@ -757,7 +750,7 @@ function lowerFunction(fn::F.M_FUNCTION)::IR.ModelicaFunction
     isempty(fns) && continue
     push!(derivatives, IR.FunctionDerivative(pathName(F.name(first(fns))), 1, Int[c[1] for c in d.conditions]))
   end
-  local inline = nameof(typeof(fn.attributes.inline)) in (:EARLY_INLINE, :NORM_INLINE)
+  local inline::Bool = fn.attributes.inline in (F.EARLY_INLINE, F.NORM_INLINE)
   return IR.ModelicaFunction(pathName(fn.path), functionVariables(fn.inputs), functionVariables(fn.outputs),
                              functionVariables(fn.locals), body, external, derivatives, F.isImpure(fn), inline,
                              IR.NO_SOURCE)
@@ -796,13 +789,13 @@ An external function's clause: the external function's name, language, arguments
 output, and its annotation as the flat model writes it (with the default
 `LibraryDirectory` and `IncludeDirectory` of the library).
 """
-function lowerExternal(fn::F.M_FUNCTION)::IR.ExternalDeclaration
+function lowerExternal(fn::F.MODELICA_FUNCTION)::IR.ExternalDeclaration
   local sections = F.getSections(F.getClass(fn.node))
   local output = F.isEmpty(sections.outputRef) ? nothing : lowerCref(sections.outputRef)
   local s = F.IOStream_M.create("external", F.IOStream_M.LIST())
   local flat = F.IOStream_M.string(F.toFlatStream(sections, fn.path, s; inFunction = true))
   local at = findfirst("annotation", flat)
-  return IR.ExternalDeclaration(sections.name, sections.language, lowerExps(collect(F.NFExpression, sections.args)), output,
+  return IR.ExternalDeclaration(sections.name, sections.language, lowerExps(collect(F.Expression, sections.args)), output,
                                 at === nothing ? "" : flat[first(at):end])
 end
 
@@ -815,11 +808,11 @@ partition (equations, algorithms, initial equations and algorithms), its structu
 frontend's function list). The frontend model to translate again at a structural change
 is the SCode class the frontend kept for a model with recompilations (`nothing` for another).
 """
-function lowerFlatModel(fm::F.FlatModel; functions::FunctionList = MetaModelica.nil)::IR.Model
+function lowerFlatModel(fm::F.FLAT_MODEL; functions::FunctionList = MetaModelica.nil)::IR.Model
   local variables = lowerVariables(fm)
   local initialMode = nothing
   local transitions = IR.StructuralTransition[]
-  local equations = F.NFEquationImpl[]
+  local equations = F.Equation[]
   for eq in fm.equations
     local sc = structuralCall(eq)
     if sc === nothing
@@ -840,7 +833,7 @@ function lowerFlatModel(fm::F.FlatModel; functions::FunctionList = MetaModelica.
   end
   return IR.Model(fm.name, variables, IR.Partition[system], IR.Partition[], IR.ClockKind[],
                   lowerFunctions(functions), initialMode, modes, transitions,
-                  fm.scodeProgram === nothing ? nothing : fm.scodeProgram.data)
+                  fm.scodeProgram === nothing ? nothing : fm.scodeProgram.value)
 end
 
 end # module LowerFlatModel
