@@ -50,8 +50,6 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     env:
-      # the nightly failure mail needs both mail secrets (not set: GitHub's own notification)
-      MAIL_CONFIGURED: ${{ secrets.MAIL_USERNAME != '' && secrets.MAIL_PASSWORD != '' }}
       # the depot cache's name: one per OS, arch and Julia version (the Linux shards share theirs)
       DEPOT_CACHE_NAME: ombackend-cpu-targets;os=${{ matrix.os }};arch=${{ matrix.arch }};version=${{ matrix.version }}
       # A pull request precompiles OMBackend without its workloads; test/precompileWorkloadTests.jl still runs them.
@@ -258,27 +256,6 @@ jobs:
           name: coverage-${{ matrix.group }}
           path: lcov.info
           retention-days: 14
-
-      - name: Email maintainer on nightly failure
-        if: ${{ failure() && github.event_name == 'schedule' && env.MAIL_CONFIGURED == 'true' }}
-        continue-on-error: true
-        uses: dawidd6/action-send-mail@v3
-        with:
-          server_address: smtp.gmail.com
-          server_port: 465
-          secure: true
-          username: ${{ secrets.MAIL_USERNAME }}
-          password: ${{ secrets.MAIL_PASSWORD }}
-          from: OMBackend CI <${{ secrets.MAIL_USERNAME }}>
-          to: jtinnerholm@gmail.com
-          subject: "[OMBackend nightly] ${{ matrix.os }} Julia ${{ matrix.version }} FAILED"
-          body: |
-            The nightly CI run for OMBackend.jl failed.
-
-            Workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-            Commit:       ${{ github.sha }}
-            Branch:       ${{ github.ref_name }}
-            Matrix:       ${{ matrix.os }} / Julia ${{ matrix.version }} / ${{ matrix.arch }}
 
   # The Linux shards' coverage merged: the percentage and a table per file in the job summary, the merged lcov file
   # an artifact; on master, when all shards passed, coverage.json on gh-pages for the README's badge (the action is
