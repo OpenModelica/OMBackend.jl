@@ -501,6 +501,9 @@ TEST_GROUP == "kept" || @testset "OMBackend" begin
   #= ── 20v. The model cache within its memory limit ── =#
   include("cacheTests.jl")
 
+  #= ── 20v2. A simulation from another start than its build's: built there once and cached ── =#
+  include("buildStartTests.jl")
+
   #= ── 20w. The initialization's parameters and pins by the variables' names ── =#
   include("initializationNamesTests.jl")
 

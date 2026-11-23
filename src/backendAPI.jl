@@ -996,7 +996,8 @@ end
 
 Simulate the translated model `modelName` (either name form, [`canonicalName`](@ref)) over `tspan` with `solver`
 (an OrdinaryDiffEq algorithm, `Tsit5()`; [`defaultSolver`](@ref)). `mode` is a [`BackendMode`](@ref).
-`overwriteCache` rebuilds the problem. `parameters` (name => value) sets parameters for this run: any parameter of a
+`overwriteCache` rebuilds the problem. A run from another start time than the build's (`translate` builds at 0)
+builds at `tspan[1]` once; the next run from there reuses that build. `parameters` (name => value) sets parameters for this run: any parameter of a
 model the arrays-kept path translated, the parameters kept tunable at translate time ([`withTunableParameters`](@ref),
 [`IMTK_MODE`](@ref) only) of another. The other keyword arguments go to `solve`. A violated
 `assert` throws [`ModelicaAssertionError`](@ref).
@@ -1052,9 +1053,11 @@ function simulate(modelName::String;
     #= overwriteCache forces a fresh build: bypass the codeHash reuse check so the
        cached problem is rebuilt (not just remade) before simulate. A failed
        rebuild warns and forgets the cached build; simulateIMTK then falls back
-       to the module's own simulate. =#
+       to the module's own simulate. Built at the run's start time: no second build there. =#
     if overwriteCache
-      IMTKGen._buildAndCache(modelName, getCompiledModel(modelName); overwriteCache = true)
+      IMTKGen.withBuildStart(tspan[1]) do
+        IMTKGen._buildAndCache(modelName, getCompiledModel(modelName); overwriteCache = true)
+      end
     end
     #= Reuse the build cached in the backend at translate time (no
        structural_simplify re-run); simulateIMTK falls back to module simulate. =#
