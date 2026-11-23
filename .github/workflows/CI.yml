@@ -54,6 +54,12 @@ jobs:
       MAIL_CONFIGURED: ${{ secrets.MAIL_USERNAME != '' && secrets.MAIL_PASSWORD != '' }}
       # the depot cache's name: one per OS, arch and Julia version (the Linux shards share theirs)
       DEPOT_CACHE_NAME: ombackend-cpu-targets;os=${{ matrix.os }};arch=${{ matrix.arch }};version=${{ matrix.version }}
+      # A pull request precompiles OMBackend without its workloads; test/precompileWorkloadTests.jl still runs them.
+      # OMBackend's image took 11-20 min in 037408a's run (three CPU targets, coverage); locally the workloads are 63
+      # of its 73 s. Master keeps them, as users get them.
+      OMBACKEND_NO_PRECOMPILE_WORKLOAD: ${{ github.event_name == 'pull_request' }}
+      # where master leaves its resolved versions for pull requests (the depot's logs directory: the cache saves it)
+      CI_MANIFEST: ombackend-ci-Manifest.toml
     strategy:
       fail-fast: false
       # group: OMBACKEND_TEST_GROUP (test/runtests.jl). Linux runs the whole suite in two shards, one per route of the
@@ -171,6 +177,18 @@ jobs:
           # a restored registry is as old as its cache (julia-actions/cache updates it on master; a PR's restore does not)
           Pkg.Registry.update()
 
+      # A pull request resolves the versions master's cache compiled. Else each package released since master's last
+      # run is compiled again with its dependents: 037408a's run compiled 43 packages in 33-43 min per job, SymbolicUtils
+      # 4.56.3 (released after the nightly) and the ModelingToolkit chain among them. A change of a sibling or of
+      # OMBackend's own dependencies still resolves what it needs.
+      - name: Master's resolved versions (pull request)
+        if: github.event_name == 'pull_request'
+        shell: julia --color=yes {0}
+        run: |
+          manifest = joinpath(DEPOT_PATH[1], "logs", ENV["CI_MANIFEST"])
+          println(isfile(manifest) ? "master's versions: $manifest" : "no versions from master (none cached yet)")
+          isfile(manifest) && cp(manifest, joinpath("OMBackend.jl", "Manifest.toml"); force = true)
+
       - name: Develop the sibling checkouts
         shell: julia --color=yes --project=OMBackend.jl {0}
         run: |
@@ -183,6 +201,14 @@ jobs:
         uses: julia-actions/julia-buildpkg@v1
         with:
           project: OMBackend.jl
+
+      # master's resolved versions saved with its depot cache, for pull requests (the step before the siblings)
+      - name: Keep the resolved versions with the depot cache (master)
+        if: github.event_name != 'pull_request'
+        shell: julia --color=yes {0}
+        run: |
+          mkpath(joinpath(DEPOT_PATH[1], "logs"))
+          cp(joinpath("OMBackend.jl", "Manifest.toml"), joinpath(DEPOT_PATH[1], "logs", ENV["CI_MANIFEST"]); force = true)
 
       # Which of our packages the restored depot has precompiled for the test
       # run (its flags: coverage on Linux), and why a cache is rejected
