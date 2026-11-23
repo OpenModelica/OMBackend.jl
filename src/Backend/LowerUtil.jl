@@ -37,7 +37,7 @@
     LowerUtil
 
 What the lowerings of a frontend's flat model into OMJLIR share, on OMJLIR alone: OMFrontend.jl's
-(`OMBackendOMFrontendExt`, its `LowerFlatModel`) and omc's (`OMBackendOMCompilerExt`). The scalar operators of
+(`OMBackendOMFrontendExt`, its `LowerFlatModel`) and another frontend's. The scalar operators of
 a scalarized element, assignments of tuples, calls in equation sections, when-branches and the order of a
 when-equation's statements, the variables an algorithm assigns, structural parameters, the derivatives of inlined
 functions. The order and forms of the lowered model are those `LowerFlatModel` documents.

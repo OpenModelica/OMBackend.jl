@@ -46,9 +46,10 @@ import ..SimCode
 const SC = SimCode
 
 #= The build's start time: the initialization is solved at it, and simulateIMTK remakes the
-   cached problem for a tspan from that start (another start builds again). OM.simulate
-   builds at its startTime (withBuildStart): built at 0, a simulation from another start
-   built twice, and again at each run. =#
+   cached problem for a tspan from that start. A simulation from another start builds there
+   once and caches that build (buildAt!). OM.simulate builds at its startTime at translate
+   (withBuildStart); a model translated at 0 and simulated from another start (OMBackend.simulate,
+   OMCompiler.simulate) builds twice, then reuses. =#
 const IMTK_BUILD_START = Ref(0.0)
 _buildTspan() = (IMTK_BUILD_START[], IMTK_BUILD_START[] + 1.0)
 
@@ -171,9 +172,7 @@ function _buildAndCache(modelName::String, modelCode::Expr; overwriteCache::Bool
      time (not codegen) and the start time are folded into the hash so a flag
      flip or another start still rebuilds.
      `overwriteCache` bypasses this reuse check to force a fresh rebuild. =#
-  local buildHash = hash((modelCode, IMTK_BUILD_START[], OMB.DIRECT_RHS_GENERATION[],
-                          OMB.DIRECT_JAC_GENERATION[], OMB.DIRECT_JAC_TREE_NODE_LIMIT[],
-                          OMB.DIRECT_RHS_TYPE_ERASE[]))
+  local buildHash::UInt64 = _buildHash(OMB, modelCode)
   if !overwriteCache && get(BUILT_HASH, cname, UInt64(0)) == buildHash &&
      haskey(BUILT, cname) && OMB._modelDefined(Symbol(cname))
     @info "[IMTK GEN] regenerated code unchanged; reusing compiled module + cached build" model = modelName
@@ -207,34 +206,7 @@ function _buildAndCache(modelName::String, modelCode::Expr; overwriteCache::Bool
       haskey(OMB.COMPILED_MODELS_MTK, cname) && OMB.modelEvaluated!(cname)
       return nothing
     end
-    local build = () -> Base.invokelatest() do
-      local mod = getfield(OMB, Symbol(modelName))
-      local modelFn = getfield(mod, Symbol(string(modelName, "Model")))
-      modelFn(_buildTspan())
-    end
-    #= A derivative of a call without a derivative annotation that the index reduction
-       needs: once more with the numeric partials (CodeGeneration.NUMERIC_PARTIALS). By the
-       error's type: its text is Markdown wrapped at 80 columns, and "Define a derivative"
-       broke across lines after a long call (Buildings' DerivativeCheck examples). =#
-    local res = try
-      build()
-    catch e
-      e isa OMB.CodeGeneration.Symbolics.DerivativeNotDefinedError || rethrow()
-      OMB.CodeGeneration.withNumericPartials(build)
-    end
-    BUILT[cname] = res
-    BUILT_HASH[cname] = buildHash
-    if res isa Tuple && length(res) >= 5
-      REDUCED_SYSTEMS[cname] = res[5]
-    end
-    try
-      PRISTINE_P[cname] = deepcopy(res[1].p)
-    catch _e
-      OMB._fallback(_e, :imtkPristineParameters, impact = :result)
-      delete!(PRISTINE_P, cname)
-    end
-    @info "[IMTK GEN] structural_simplify ran in backend; build cached" model = modelName
-    DUMP_ENABLED[] && _dumpReduced(OMB, modelName, cname)
+    _cacheBuild!(OMB, modelName, cname, buildHash)
   catch e
     OMB._fallback(e, :imtkBuild, impact = :result)
     #= No stale build: a previous build of this model (other tunable
@@ -243,6 +215,73 @@ function _buildAndCache(modelName::String, modelCode::Expr; overwriteCache::Bool
     @warn "[IMTK GEN] in-backend build / structural_simplify failed" model = modelName exception = e
   end
   return nothing
+end
+
+"The hash of a build (`_buildAndCache`'s reuse check): the model code, the build's start time and the flags read at build time."
+function _buildHash(OMB::Module, modelCode::Expr)::UInt64
+  return hash((modelCode, IMTK_BUILD_START[], OMB.DIRECT_RHS_GENERATION[], OMB.DIRECT_JAC_GENERATION[],
+               OMB.DIRECT_JAC_TREE_NODE_LIMIT[], OMB.DIRECT_RHS_TYPE_ERASE[]))
+end
+
+"""
+    _cacheBuild!(OMB, modelName, cname, buildHash)
+
+Invoke the evaluated module's `<name>Model(_buildTspan())` (runs structural_simplify) and cache the 9-tuple: `BUILT`,
+`BUILT_HASH`, the post-simplify System in `REDUCED_SYSTEMS` and the pristine parameters. Throws when the build fails.
+"""
+function _cacheBuild!(OMB::Module, modelName::String, cname::String, buildHash::UInt64)::Nothing
+  local build = () -> Base.invokelatest() do
+    local mod = getfield(OMB, Symbol(modelName))
+    local modelFn = getfield(mod, Symbol(string(modelName, "Model")))
+    modelFn(_buildTspan())
+  end
+  #= A derivative of a call without a derivative annotation that the index reduction
+     needs: once more with the numeric partials (CodeGeneration.NUMERIC_PARTIALS). By the
+     error's type: its text is Markdown wrapped at 80 columns, and "Define a derivative"
+     broke across lines after a long call (Buildings' DerivativeCheck examples). =#
+  local res = try
+    build()
+  catch e
+    e isa OMB.CodeGeneration.Symbolics.DerivativeNotDefinedError || rethrow()
+    OMB.CodeGeneration.withNumericPartials(build)
+  end
+  BUILT[cname] = res
+  BUILT_HASH[cname] = buildHash
+  if res isa Tuple && length(res) >= 5
+    REDUCED_SYSTEMS[cname] = res[5]
+  end
+  try
+    PRISTINE_P[cname] = deepcopy(res[1].p)
+  catch _e
+    OMB._fallback(_e, :imtkPristineParameters, impact = :result)
+    delete!(PRISTINE_P, cname)
+  end
+  @info "[IMTK GEN] structural_simplify ran in backend; build cached" model = modelName
+  DUMP_ENABLED[] && _dumpReduced(OMB, modelName, cname)
+  return nothing
+end
+
+"""
+    buildAt!(cname, t0) -> Bool
+
+Build the evaluated model `cname` again at the start time `t0` and cache that build in place of its cached build at
+another start: a simulation from `t0`, which then reuses it (its module is not evaluated again). `false` when the
+cached build is at `t0` or there is none. A failed build forgets the cached one (`_buildAndCache`).
+"""
+function buildAt!(cname::String, t0::Float64)::Bool
+  (haskey(BUILT, cname) && Float64(BUILT[cname][6][1]) != t0) || return false
+  local OMB::Module = _OMBackend()
+  withBuildStart(t0) do
+    _forgetReinit(cname)
+    try
+      _cacheBuild!(OMB, cname, cname, _buildHash(OMB, OMB.getCompiledModel(cname)))
+    catch e
+      OMB._fallback(e, :imtkBuild, impact = :result)
+      forgetBuild(cname)
+      @warn "[IMTK GEN] build at start time $(t0) failed" model = cname exception = e
+    end
+  end
+  return true
 end
 
 function _dumpReduced(OMB, modelName::String, cname::String)
@@ -294,20 +333,17 @@ function simulateIMTK(modelName::String, tspan, solver; parameters = nothing, kw
     OMB.CodeGeneration.registerModelFunctions!(OMB._modelModule(Symbol(cname)))
   end
   #= The cached build is initialized at the build's start time: another start time
-     builds again, then the same pipeline (its remake only moved tspan, and the
-     simulation started from the initial state at 0: Buildings' DerivativeCheck
-     examples from -1). =#
-  local sameStart = haskey(BUILT, cname) && Float64(tspan[1]) == Float64(BUILT[cname][6][1])
-  sameStart || parameters === nothing ||
-    error("simulating $(modelName) with `parameters` from another start time than its build's")
+     builds again (a remake only moves tspan, and the simulation started from the initial
+     state at 0: Buildings' DerivativeCheck examples from -1), once: the build at that start
+     is cached (buildAt!), so the next run from it reuses it and `parameters` apply. =#
+  buildAt!(cname, Float64(tspan[1]))
   if haskey(BUILT, cname)
     try
-      local cached = sameStart ? BUILT[cname] :
-        Base.invokelatest(getfield(OMB._modelModule(Symbol(cname)), Symbol(cname, "Model")), tspan)
+      local cached = BUILT[cname]
       local prob   = OMB.Runtime.ModelingToolkit.SciMLBase.remake(cached[1]; tspan = tspan)
       #= Restore the build-time parameter values: a previous run's affects may
          have mutated the shared vector (ifCond toggles persist otherwise). =#
-      if sameStart && haskey(PRISTINE_P, cname)
+      if haskey(PRISTINE_P, cname)
         prob = OMB.Runtime.ModelingToolkit.SciMLBase.remake(prob; p = deepcopy(PRISTINE_P[cname]))
       end
       if parameters !== nothing

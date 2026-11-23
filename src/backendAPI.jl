@@ -420,7 +420,7 @@ end
               eliminateNonDynamic = nothing, observedFilter = nothing, checkSimCode = true)
 
 The target code of a model another frontend lowered to OMJLIR and through its passes
-(`lowerOMCFlatModel`).
+(`OMBackend.Passes.runPasses!`).
 """
 function translate(model::OMJLIR.Model;
                    mode::OMBackend.BackendMode = DEFAULT_BACKEND_MODE[],
@@ -445,14 +445,6 @@ function translate(model::OMJLIR.Model;
     WARN_MISSING_START_VALUES[] = previousWarnSetting
   end
 end
-
-"""
-    lowerOMCFlatModel(flatModel, functions)::OMJLIR.Model
-
-The OMJLIR model, through its passes, of a flat model omc's frontend made: an `NFFlatModel`
-and its `NFFunction`s, read through OMCompiler.jl. Defined when OMCompiler.jl is loaded.
-"""
-function lowerOMCFlatModel end
 
 "The target code of the OMJLIR model `model` for the backend mode `mode`."
 function generateTargetCode(model::OMJLIR.Model; mode::BackendMode,
@@ -1004,7 +996,8 @@ end
 
 Simulate the translated model `modelName` (either name form, [`canonicalName`](@ref)) over `tspan` with `solver`
 (an OrdinaryDiffEq algorithm, `Tsit5()`; [`defaultSolver`](@ref)). `mode` is a [`BackendMode`](@ref).
-`overwriteCache` rebuilds the problem. `parameters` (name => value) sets parameters for this run: any parameter of a
+`overwriteCache` rebuilds the problem. A run from another start time than the build's (`translate` builds at 0)
+builds at `tspan[1]` once; the next run from there reuses that build. `parameters` (name => value) sets parameters for this run: any parameter of a
 model the arrays-kept path translated, the parameters kept tunable at translate time ([`withTunableParameters`](@ref),
 [`IMTK_MODE`](@ref) only) of another. The other keyword arguments go to `solve`. A violated
 `assert` throws [`ModelicaAssertionError`](@ref).
@@ -1060,9 +1053,11 @@ function simulate(modelName::String;
     #= overwriteCache forces a fresh build: bypass the codeHash reuse check so the
        cached problem is rebuilt (not just remade) before simulate. A failed
        rebuild warns and forgets the cached build; simulateIMTK then falls back
-       to the module's own simulate. =#
+       to the module's own simulate. Built at the run's start time: no second build there. =#
     if overwriteCache
-      IMTKGen._buildAndCache(modelName, getCompiledModel(modelName); overwriteCache = true)
+      IMTKGen.withBuildStart(tspan[1]) do
+        IMTKGen._buildAndCache(modelName, getCompiledModel(modelName); overwriteCache = true)
+      end
     end
     #= Reuse the build cached in the backend at translate time (no
        structural_simplify re-run); simulateIMTK falls back to module simulate. =#
@@ -1238,6 +1233,23 @@ function pristineParameters(modelName::String)
   _arrayModelModule(canonicalName(modelName)) === nothing || return copy(getMTKProblem(modelName)[1].p.values)
   local p = get(IMTKGen.PRISTINE_P, canonicalName(modelName), nothing)
   return p === nothing ? nothing : deepcopy(p)
+end
+
+"""
+    buildId(modelName) -> UInt64
+
+The identity of the current build of the translated model `modelName` (either name form, [`canonicalName`](@ref)):
+the hash of the code [`translate`](@ref) generated for it. A translation that generates the same code keeps it; one
+that replaces the model by other code under the same name (other equations, other settings) changes it. A caller
+that keeps a build by name (a parametric model simulated by name) compares it with the identity of the build it made
+and translates again when they differ. An `ArgumentError` for a model not translated ([`availableModels`](@ref)).
+"""
+function buildId(modelName::String)::UInt64
+  local name::String = canonicalName(modelName)
+  local builds::Dict{String, Tuple{Expr, Bool, UInt64}} =
+    name in ARRAY_PRESERVE_DE_MODELS ? COMPILED_MODELS_ARRAY_PRESERVE_DE : COMPILED_MODELS_MTK
+  haskey(builds, name) || throw(ArgumentError("$modelName is not translated (OMBackend.translate first)"))
+  return builds[name][3]
 end
 
 """

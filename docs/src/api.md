@@ -45,6 +45,7 @@ builds on these (parametric models, surrogates, neural blocks trained in the com
 OMBackend.withTunableParameters
 OMBackend.isTunable
 OMBackend.pristineParameters
+OMBackend.buildId
 ```
 
 ## Inspect and write models

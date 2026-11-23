@@ -23,47 +23,14 @@ simulated with DifferentialEquations.jl and ModelingToolkit.jl.
 
 ## Frontends
 
-The backend does not depend on a frontend. A frontend's flat model reaches OMJLIR
-through a package extension, which Julia loads when the frontend's package is
-loaded next to OMBackend:
+The backend does not depend on a frontend. It takes a model in OMJLIR:
 
-| Frontend | Load | Extension | Call |
-|:---|:---|:---|:---|
-| [OMFrontend.jl](https://github.com/OpenModelica/OMFrontend.jl), in Julia | `import OMFrontend` | `OMBackendOMFrontendExt` | `OMBackend.translate(fm; functionList = ...)`, see [Getting started](getting-started.md) |
-| omc, through [OMCompiler.jl](https://github.com/OpenModelica/OpenModelica/tree/master/OMCompiler/Compiler/OpenModelica.rs/OMCompiler.jl) (experimental) | `import OMCompiler` | `OMBackendOMCompilerExt` | `OMBackend.translate(OMBackend.lowerOMCFlatModel(model, functions))` |
+| Frontend | Load | Call |
+|:---|:---|:---|
+| [OMFrontend.jl](https://github.com/OpenModelica/OMFrontend.jl), in Julia | `import OMFrontend`: Julia loads the package extension `OMBackendOMFrontendExt`, which lowers OMFrontend's flat model to OMJLIR | `OMBackend.translate(fm; functionList = ...)`, see [Getting started](getting-started.md) |
+| Another frontend | its own package, which lowers its flat model to OMJLIR | `OMBackend.translate(model::OMJLIR.Model)` |
 
 On both routes [`OMBackend.simulate`](@ref) then runs the model by name.
-
-### omc (experimental)
-
-OMCompiler.jl loads omc's compiler library into Julia. It is not registered:
-develop it from an OpenModelica checkout. It needs the install tree
-(`install_cmake`) of a build with `-DOM_OMC_ENABLE_RUST=ON`, in
-`OPENMODELICAHOME` or passed as `OMCompiler.init(omhome = ...)`.
-`lowerOMCFlatModel` is not yet part of the [public API](api.md).
-
-```julia
-import Pkg  # once
-Pkg.develop(path = "<OpenModelica>/OMCompiler/Compiler/OpenModelica.rs/OMCompiler.jl")
-```
-
-```julia
-begin
-  import OMCompiler, OMBackend
-  OMCompiler.init()  # the install tree in ENV["OPENMODELICAHOME"]
-  write("Decay.mo", """
-    model Decay
-      Real x(start = 1, fixed = true);
-    equation
-      der(x) = -x;
-    end Decay;
-    """)
-  OMCompiler.evaluate("""loadFile("Decay.mo")""")
-  (model, functions) = OMCompiler.instantiate("Decay")
-  OMBackend.translate(OMBackend.lowerOMCFlatModel(model, functions))
-  OMBackend.simulate("Decay"; tspan = (0.0, 1.0))
-end
-```
 
 ## Where to read next
 
