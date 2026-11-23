@@ -40,7 +40,7 @@ OMFrontend.jl's flat model through OMBackend, loaded with OMFrontend: the loweri
 the backend's entry points on the FlatModel (`translate`, `omjlirModel`,
 `explainIndexReduction`, ...; translate.jl), the frontend's part of a recompilation at a structural change
 (`Recompilation`), the URI resolution of external functions' include directories, and the translate precompile
-workload. OMBackend alone takes OMJLIR (`translate(::OMJLIR.Model)`; omc's frontend through OMBackendOMCompilerExt).
+workload. OMBackend alone takes OMJLIR (`translate(::OMJLIR.Model)`), which another frontend lowers its model to.
 """
 module OMBackendOMFrontendExt
 

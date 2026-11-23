@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 560" width="800" height="560" role="img" aria-labelledby="t d">
   <title id="t">From Modelica source to a simulation with OMBackend</title>
-  <desc id="d">Two frontends, OMFrontend.jl and omc through OMCompiler.jl, give a flat model to OMBackend.translate, which lowers it to OMJLIR, runs the passes, builds SimCode and generates the code. The compiled model is then simulated, resimulated with new parameters, or turned into an ODEProblem.</desc>
+  <desc id="d">OMFrontend.jl gives a flat model to OMBackend.translate, and another frontend gives a model already lowered to OMJLIR; OMBackend lowers the flat model to OMJLIR, runs the passes, builds SimCode and generates the code. The compiled model is then simulated, resimulated with new parameters, or turned into an ODEProblem.</desc>
   <defs>
     <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
       <path d="M0,0 L10,5 L0,10 z" fill="#1d3f73"/>
@@ -27,21 +27,20 @@
   <text x="250" y="40" class="sub">runs every step below for a model name or file</text>
 
   <!-- Frontends -->
-  <text x="24" y="80" class="tag">FRONTEND (PACKAGE EXTENSION)</text>
+  <text x="24" y="80" class="tag">FRONTEND</text>
   <rect x="24" y="90" width="360" height="62" rx="8" class="box"/>
   <text x="40" y="114" class="label">OMFrontend.jl</text>
   <text x="40" y="136" class="sub">Modelica source → flat model <tspan class="code">fm</tspan></text>
   <rect x="416" y="90" width="360" height="62" rx="8" class="box" stroke-dasharray="6 4"/>
-  <text x="432" y="114" class="label">omc through OMCompiler.jl</text>
-  <text x="640" y="114" class="sub">experimental</text>
-  <text x="432" y="136" class="sub">Modelica source → <tspan class="code">NFFlatModel</tspan> + functions</text>
+  <text x="432" y="114" class="label">Another frontend</text>
+  <text x="432" y="136" class="sub">Modelica source → its flat model → OMJLIR</text>
 
   <path d="M204,152 V214" class="flow"/>
   <text x="214" y="178" class="sub">OMBackendOMFrontendExt</text>
   <text x="214" y="198" class="code">translate(fm; functionList)</text>
   <path d="M436,152 V214" class="flow"/>
-  <text x="446" y="178" class="sub">OMBackendOMCompilerExt</text>
-  <text x="446" y="198" class="code">translate(lowerOMCFlatModel(model, functions))</text>
+  <text x="446" y="178" class="sub">the frontend's own package</text>
+  <text x="446" y="198" class="code">translate(model::OMJLIR.Model)</text>
 
   <!-- The backend -->
   <rect x="24" y="218" width="752" height="128" rx="10" class="soft"/>

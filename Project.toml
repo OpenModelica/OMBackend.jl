@@ -1,6 +1,6 @@
 name = "OMBackend"
 uuid = "9400bd5f-7561-42f6-8760-03756753da50"
-version = "1.1.0"
+version = "1.2.0"
 authors = ["John Tinnerholm <johti17@liu.se>", "Karim Abdelhak <karim.abdelhak@fh-bielefeld.de>", "AnHeuermann <andreas.heuermann@fh-bielefeld.de>"]
 
 [deps]
@@ -30,13 +30,11 @@ Symbolics = "0c5d862f-8b57-4792-8d23-62f2024744c7"
 [weakdeps]
 JuliaFormatter = "98e50ef6-434e-11e9-1051-2b60c6c9e899"
 MetaModelica = "9d7f2a79-07b5-5542-8b19-c0100dda6b06"
-OMCompiler = "5eee2e4c-d6e4-4c2a-a3d5-a5d6acef407f"
 OMFrontend = "b10394b5-f439-4073-a0c5-e09cb00cf46c"
 Plots = "91a5bcdd-55d7-5caf-9e0b-520d859cae80"
 
 [extensions]
 OMBackendJuliaFormatterExt = "JuliaFormatter"
-OMBackendOMCompilerExt = "OMCompiler"
 OMBackendOMFrontendExt = ["OMFrontend", "MetaModelica"]
 OMBackendPlotsExt = "Plots"
 
@@ -46,7 +44,6 @@ DiffEqBase = "7.21.2"
 MetaModelica = "2"
 ModelingToolkit = "11.21"
 NonlinearSolve = "4"
-OMCompiler = "0.1"
 OMFrontend = "3"
 OMRuntimeExternalC = "1"
 OrdinaryDiffEqBDF = "2.4.14"

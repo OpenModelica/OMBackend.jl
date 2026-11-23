@@ -420,7 +420,7 @@ end
               eliminateNonDynamic = nothing, observedFilter = nothing, checkSimCode = true)
 
 The target code of a model another frontend lowered to OMJLIR and through its passes
-(`lowerOMCFlatModel`).
+(`OMBackend.Passes.runPasses!`).
 """
 function translate(model::OMJLIR.Model;
                    mode::OMBackend.BackendMode = DEFAULT_BACKEND_MODE[],
@@ -445,14 +445,6 @@ function translate(model::OMJLIR.Model;
     WARN_MISSING_START_VALUES[] = previousWarnSetting
   end
 end
-
-"""
-    lowerOMCFlatModel(flatModel, functions)::OMJLIR.Model
-
-The OMJLIR model, through its passes, of a flat model omc's frontend made: an `NFFlatModel`
-and its `NFFunction`s, read through OMCompiler.jl. Defined when OMCompiler.jl is loaded.
-"""
-function lowerOMCFlatModel end
 
 "The target code of the OMJLIR model `model` for the backend mode `mode`."
 function generateTargetCode(model::OMJLIR.Model; mode::BackendMode,

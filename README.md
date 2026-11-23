@@ -12,9 +12,9 @@ The flat model of OMFrontend.jl is lowered to OMJLIR by the package extension
 `OMBackendOMFrontendExt` (`ext/OMBackendOMFrontendExt`), which Julia loads when
 OMFrontend is loaded: the lowering, `translate(fm)` and the other entry points
 on the frontend's flat model, the frontend's part of a recompilation at a
-structural change, and the translate precompile workload. omc's flat model goes
-through `OMBackendOMCompilerExt` (with OMCompiler.jl). Without either,
-`OMBackend.translate` takes an `OMJLIR.Model`.
+structural change, and the translate precompile workload. Without it,
+`OMBackend.translate` takes an `OMJLIR.Model`, which another frontend lowers its
+flat model to.
 
 # Requirements
 
