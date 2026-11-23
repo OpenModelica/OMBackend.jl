@@ -504,6 +504,9 @@ TEST_GROUP == "kept" || @testset "OMBackend" begin
   #= ── 20v2. A simulation from another start than its build's: built there once and cached ── =#
   include("buildStartTests.jl")
 
+  #= ── 20v3. The identity of a model's current build ── =#
+  include("buildIdTests.jl")
+
   #= ── 20w. The initialization's parameters and pins by the variables' names ── =#
   include("initializationNamesTests.jl")
 

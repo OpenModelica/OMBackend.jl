@@ -69,7 +69,7 @@ public translate, BackendMode, IMTK_MODE, MTK_MODE, EliminationOptions, explainI
   scalarizedFallbackReason, canonicalName
 public simulate, resimulate, getMTKProblem, defaultSolver, daeFallbackSolver, variableValues,
   eventCallbacks, isEventCallback, isStepControl, ModelicaAssertionError, plot
-public withTunableParameters, isTunable, pristineParameters
+public withTunableParameters, isTunable, pristineParameters, buildId
 public availableModels, printModel, modelToString, writeModelToFile
 public clearCaches!, forgetModel
 #= The names 1.0 renamed, kept for 1.x with a deprecation warning: not public. =#

@@ -1236,6 +1236,23 @@ function pristineParameters(modelName::String)
 end
 
 """
+    buildId(modelName) -> UInt64
+
+The identity of the current build of the translated model `modelName` (either name form, [`canonicalName`](@ref)):
+the hash of the code [`translate`](@ref) generated for it. A translation that generates the same code keeps it; one
+that replaces the model by other code under the same name (other equations, other settings) changes it. A caller
+that keeps a build by name (a parametric model simulated by name) compares it with the identity of the build it made
+and translates again when they differ. An `ArgumentError` for a model not translated ([`availableModels`](@ref)).
+"""
+function buildId(modelName::String)::UInt64
+  local name::String = canonicalName(modelName)
+  local builds::Dict{String, Tuple{Expr, Bool, UInt64}} =
+    name in ARRAY_PRESERVE_DE_MODELS ? COMPILED_MODELS_ARRAY_PRESERVE_DE : COMPILED_MODELS_MTK
+  haskey(builds, name) || throw(ArgumentError("$modelName is not translated (OMBackend.translate first)"))
+  return builds[name][3]
+end
+
+"""
     _arrayModelModule(modelName) -> Union{Nothing, Module}
 
 The module of the model `modelName` (canonical) the arrays-kept path translated, evaluated where it is not yet or

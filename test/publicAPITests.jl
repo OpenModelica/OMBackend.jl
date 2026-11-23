@@ -10,7 +10,7 @@ const PUBLIC_API_NAMES = Symbol[
   :simulate, :resimulate, :getMTKProblem, :defaultSolver, :daeFallbackSolver, :variableValues,
   :eventCallbacks, :isEventCallback, :isStepControl, :ModelicaAssertionError, :plot,
   #= tunable parameters (OMSurrogates) =#
-  :withTunableParameters, :isTunable, :pristineParameters,
+  :withTunableParameters, :isTunable, :pristineParameters, :buildId,
   #= inspect and write models =#
   :availableModels, :printModel, :modelToString, :writeModelToFile,
   #= caches =#
