@@ -1,0 +1,90 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 560" width="800" height="560" role="img" aria-labelledby="t d">
+  <title id="t">From Modelica source to a simulation with OMBackend</title>
+  <desc id="d">OMFrontend.jl gives a flat model to OMBackend.translate, and another frontend gives a model already lowered to OMJLIR; OMBackend lowers the flat model to OMJLIR, runs the passes, builds SimCode and generates the code. The compiled model is then simulated, resimulated with new parameters, or turned into an ODEProblem.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#1d3f73"/>
+    </marker>
+    <style>
+      .title { font: 600 15px "Inter", "Helvetica Neue", Arial, sans-serif; fill: #0f1b2d; }
+      .label { font: 600 14px "Inter", "Helvetica Neue", Arial, sans-serif; fill: #0f1b2d; }
+      .sub { font: 12.5px "Inter", "Helvetica Neue", Arial, sans-serif; fill: #3d4a5c; }
+      .code { font: 12px "JuliaMono", "SFMono-Regular", Menlo, Consolas, monospace; fill: #1d3f73; }
+      .codew { font: 12px "JuliaMono", "SFMono-Regular", Menlo, Consolas, monospace; fill: #ffffff; }
+      .tag { font: 600 10.5px "Inter", "Helvetica Neue", Arial, sans-serif; fill: #1f5fbf; letter-spacing: 0.06em; }
+      .box { fill: #ffffff; stroke: #1f5fbf; stroke-width: 1.5; }
+      .soft { fill: #eaf1fb; stroke: #9db8e0; stroke-width: 1; }
+      .dark { fill: #1d3f73; }
+      .flow { stroke: #1d3f73; stroke-width: 1.6; fill: none; marker-end: url(#arrow); }
+    </style>
+  </defs>
+  <rect x="0" y="0" width="800" height="560" rx="12" fill="#ffffff"/>
+
+  <!-- OM.jl drives every step -->
+  <rect x="24" y="18" width="752" height="34" rx="6" class="soft"/>
+  <text x="40" y="40" class="label">OM.jl</text>
+  <text x="92" y="40" class="code">OM.simulate("Model")</text>
+  <text x="250" y="40" class="sub">runs every step below for a model name or file</text>
+
+  <!-- Frontends -->
+  <text x="24" y="80" class="tag">FRONTEND</text>
+  <rect x="24" y="90" width="360" height="62" rx="8" class="box"/>
+  <text x="40" y="114" class="label">OMFrontend.jl</text>
+  <text x="40" y="136" class="sub">Modelica source → flat model <tspan class="code">fm</tspan></text>
+  <rect x="416" y="90" width="360" height="62" rx="8" class="box" stroke-dasharray="6 4"/>
+  <text x="432" y="114" class="label">Another frontend</text>
+  <text x="432" y="136" class="sub">Modelica source → its flat model → OMJLIR</text>
+
+  <path d="M204,152 V214" class="flow"/>
+  <text x="214" y="178" class="sub">OMBackendOMFrontendExt</text>
+  <text x="214" y="198" class="code">translate(fm; functionList)</text>
+  <path d="M436,152 V214" class="flow"/>
+  <text x="446" y="178" class="sub">the frontend's own package</text>
+  <text x="446" y="198" class="code">translate(model::OMJLIR.Model)</text>
+
+  <!-- The backend -->
+  <rect x="24" y="218" width="752" height="128" rx="10" class="soft"/>
+  <text x="40" y="242" class="tag">OMBACKEND</text>
+  <text x="122" y="242" class="code">translate</text>
+  <rect x="40" y="256" width="160" height="72" rx="8" class="box"/>
+  <text x="56" y="282" class="label">OMJLIR</text>
+  <text x="56" y="304" class="sub">the backend's own IR</text>
+  <rect x="226" y="256" width="168" height="72" rx="8" class="box"/>
+  <text x="242" y="282" class="label">Passes</text>
+  <text x="242" y="302" class="sub">index reduction,</text>
+  <text x="242" y="318" class="sub">matching, sorting</text>
+  <rect x="420" y="256" width="148" height="72" rx="8" class="box"/>
+  <text x="436" y="282" class="label">SimCode</text>
+  <text x="436" y="304" class="sub">simulation code</text>
+  <rect x="594" y="256" width="166" height="72" rx="8" class="box"/>
+  <text x="610" y="282" class="label">Code generation</text>
+  <text x="610" y="304" class="code">IMTK_MODE</text>
+  <text x="610" y="320" class="sub">or <tspan class="code">MTK_MODE</tspan></text>
+  <path d="M200,292 H222" class="flow"/>
+  <path d="M394,292 H416" class="flow"/>
+  <path d="M568,292 H590" class="flow"/>
+
+  <path d="M400,346 V392" class="flow"/>
+  <text x="412" y="374" class="sub">the compiled model, kept by its name</text>
+
+  <!-- Running it -->
+  <text x="24" y="390" class="tag">RUN</text>
+  <rect x="24" y="398" width="240" height="66" rx="8" class="box"/>
+  <text x="40" y="422" class="code">simulate(name; tspan)</text>
+  <text x="40" y="446" class="sub">solve once → <tspan class="code">ODESolution</tspan></text>
+  <rect x="280" y="398" width="240" height="66" rx="8" class="box"/>
+  <text x="296" y="422" class="code">resimulate(name; parameters)</text>
+  <text x="296" y="446" class="sub">new values, no new translation</text>
+  <rect x="536" y="398" width="240" height="66" rx="8" class="box"/>
+  <text x="552" y="422" class="code">getMTKProblem(name)</text>
+  <text x="552" y="446" class="sub">problem + callbacks, solve yourself</text>
+
+  <path d="M144,464 V496" class="flow"/>
+  <path d="M400,464 V496" class="flow"/>
+  <path d="M656,464 V496" class="flow"/>
+  <rect x="24" y="500" width="752" height="40" rx="8" class="dark"/>
+  <text x="40" y="525" class="codew">variableValues(sol, "x")</text>
+  <text x="244" y="525" class="codew">plot(sol)</text>
+  <text x="340" y="525" class="codew">eventCallbacks(name)</text>
+  <text x="520" y="525" class="codew">availableModels()</text>
+</svg>
