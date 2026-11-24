@@ -65,9 +65,6 @@ function ensureArray(x)
   end
 end
 
-#= Alias for backwards compatibility with existing code =#
-const ensureMatrix = ensureArray
-
 """
   Compute dot product of two vectors.
   This is a wrapper for sum(a .* b) that works with any numeric vectors.

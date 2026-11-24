@@ -114,18 +114,6 @@ function createNewU0(symsOfOldProblem::Vector{Symbol},
   return newU0
 end
 
-
-
-"""
-```
-isReturnCodeSuccess(integrator)
-```
-Returns true if the current return code of the supplied integrator argument is `Success`.
-"""
-function isReturnCodeSuccess(integrator)
-  integrator.sol.retcode == ReturnCode.Success
-end
-
 function getUnknowns(integrator)
   return [u for u in ModelingToolkit.unknowns(integrator.f.sys)]
 end

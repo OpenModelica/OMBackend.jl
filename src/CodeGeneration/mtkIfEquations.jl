@@ -158,10 +158,6 @@ function _ifConditionDependsOnTime(condition::SC.Exp)::Bool
   return "time" in refs
 end
 
-#= _ifConditionAllDiscreteOrParameter / _allBranchConditionsDiscrete live in the
-   MTK_CodeGenerationUtil submodule (generateIfExpressions needs them); call them
-   here as MTK_CodeGenerationUtil._allBranchConditionsDiscrete. =#
-
 """
     _ifConditionIsPureTimeEvent(condition, simCode) -> Bool
 

@@ -1974,15 +1974,6 @@ function _crefNamesOutsideNoEvent!(out::OrderedSet{String}, e::SC.Exp)::OrderedS
 end
 
 """
-True when every non-else branch condition of an if-equation is discrete/parameter, so the
-residual gates directly on the boolean condition instead of emitting a continuous ifCond
-relay callback.
-"""
-function _allBranchConditionsDiscrete(branches::AbstractVector{<:SC.BRANCH}, simCode::SC.SIM_CODE)::Bool
-  return all(b -> b.targets == -1 || _ifConditionAllDiscreteOrParameter(b.condition, simCode), branches)
-end
-
-"""
 Residuals pair across branches by the variable their causalized form defines, with the
 positional index only as a fallback: source-order differences between sibling branches
 (hoisted nested ifs, lifted if-expressions) made pure positional pairing relay the wrong

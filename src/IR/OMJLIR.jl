@@ -1200,11 +1200,6 @@ function Base.filter!(f::F, set::VariableSet)::VariableSet where {F}
   return set
 end
 
-"The variables of `set` of kind `K`."
-function variablesOfKind(set::VariableSet, ::Type{K})::Vector{Variable} where {K <: VariableKind}
-  return Variable[v for v in set.variables if v.kind isa K]
-end
-
 isState(v::Variable)::Bool = v.kind isa STATE
 isParameter(v::Variable)::Bool = v.kind isa PARAMETER
 isConstant(v::Variable)::Bool = v.kind isa CONSTANT
@@ -1497,9 +1492,6 @@ struct SubClock <: Node
   solverMethod::Union{Nothing, String}
 end
 
-"The clock that ticks with its base clock."
-const IDENTITY_SUBCLOCK = SubClock(1 // 1, 0 // 1, nothing)
-
 "Evaluated at the ticks of the sub-clock `subClock` of base clock `baseClock`."
 struct CLOCKED_PARTITION <: Association
   baseClock::Int
@@ -1673,7 +1665,6 @@ dimensions(ty::T_SLICE)::Vector{Dimension} = dimensions(ty.of)[1:end - length(ty
 dimensions(::ModelicaType)::Vector{Dimension} = Dimension[]
 
 isArray(ty::ModelicaType)::Bool = ty isa T_ARRAY
-isScalar(ty::ModelicaType)::Bool = !(ty isa T_ARRAY)
 
 #= ==================================================================================== =#
 #= Traversal                                                                            =#

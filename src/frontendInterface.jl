@@ -77,8 +77,8 @@ function omjlirModel end
 
 A flat model with arrays kept lowered with its arrays, through the passes (`runPassesKeepingArrays!`:
 its array equations as for-equations), its index reduced in array form where above one, its states
-committed in array form (`Passes.IndexReduction.reduceIndexArrays!`; a model without arrays to keep of
-index 1 the same, `commitIndexOne!`, for the array code only): what the array code
+committed in array form (`Passes.IndexReduction.reduceIndexArrays!`; a model without arrays to keep the
+same, with `arrays = false`): what the array code
 (`generateReducedArrayPreserveDETargetCode`) or the scalarized form (`scalarizedReducedModel`) is made from.
 `nothing` where the array form does not take the model (switched off, no arrays to keep and of index
 above one, of index 1 with clocked partitions, of index above one with an if-expression that reads a

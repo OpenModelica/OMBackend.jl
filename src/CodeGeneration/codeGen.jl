@@ -42,12 +42,6 @@
 =#
 
 """
-  Contains the headerstring defining the OpenModelica copyright notice.
-"""
-const HEADER_STRING ="
-  $(copyrightString())"
-
-"""
 An elsewhen arm as a when-equation of its own, `nothing` for none.
 """
 _elsewhenInner(::Nothing) = nothing

@@ -1140,21 +1140,6 @@ function reduceIndexArrays!(model::IR.Model; arrays::Bool = true)::Bool
 end
 
 """
-    commitIndexOne!(model) -> Bool
-
-A model without continuous arrays (on the arrays-kept route, for the array code) of index 1 committed as
-`reduceIndexArrays!` commits one: the plan that differentiates nothing, its states, their derivative variables and
-links. False, the model not changed, where its index is above one (the scalarized path reduces it).
-"""
-function commitIndexOne!(model::IR.Model)::Bool
-  local view::Scalarized = scalarizeArrays(model)
-  local written::Plan = plan(view.model, view.model.continuous[1]; indexOne = true, initialDerivatives = true)
-  isempty(written.differentiated) || return false
-  commitArrayPlan!(model, view, written)
-  return true
-end
-
-"""
     applyCarriedArrays!(variables, E, carried) -> Nothing
 
 `applyCarried!` for the arrays that declare no start: a state array with elements of a carried start, and an array

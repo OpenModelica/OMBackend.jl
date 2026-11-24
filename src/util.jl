@@ -127,8 +127,6 @@ macro BACKEND_PERFLOG(label, expr)
   end
 end
 
-const COMPONENT_SEPARATOR = "_"
-
 """
     canonicalName(name::AbstractString) -> String
 

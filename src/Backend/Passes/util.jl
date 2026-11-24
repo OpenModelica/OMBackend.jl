@@ -100,9 +100,6 @@ isRecordType(ty::IR.ModelicaType)::Bool = ty isa IR.T_RECORD
 
 #= Expressions =#
 
-"Whether `e` mentions `initial()`."
-mentionsInitial(e::IR.Expression)::Bool = IR.anyExp(isInitialCall, e)
-
 "Whether `e` is the built-in variable `time`."
 isTime(e::IR.Expression)::Bool = e isa IR.CREF && e.cref.name === :time
 

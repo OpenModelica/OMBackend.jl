@@ -234,17 +234,6 @@ function partialDerivative(eq::IR.Equation, name::Symbol, functions::Dict{Symbol
   end
 end
 
-"""
-    jacobianEntry(eq, name, functions, values) -> Union{Nothing, Float64}
-
-`partialDerivative` at the start values; `nothing` where it does not evaluate (an if-equation,
-an unknown value).
-"""
-function jacobianEntry(eq::IR.Equation, name::Symbol, functions::Dict{Symbol, IR.ModelicaFunction}, values::StartValues)::Union{Nothing, Float64}
-  local d = partialDerivative(eq, name, functions)
-  return d === nothing ? nothing : evaluate(d, values)
-end
-
 "Whether `e` reads no continuous variable of `s` (nor `time`): a constant entry of a Jacobian."
 function isConstantEntry(e::IR.Expression, s::Structure)::Bool
   return !IR.anyExp((x::IR.Expression) -> x isa IR.CREF && (x.cref.name === :time || haskey(s.index, x.cref.name)), e)
