@@ -318,15 +318,9 @@ function substituteArrayAliases!(model::IR.Model, view::Scalarized)::AliasUndo
     local e::IR.CREF = IR.CREF(cref, x.ty)
     return r.negated ? IR.UNARY(IR.UMINUS, e, x.ty) : e
   end
-  local reads = (eq::IR.Equation) -> begin
-    local found::Bool = false
-    IR.foreachRootExp(eq) do @nospecialize(e::IR.Expression)
-      found || (found = IR.anyExp((@nospecialize(x::IR.Expression)) ->
-                                    x isa IR.CREF && haskey(replacements, first(aliasReference(x.cref, variables))), e))
-      nothing
-    end
-    found
-  end
+  local reads = (eq::IR.Equation) ->
+    IR.anyExp((@nospecialize(x::IR.Expression)) ->
+                x isa IR.CREF && haskey(replacements, first(aliasReference(x.cref, variables))), eq)
   partition.equations = IR.Equation[rewriteAliasLeaves(eq, (i, Int[]), kept, substitute, reads)
                                     for (i, eq) in enumerate(partition.equations)]
   local noLeaves::Set{EquationLeaf} = Set{EquationLeaf}()

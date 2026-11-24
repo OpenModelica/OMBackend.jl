@@ -2113,24 +2113,32 @@ function _functionDefinitions(mfs::Vector{SimCode.ModelicaFunction})
     ns("the model's functions: " * first(sprint(showerror, err), 160))
   end
   for (mf, ex, nm) in zip(mfs, exprs, names)
-    local impl = nothing
-    local find = function (x)
-      x isa Expr || return
-      #= MODELICA_FUNCTION_IMPLS[:name] = impl (FUNCTION_DERIVATIVE_RULES[:name] = (derivative,
-         inputs) is one too: the rule became the function, "Tuple not callable") =#
-      if x.head == :(=) && x.args[1] isa Expr && x.args[1].head == :ref && x.args[1].args[end] == QuoteNode(Symbol(nm)) &&
-         endswith(string(x.args[1].args[1]), "MODELICA_FUNCTION_IMPLS")
-        impl = x.args[2]
-      else
-        foreach(find, x.args)
-      end
-    end
-    find(ex)
+    local impl = _functionImplOf(ex, nm)
     impl === nothing && ns("the code of function $(nm)")
     push!(defs, :(const $(Symbol(nm)) = $impl))
     outs[nm] = length(mf.outputs)
   end
   return (defs, outs)
+end
+
+"""
+The implementation of the function `nm` in its generated code `x` (`_functionDefinitions`): the right side of the last
+`MODELICA_FUNCTION_IMPLS[:nm] = impl`; `nothing` if there is none.
+"""
+function _functionImplOf(@nospecialize(x), nm::String)
+  x isa Expr || return nothing
+  #= MODELICA_FUNCTION_IMPLS[:name] = impl (FUNCTION_DERIVATIVE_RULES[:name] = (derivative,
+     inputs) is one too: the rule became the function, "Tuple not callable") =#
+  if x.head == :(=) && x.args[1] isa Expr && x.args[1].head == :ref && x.args[1].args[end] == QuoteNode(Symbol(nm)) &&
+     endswith(string(x.args[1].args[1]), "MODELICA_FUNCTION_IMPLS")
+    return x.args[2]
+  end
+  local impl = nothing
+  for a in x.args
+    local found = _functionImplOf(a, nm)
+    found === nothing || (impl = found)
+  end
+  return impl
 end
 
 "The sample() calls of `x` into `samples`, by their number (the call's third argument)."

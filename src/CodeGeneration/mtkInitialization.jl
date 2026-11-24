@@ -562,21 +562,29 @@ end
 The iterators of the for loops of the early initial algorithms.
 """
 function _initAlgIterators(simCode::SC.SIM_CODE)::Set{String}
-  local out = Set{String}()
-  local walk! = nothing
-  walk! = (body::Vector{SC.Statement}) -> foreach(body) do s
+  local out::Set{String} = Set{String}()
+  for ia in _earlyInitialAlgorithms(simCode)
+    _forIterators!(out, ia.statements)
+  end
+  return out
+end
+
+"The iterators of the for-statements in `body` (nested ones too) into `out`."
+function _forIterators!(out::Set{String}, body::Vector{SC.Statement})::Nothing
+  for s::SC.Statement in body
     if s isa SC.FOR
       push!(out, String(s.iterator.name))
-      walk!(s.body)
+      _forIterators!(out, s.body)
     elseif s isa SC.IF
-      foreach(b -> walk!(b.body), s.branches)
-      walk!(s.elseBody)
+      for b in s.branches
+        _forIterators!(out, b.body)
+      end
+      _forIterators!(out, s.elseBody)
     elseif s isa SC.WHILE
-      walk!(s.body)
+      _forIterators!(out, s.body)
     end
   end
-  foreach(ia -> walk!(ia.statements), _earlyInitialAlgorithms(simCode))
-  return out
+  return nothing
 end
 
 """

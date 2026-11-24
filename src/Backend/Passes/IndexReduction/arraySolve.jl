@@ -372,31 +372,37 @@ end
 
 "A cycle among the templates' reads reachable from `target` (depth first), or the reads of `target`: for a refusal."
 function readChain(target::Symbol, E::Elements, templates::Dict{Symbol, SolvedTemplate})::String
-  local readsOf::Function = (t::Symbol) -> begin
-    local reads::Vector{Symbol} = Symbol[]
-    IR.foreachExp(x::IR.Expression -> (local s::Union{Nothing, Symbol} = solvedTarget(x, E, templates); (s === nothing || s in reads) || push!(reads, s); nothing),
-                  templates[t].value)
-    reads
-  end
-  local stack::Vector{Symbol} = Symbol[]
-  local done::Set{Symbol} = Set{Symbol}()
   local cycle::Vector{Symbol} = Symbol[]
-  local visit::Function = function (t::Symbol)
-    t in done && return false
-    local at::Union{Nothing, Int} = findfirst(==(t), stack)
-    if at !== nothing
-      append!(cycle, stack[at:end]); push!(cycle, t)
-      return true
-    end
-    push!(stack, t)
-    for r in readsOf(t)
-      visit(r) && return true
-    end
-    pop!(stack); push!(done, t)
-    return false
+  _findReadCycle!(cycle, Symbol[], Set{Symbol}(), target, E, templates) && return "cycle " * join(String.(cycle), " -> ")
+  return join(String.(_solvedReads(target, E, templates)), ", ")
+end
+
+"The solved targets the template of `t` reads, each once, in the order read (`readChain`)."
+function _solvedReads(t::Symbol, E::Elements, templates::Dict{Symbol, SolvedTemplate})::Vector{Symbol}
+  local reads::Vector{Symbol} = Symbol[]
+  IR.foreachExp(x::IR.Expression -> (local s::Union{Nothing, Symbol} = solvedTarget(x, E, templates); (s === nothing || s in reads) || push!(reads, s); nothing),
+                templates[t].value)
+  return reads
+end
+
+"""
+Whether a chain of reads from `t` comes back to a target on `stack` (`readChain`, depth first; `done`: the targets
+searched without one): the cycle onto `cycle`.
+"""
+function _findReadCycle!(cycle::Vector{Symbol}, stack::Vector{Symbol}, done::Set{Symbol}, t::Symbol, E::Elements,
+                         templates::Dict{Symbol, SolvedTemplate})::Bool
+  t in done && return false
+  local at::Union{Nothing, Int} = findfirst(==(t), stack)
+  if at !== nothing
+    append!(cycle, stack[at:end]); push!(cycle, t)
+    return true
   end
-  visit(target) && return "cycle " * join(String.(cycle), " -> ")
-  return join(String.(readsOf(target)), ", ")
+  push!(stack, t)
+  for r in _solvedReads(t, E, templates)
+    _findReadCycle!(cycle, stack, done, r, E, templates) && return true
+  end
+  pop!(stack); push!(done, t)
+  return false
 end
 
 """

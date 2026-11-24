@@ -356,9 +356,7 @@ function solveThroughSolved!(solved::Dict{Symbol, IR.Expression}, equationOf::Di
     (d in reads && !any(o -> o in reads, others)) || return nothing
     local c = partialDerivative(substituted, d, functions; derivativeCalls = true)
     (c === nothing || isZeroConstant(c) || isPiecewise(c)) && return nothing
-    local linear = true
-    IR.foreachExp(x -> (x isa IR.CREF && x.cref.name === d && (linear = false); nothing), c)
-    linear || return nothing
+    IR.anyExp((@nospecialize(x::IR.Expression)) -> x isa IR.CREF && x.cref.name === d, c) && return nothing
     local atStart = evaluate(c, start)
     (atStart !== nothing && isfinite(atStart) && abs(atStart) > ZERO_PIVOT) || return nothing
     return solvedValue(substituted, d, c)

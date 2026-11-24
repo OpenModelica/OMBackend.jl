@@ -76,13 +76,16 @@ end
 The names of the references an expression reads outside pre().
 """
 function _crefNamesOutsidePre(@nospecialize(e::SC.Exp))::Set{String}
-  local names = Set{String}()
-  local visit = function (@nospecialize(x::SC.Exp),)
-    SC.isBuiltin(x, :pre) && return
-    x isa SC.EXP_CREF && return push!(names, SC.crefName(x.cref))
-    foreach(visit, SC.children(x))
+  return _crefNamesOutsidePre!(Set{String}(), e)
+end
+
+"`_crefNamesOutsidePre` of `x` into `names`: a reference's subscripts are not searched."
+function _crefNamesOutsidePre!(names::Set{String}, @nospecialize(x::SC.Exp))::Set{String}
+  SC.isBuiltin(x, :pre) && return names
+  x isa SC.EXP_CREF && return push!(names, SC.crefName(x.cref))
+  for c::SC.Exp in SC.children(x)
+    _crefNamesOutsidePre!(names, c)
   end
-  visit(e)
   return names
 end
 

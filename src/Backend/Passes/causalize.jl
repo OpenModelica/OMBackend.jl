@@ -711,14 +711,15 @@ function assembledBinding(sizes::Vector{Int}, elements::Dict{Vector{Int}, IR.Exp
   isempty(elements) && return nothing
   local missing = [collect(Tuple(i)) for i in CartesianIndices(Tuple(sizes)) if !haskey(elements, collect(Tuple(i)))]
   isempty(missing) || @warn "$(length(missing)) of $(prod(sizes)) element bindings missing for the array $(name); 0.0 for them" missing
-  local build
-  build = (prefix::Vector{Int}) -> begin
-    local k = length(prefix) + 1
-    k > length(sizes) && return get(elements, prefix, IR.REAL(0.0))
-    return IR.ARRAY(IR.Expression[build(vcat(prefix, i)) for i in 1:sizes[k]],
-                    IR.T_ARRAY(IR.T_REAL(), IR.Dimension[IR.DIM_SIZE(s) for s in sizes[k:end]]))
-  end
-  return build(Int[])
+  return _assembledArray(sizes, elements, Int[])
+end
+
+"The array of `assembledBinding` under the index `prefix`: its elements' bindings, 0.0 for a missing one."
+function _assembledArray(sizes::Vector{Int}, elements::Dict{Vector{Int}, IR.Expression}, prefix::Vector{Int})::IR.Expression
+  local k::Int = length(prefix) + 1
+  k > length(sizes) && return get(elements, prefix, IR.REAL(0.0))
+  return IR.ARRAY(IR.Expression[_assembledArray(sizes, elements, vcat(prefix, i)) for i in 1:sizes[k]],
+                  IR.T_ARRAY(IR.T_REAL(), IR.Dimension[IR.DIM_SIZE(s) for s in sizes[k:end]]))
 end
 
 """

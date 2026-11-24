@@ -1197,31 +1197,38 @@ reduction).
 """
 function _assertCrossingExprs(@nospecialize(cond::SC.Exp), obsAcc::Dict{Symbol, Symbol},
                               simCode::SC.SIM_CODE)::Vector{Any}
-  local out = Any[]
-  local both = (r, c) -> r === true ? c : :($(r) && $(c))
-  local walk = nothing
-  walk = function (@nospecialize(e::SC.Exp), reached)
-    if e isa SC.LBINARY
-      walk(e.exp1, reached)
-      local lhs = _affectBool(e.exp1, obsAcc, simCode)
-      walk(e.exp2, both(reached, e.op === SC.OP_AND ? lhs : :(!$(lhs))))
-    elseif e isa SC.LUNARY
-      walk(e.exp, reached)
-    elseif e isa SC.IFEXP
-      walk(e.cond, reached)
-      local c = _affectBool(e.cond, obsAcc, simCode)
-      walk(e.thenExp, both(reached, c))
-      walk(e.elseExp, both(reached, :(!$(c))))
-    elseif e isa SC.RELATION && e.op in (SC.OP_LESS, SC.OP_LESSEQ, SC.OP_GREATER, SC.OP_GREATEREQ) &&
-           !(SC.scalarType(SC.typeOf(e.exp1)) isa Union{SC.TYPE_STRING, SC.TYPE_BOOL})
-      local zc = :(Float64($(_affectValue(e.exp1, obsAcc, simCode))) - Float64($(_affectValue(e.exp2, obsAcc, simCode))))
-      push!(out, reached === true ? zc : :($(reached) ? $(zc) : 1.0))
-    end
-    nothing
-  end
-  walk(cond, true)
+  local out::Vector{Any} = Any[]
+  _assertCrossingExprs!(out, cond, true, obsAcc, simCode)
   return out
 end
+
+"""
+`_assertCrossingExprs` of `e` onto `out`; `reached`: the condition under which `e` is evaluated (`true`: always), a
+Julia expression.
+"""
+function _assertCrossingExprs!(out::Vector{Any}, @nospecialize(e::SC.Exp), @nospecialize(reached), obsAcc::Dict{Symbol, Symbol},
+                           simCode::SC.SIM_CODE)::Nothing
+  if e isa SC.LBINARY
+    _assertCrossingExprs!(out, e.exp1, reached, obsAcc, simCode)
+    local lhs = _affectBool(e.exp1, obsAcc, simCode)
+    _assertCrossingExprs!(out, e.exp2, _bothReached(reached, e.op === SC.OP_AND ? lhs : :(!$(lhs))), obsAcc, simCode)
+  elseif e isa SC.LUNARY
+    _assertCrossingExprs!(out, e.exp, reached, obsAcc, simCode)
+  elseif e isa SC.IFEXP
+    _assertCrossingExprs!(out, e.cond, reached, obsAcc, simCode)
+    local c = _affectBool(e.cond, obsAcc, simCode)
+    _assertCrossingExprs!(out, e.thenExp, _bothReached(reached, c), obsAcc, simCode)
+    _assertCrossingExprs!(out, e.elseExp, _bothReached(reached, :(!$(c))), obsAcc, simCode)
+  elseif e isa SC.RELATION && e.op in (SC.OP_LESS, SC.OP_LESSEQ, SC.OP_GREATER, SC.OP_GREATEREQ) &&
+         !(SC.scalarType(SC.typeOf(e.exp1)) isa Union{SC.TYPE_STRING, SC.TYPE_BOOL})
+    local zc = :(Float64($(_affectValue(e.exp1, obsAcc, simCode))) - Float64($(_affectValue(e.exp2, obsAcc, simCode))))
+    push!(out, reached === true ? zc : :($(reached) ? $(zc) : 1.0))
+  end
+  return nothing
+end
+
+"The condition `r` and `c` (`r` `true`: `c`), Julia expressions."
+_bothReached(@nospecialize(r), @nospecialize(c)) = r === true ? c : :($(r) && $(c))
 
 """
 An assert's condition; a call equation for its effects runs and holds, one in an
@@ -1243,12 +1250,14 @@ from the arithmetic encoding, an array element by element (a literal one too: it
 may be variables).
 """
 function _effectCallExpr(call::SC.CALL, obsAcc::Dict{Symbol, Symbol}, simCode::SC.SIM_CODE)::Expr
-  local arg = nothing
-  arg = a::SC.Exp -> a isa SC.SCONST ? a.value :
-    a isa SC.ARRAY_EXP ? Expr(:vect, (arg(e) for e in a.elements)...) :
-    _isBooleanExp(a) ? _affectBool(a, obsAcc, simCode) : _affectValue(a, obsAcc, simCode)
-  return Expr(:call, call.name, (arg(a) for a in call.args)...)
+  return Expr(:call, call.name, (_effectArgExpr(a, obsAcc, simCode) for a in call.args)...)
 end
+
+"An argument `a` of an effect call (`_effectCallExpr`): a string's value, an array's elements, a Boolean or a value."
+_effectArgExpr(a::SC.Exp, obsAcc::Dict{Symbol, Symbol}, simCode::SC.SIM_CODE) =
+  a isa SC.SCONST ? a.value :
+  a isa SC.ARRAY_EXP ? Expr(:vect, (_effectArgExpr(e, obsAcc, simCode) for e in a.elements)...) :
+  _isBooleanExp(a) ? _affectBool(a, obsAcc, simCode) : _affectValue(a, obsAcc, simCode)
 
 _isBooleanExp(e::SC.Exp)::Bool =
   e isa Union{SC.BCONST, SC.RELATION, SC.LBINARY, SC.LUNARY} || (e isa Union{SC.EXP_CREF, SC.CALL} && e.ty isa SC.TYPE_BOOL)
@@ -1260,21 +1269,23 @@ binding (createStringParameterAssignments), not a variable of the simulation (re
 `observed`, the assert was left out as reading a variable the simulation does not keep).
 """
 function _assertMessageExpr(msg::SC.Exp, obsAcc::Dict{Symbol, Symbol}, simCode::SC.SIM_CODE)
-  local part = nothing
-  part = (@nospecialize(e::SC.Exp)) -> begin
-    e isa SC.SCONST && return e.value
-    (e isa SC.BINARY && e.op === SC.OP_ADD) && return :(string($(part(e.exp1)), $(part(e.exp2))))
-    (e isa SC.EXP_CREF && _isStringBinding(SC.crefName(e.cref), simCode)) &&
-      return Symbol(last(simCode.stringToSimVarHT[SC.crefName(e.cref)]).name)
-    return :(string($(_affectValue(e, obsAcc, simCode))))
-  end
   return try
-    part(msg)
+    _assertMessagePart(msg, obsAcc, simCode)
   catch err
     #= The assert is still checked; its message is the Modelica text. =#
     OMBackend._fallback(err, :assertMessage; only = LoweringFailure, impact = :result)
     string(msg)
   end
+end
+
+"A part of an assert's message `e` (`_assertMessageExpr`): a string, a concatenation, a String binding or a value."
+function _assertMessagePart(@nospecialize(e::SC.Exp), obsAcc::Dict{Symbol, Symbol}, simCode::SC.SIM_CODE)
+  e isa SC.SCONST && return e.value
+  (e isa SC.BINARY && e.op === SC.OP_ADD) &&
+    return :(string($(_assertMessagePart(e.exp1, obsAcc, simCode)), $(_assertMessagePart(e.exp2, obsAcc, simCode))))
+  (e isa SC.EXP_CREF && _isStringBinding(SC.crefName(e.cref), simCode)) &&
+    return Symbol(last(simCode.stringToSimVarHT[SC.crefName(e.cref)]).name)
+  return :(string($(_affectValue(e, obsAcc, simCode))))
 end
 
 _isStringBinding(name::String, simCode::SC.SIM_CODE)::Bool =

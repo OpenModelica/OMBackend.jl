@@ -588,25 +588,27 @@ function structuralChoice(s::Structure, rows::Vector{Int}, order::Vector{Int})::
   for (i, r) in enumerate(rows), c in s.incidence[r]
     haskey(columnRows, c) && push!(columnRows[c], i)
   end
-  local rowMatch = zeros(Int, length(rows))     # row -> column taken
-  local chosen = Int[]
-  function augment(c::Int, seen::Set{Int})::Bool
-    for i in columnRows[c]
-      i in seen && continue
-      push!(seen, i)
-      if rowMatch[i] == 0 || augment(rowMatch[i], seen)
-        rowMatch[i] = c
-        return true
-      end
-    end
-    return false
-  end
+  local rowMatch::Vector{Int} = zeros(Int, length(rows))     # row -> column taken
+  local chosen::Vector{Int} = Int[]
   for c in order
     length(chosen) == length(rows) && break
-    augment(c, Set{Int}()) && push!(chosen, c)
+    _augmentChoice!(rowMatch, columnRows, c, Set{Int}()) && push!(chosen, c)
   end
   length(chosen) == length(rows) || throw(NotHandled("dummy derivatives: no regular choice of $(length(rows)) of $(length(order)) derivatives (a structural error)"))
   return chosen
+end
+
+"An augmenting path from the column `c` (`structuralChoice`'s matching, rows `seen` visited): `rowMatch` changed along it."
+function _augmentChoice!(rowMatch::Vector{Int}, columnRows::Dict{Int, Vector{Int}}, c::Int, seen::Set{Int})::Bool
+  for i in columnRows[c]
+    i in seen && continue
+    push!(seen, i)
+    if rowMatch[i] == 0 || _augmentChoice!(rowMatch, columnRows, rowMatch[i], seen)
+      rowMatch[i] = c
+      return true
+    end
+  end
+  return false
 end
 
 """

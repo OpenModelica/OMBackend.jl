@@ -256,16 +256,35 @@ const STATE_SELECTS = Dict("never" => IR.NEVER, "avoid" => IR.AVOID, "default" =
 
 "The variables `statements` assign, in the order of their first assignment."
 function assignedCrefs(statements::Vector{IR.Statement})::Vector{IR.ComponentRef}
-  local out = IR.ComponentRef[]
-  local seen = Set{Symbol}()
-  local visit(s::IR.ASSIGNMENT) = foreach(t -> (t isa IR.CREF && !(t.cref.name in seen)) && (push!(seen, t.cref.name); push!(out, t.cref)),
-                                         s.lhs isa IR.TUPLE ? s.lhs.elements : IR.Expression[s.lhs])
-  local visit(s::Union{IR.IF_STATEMENT, IR.WHEN_STATEMENT}) =
-    (foreach(b -> foreach(visit, b.body), s.branches); s isa IR.IF_STATEMENT && foreach(visit, s.elseBody))
-  local visit(s::Union{IR.FOR_STATEMENT, IR.WHILE_STATEMENT}) = foreach(visit, s.body)
-  local visit(::IR.Statement) = nothing
-  foreach(visit, statements)
+  local out::Vector{IR.ComponentRef} = IR.ComponentRef[]
+  local seen::Set{Symbol} = Set{Symbol}()
+  for s::IR.Statement in statements
+    assignedCrefs!(out, seen, s)
+  end
   return out
+end
+
+"`assignedCrefs` of the statement `s` (its nested statements too) onto `out`, each name once (`seen`)."
+function assignedCrefs!(out::Vector{IR.ComponentRef}, seen::Set{Symbol}, s::IR.Statement)::Nothing
+  if s isa IR.ASSIGNMENT
+    for t in (s.lhs isa IR.TUPLE ? s.lhs.elements : IR.Expression[s.lhs])
+      (t isa IR.CREF && !(t.cref.name in seen)) && (push!(seen, t.cref.name); push!(out, t.cref))
+    end
+  elseif s isa Union{IR.IF_STATEMENT, IR.WHEN_STATEMENT}
+    for b in s.branches, x::IR.Statement in b.body
+      assignedCrefs!(out, seen, x)
+    end
+    if s isa IR.IF_STATEMENT
+      for x::IR.Statement in s.elseBody
+        assignedCrefs!(out, seen, x)
+      end
+    end
+  elseif s isa Union{IR.FOR_STATEMENT, IR.WHILE_STATEMENT}
+    for x::IR.Statement in s.body
+      assignedCrefs!(out, seen, x)
+    end
+  end
+  return nothing
 end
 
 """

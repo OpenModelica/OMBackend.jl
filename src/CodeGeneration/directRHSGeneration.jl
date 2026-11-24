@@ -652,9 +652,9 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, @
       #= The derivative targets read them too (`der(x) = p` kept x for p = 2).
          Those on algebraic or observed variables are inside the residual
          functions built above: a change there is refused. =#
-      local targets = derivativeInitTargets
+      local targets::Vector{Pair{Int, Float64}} = r === nothing ? derivativeInitTargets :
+        _derivativeInitializationTargets(reducedSystem, states; resolvedParams=r.initResolved)
       if r !== nothing
-        targets = _derivativeInitializationTargets(reducedSystem, states; resolvedParams=r.initResolved)
         (Pair{Int, Float64}[t for t in targets if 1 <= t.first <= size(mm, 1) && mm[t.first, t.first] == 0] == algDerTargets &&
          last(_observedDerivativeInitEquations(reducedSystem, states; resolvedParams=r.initResolved)) == obsTargets) ||
           OMBackend.unsupported("other tunable parameter values in a derivative initial equation on an algebraic or observed variable",
@@ -1873,113 +1873,126 @@ are its derivative rules (derivative_idx); throws _NoDagDerivative where
 there is none.
 """
 function _dagSparseJacobian(rhs_list, states; columns::Union{Nothing, AbstractSet{Int}} = nothing)
-  local T = Symbolics.VartypeT
   local stateIdx = Dict{Any, Int}(Symbolics.unwrap(s) => j for (j, s) in enumerate(states))
   #= Whole-array uses of scalarized states would read no state here. =#
   local arrParents = Set{Any}(SymbolicUtils.arguments(u)[1] for u in keys(stateIdx)
                               if SymbolicUtils.iscall(u) && SymbolicUtils.operation(u) === getindex)
-  local depsMemo = IdDict{Any, BitSet}()
-  local deps = x -> begin
-    local hit = get(depsMemo, x, nothing)
-    hit === nothing || return hit
-    local j = get(stateIdx, x, 0)
-    local d = BitSet()
-    if j > 0
-      push!(d, j)
-    elseif x in arrParents
-      throw(_NoDagDerivative("array use of a scalarized state", true))
-    elseif SymbolicUtils.iscall(x)
-      for a in SymbolicUtils.arguments(x)
-        union!(d, deps(a))
-      end
-    end
-    depsMemo[x] = d
-    return d
-  end
-  #= Combined as plain terms, not with + and *: canonical sums and products
-     merge their operands' terms, copying what the DAG shares (EngineV6_analytic
-     grew to 16 GB that way too). Symbolic 0 and 1 (the rules of sign, floor,
-     comparisons) fold like numbers. =#
-  local isZero = x -> (local v = SymbolicUtils.unwrap_const(x); v isa Number && iszero(v))
-  local isOne = x -> (local v = SymbolicUtils.unwrap_const(x); v isa Number && isone(v))
-  local plus = (a, b) -> isZero(a) ? b : isZero(b) ? a : SymbolicUtils.term(+, a, b; vartype = T)
-  local times = (a, b) -> (isZero(a) || isZero(b)) ? 0 : isOne(a) ? b : isOne(b) ? a :
-                          SymbolicUtils.term(*, a, b; vartype = T)
-  local sumOf = terms -> foldl(plus, terms; init = 0)
-  local isSum = x -> SymbolicUtils.isadd(x) || (SymbolicUtils.isterm(x) && SymbolicUtils.operation(x) === (+))
-  local isProduct = x -> SymbolicUtils.ismul(x) || (SymbolicUtils.isterm(x) && SymbolicUtils.operation(x) === (*))
-  local derivative
-  derivative = (x, j, memo) -> begin
-    j in deps(x) || return 0
-    local hit = get(memo, x, nothing)
-    hit === nothing || return hit
-    local r = if get(stateIdx, x, 0) == j
-      1
-    elseif isSum(x)
-      sumOf(Any[derivative(a, j, memo) for a in SymbolicUtils.arguments(x) if j in deps(a)])
-    elseif isProduct(x)
-      local args = SymbolicUtils.arguments(x)
-      sumOf(Any[times(foldl(times, (args[k] for k in eachindex(args) if k != i); init = 1),
-                      derivative(args[i], j, memo))
-                for i in eachindex(args) if j in deps(args[i])])
-    elseif SymbolicUtils.isdiv(x)
-      local (num, den) = SymbolicUtils.arguments(x)
-      local dn = derivative(num, j, memo)
-      local dd = derivative(den, j, memo)
-      local a = isZero(dn) ? 0 : SymbolicUtils.term(/, dn, den; vartype = T)
-      local b = isZero(dd) ? 0 : SymbolicUtils.term(/, times(num, dd), SymbolicUtils.term(^, den, 2; vartype = T); vartype = T)
-      isZero(b) ? a : isZero(a) ? SymbolicUtils.term(-, b; vartype = T) : SymbolicUtils.term(-, a, b; vartype = T)
-    elseif SymbolicUtils.ispow(x) && !(j in deps(SymbolicUtils.arguments(x)[2]))
-      local (b, e) = SymbolicUtils.arguments(x)
-      local ev = SymbolicUtils.unwrap_const(e)
-      local bPow = ev isa Number ? (isone(ev - 1) ? b : SymbolicUtils.term(^, b, ev - 1; vartype = T)) :
-                   SymbolicUtils.term(^, b, SymbolicUtils.term(-, e, 1; vartype = T); vartype = T)
-      times(times(e, bPow), derivative(b, j, memo))
-    elseif SymbolicUtils.isterm(x)
-      local f = SymbolicUtils.operation(x)
-      local args = SymbolicUtils.arguments(x)
-      if f === ifelse || f === SymbolicUtils.ifelse_eager || f === SymbolicUtils.ifelse_branching
-        local dt = derivative(args[2], j, memo)
-        local df = derivative(args[3], j, memo)
-        (isZero(dt) && isZero(df)) ? 0 : SymbolicUtils.term(f, args[1], dt, df; vartype = T)
-      elseif f isa Symbolics.Differential || f isa Symbolics.Integral || f === getindex
-        throw(_NoDagDerivative(string(f), true))
-      elseif f isa SymbolicUtils.Operator
-        #= Pre, Sample, Hold, Shift: new variables, as in Symbolics. =#
-        0
-      elseif f isa SymbolicUtils.BasicSymbolic
-        throw(_NoDagDerivative(string(f), false))
-      else
-        local terms = Any[]
-        for (i, a) in enumerate(args)
-          j in deps(a) || continue
-          local rule = Symbolics.derivative_idx(x, i)
-          rule === nothing && throw(_NoDagDerivative(string(f), false))
-          isZero(rule) && continue
-          push!(terms, times(rule, derivative(a, j, memo)))
-        end
-        sumOf(terms)
-      end
-    else
-      throw(_NoDagDerivative(string(typeof(x)), true))
-    end
-    memo[x] = r
-    return r
-  end
+  local D::_DagDeps = _DagDeps(stateIdx, arrParents, IdDict{Any, BitSet}())
   local I = Int[]
   local J = Int[]
   local V = Symbolics.Num[]
   local memos = [IdDict{Any, Any}() for _ in states]
   for (i, ex) in enumerate(rhs_list)
     local x = Symbolics.unwrap(ex)
-    for j in deps(x)
+    for j in _dagDeps(D, x)
       columns === nothing || j in columns || continue
       push!(I, i)
       push!(J, j)
-      push!(V, Symbolics.Num(derivative(x, j, memos[j])))
+      push!(V, Symbolics.Num(_dagDerivative(D, x, j, memos[j])))
     end
   end
   return Symbolics.SparseArrays.sparse(I, J, V, length(rhs_list), length(states))
+end
+
+"The state dependencies of `_dagSparseJacobian`'s expressions: the states' indices, the arrays of scalarized states (a
+whole-array use reads no state here), the dependencies found (`memo`)."
+struct _DagDeps
+  stateIdx::Dict{Any, Int}
+  arrParents::Set{Any}
+  memo::IdDict{Any, BitSet}
+end
+
+"The indices of the states `x` depends on (`_dagSparseJacobian`), memoized."
+function _dagDeps(D::_DagDeps, x)::BitSet
+  local hit = get(D.memo, x, nothing)
+  hit === nothing || return hit
+  local j = get(D.stateIdx, x, 0)
+  local d = BitSet()
+  if j > 0
+    push!(d, j)
+  elseif x in D.arrParents
+    throw(_NoDagDerivative("array use of a scalarized state", true))
+  elseif SymbolicUtils.iscall(x)
+    for a in SymbolicUtils.arguments(x)
+      union!(d, _dagDeps(D, a))
+    end
+  end
+  D.memo[x] = d
+  return d
+end
+
+#= Combined as plain terms, not with + and *: canonical sums and products
+   merge their operands' terms, copying what the DAG shares (EngineV6_analytic
+   grew to 16 GB that way too). Symbolic 0 and 1 (the rules of sign, floor,
+   comparisons) fold like numbers. =#
+_dagIsZero(x)::Bool = (local v = SymbolicUtils.unwrap_const(x); v isa Number && iszero(v))
+_dagIsOne(x)::Bool = (local v = SymbolicUtils.unwrap_const(x); v isa Number && isone(v))
+_dagPlus(a, b) = _dagIsZero(a) ? b : _dagIsZero(b) ? a : SymbolicUtils.term(+, a, b; vartype = Symbolics.VartypeT)
+_dagTimes(a, b) = (_dagIsZero(a) || _dagIsZero(b)) ? 0 : _dagIsOne(a) ? b : _dagIsOne(b) ? a :
+                  SymbolicUtils.term(*, a, b; vartype = Symbolics.VartypeT)
+_dagSum(terms) = foldl(_dagPlus, terms; init = 0)
+_dagIsSum(x)::Bool = SymbolicUtils.isadd(x) || (SymbolicUtils.isterm(x) && SymbolicUtils.operation(x) === (+))
+_dagIsProduct(x)::Bool = SymbolicUtils.ismul(x) || (SymbolicUtils.isterm(x) && SymbolicUtils.operation(x) === (*))
+
+"The derivative of `x` by the state `j` (`_dagSparseJacobian`), as plain terms, memoized in `memo`."
+function _dagDerivative(D::_DagDeps, x, j::Int, memo::IdDict{Any, Any})
+  local T = Symbolics.VartypeT
+  j in _dagDeps(D, x) || return 0
+  local hit = get(memo, x, nothing)
+  hit === nothing || return hit
+  local r = if get(D.stateIdx, x, 0) == j
+    1
+  elseif _dagIsSum(x)
+    _dagSum(Any[_dagDerivative(D, a, j, memo) for a in SymbolicUtils.arguments(x) if j in _dagDeps(D, a)])
+  elseif _dagIsProduct(x)
+    #= `factors`, not `args`: one local in two branches is assigned twice, and the generator would box it =#
+    local factors = SymbolicUtils.arguments(x)
+    _dagSum(Any[_dagTimes(foldl(_dagTimes, (factors[k] for k in eachindex(factors) if k != i); init = 1),
+                          _dagDerivative(D, factors[i], j, memo))
+                for i in eachindex(factors) if j in _dagDeps(D, factors[i])])
+  elseif SymbolicUtils.isdiv(x)
+    local (num, den) = SymbolicUtils.arguments(x)
+    local dn = _dagDerivative(D, num, j, memo)
+    local dd = _dagDerivative(D, den, j, memo)
+    local a = _dagIsZero(dn) ? 0 : SymbolicUtils.term(/, dn, den; vartype = T)
+    local b = _dagIsZero(dd) ? 0 : SymbolicUtils.term(/, _dagTimes(num, dd), SymbolicUtils.term(^, den, 2; vartype = T); vartype = T)
+    _dagIsZero(b) ? a : _dagIsZero(a) ? SymbolicUtils.term(-, b; vartype = T) : SymbolicUtils.term(-, a, b; vartype = T)
+  elseif SymbolicUtils.ispow(x) && !(j in _dagDeps(D, SymbolicUtils.arguments(x)[2]))
+    local (b, e) = SymbolicUtils.arguments(x)
+    local ev = SymbolicUtils.unwrap_const(e)
+    local bPow = ev isa Number ? (isone(ev - 1) ? b : SymbolicUtils.term(^, b, ev - 1; vartype = T)) :
+                 SymbolicUtils.term(^, b, SymbolicUtils.term(-, e, 1; vartype = T); vartype = T)
+    _dagTimes(_dagTimes(e, bPow), _dagDerivative(D, b, j, memo))
+  elseif SymbolicUtils.isterm(x)
+    local f = SymbolicUtils.operation(x)
+    local args = SymbolicUtils.arguments(x)
+    if f === ifelse || f === SymbolicUtils.ifelse_eager || f === SymbolicUtils.ifelse_branching
+      local dt = _dagDerivative(D, args[2], j, memo)
+      local df = _dagDerivative(D, args[3], j, memo)
+      (_dagIsZero(dt) && _dagIsZero(df)) ? 0 : SymbolicUtils.term(f, args[1], dt, df; vartype = T)
+    elseif f isa Symbolics.Differential || f isa Symbolics.Integral || f === getindex
+      throw(_NoDagDerivative(string(f), true))
+    elseif f isa SymbolicUtils.Operator
+      #= Pre, Sample, Hold, Shift: new variables, as in Symbolics. =#
+      0
+    elseif f isa SymbolicUtils.BasicSymbolic
+      throw(_NoDagDerivative(string(f), false))
+    else
+      local terms = Any[]
+      for (i, a) in enumerate(args)
+        j in _dagDeps(D, a) || continue
+        local rule = Symbolics.derivative_idx(x, i)
+        rule === nothing && throw(_NoDagDerivative(string(f), false))
+        _dagIsZero(rule) && continue
+        push!(terms, _dagTimes(rule, _dagDerivative(D, a, j, memo)))
+      end
+      _dagSum(terms)
+    end
+  else
+    throw(_NoDagDerivative(string(typeof(x)), true))
+  end
+  memo[x] = r
+  return r
 end
 
 """

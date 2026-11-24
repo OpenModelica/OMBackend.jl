@@ -611,35 +611,43 @@ function scalarTargets(lhs::IR.CREF)::Vector{Tuple{IR.CREF, Union{Nothing, IR.Ex
   padded === nothing && return Tuple{IR.CREF, Union{Nothing, IR.Expression}, Vector{Int}}[(lhs, nothing, Int[])]
   local (subs, dims) = padded
   length(subs) == length(dims) || return out
-  local elementTy = IR.elementType(lhs.cref.parts[end].ty)
-  local visit
-  visit = (pos, newSubs, guard, rhsIndices) -> begin
-    if pos > length(dims)
-      push!(out, (IR.CREF(IR.withLastSubscripts(lhs.cref, newSubs), elementTy), guard, copy(rhsIndices)))
-      return true
-    end
-    local n = IR.dimensionSize(dims[pos])
-    local sub = subs[pos]
-    if sub isa IR.WHOLE
-      n === nothing && return false
-      for k in 1:n
-        visit(pos + 1, IR.Subscript[newSubs..., IR.INDEX(indexOf(dims[pos], k))], guard, Int[rhsIndices..., k]) || return false
-      end
-    elseif IR.isLiteralSubscript(sub)
-      visit(pos + 1, IR.Subscript[newSubs..., sub], guard, rhsIndices) || return false
-    elseif sub isa IR.INDEX
-      n === nothing && return false
-      for k in 1:n
-        visit(pos + 1, IR.Subscript[newSubs..., IR.INDEX(indexOf(dims[pos], k))],
-              andCondition(guard, indexEqualsCondition(sub.exp, k)), rhsIndices) || return false
-      end
-    else
-      return false
-    end
+  local elementTy::IR.ModelicaType = IR.elementType(lhs.cref.parts[end].ty)
+  scalarTargets!(out, lhs, subs, dims, elementTy, 1, IR.Subscript[], nothing, Int[]) ||
+    return Tuple{IR.CREF, Union{Nothing, IR.Expression}, Vector{Int}}[]
+  return out
+end
+
+"""
+`scalarTargets` from subscript `pos` on, the subscripts before it `newSubs` under `guard`, the right-hand side's
+indices `rhsIndices`: false if a subscript cannot be expanded.
+"""
+function scalarTargets!(out::Vector{Tuple{IR.CREF, Union{Nothing, IR.Expression}, Vector{Int}}}, lhs::IR.CREF,
+                        subs::Vector{IR.Subscript}, dims::Vector{IR.Dimension}, elementTy::IR.ModelicaType, pos::Int,
+                        newSubs::Vector{IR.Subscript}, guard::Union{Nothing, IR.Expression}, rhsIndices::Vector{Int})::Bool
+  if pos > length(dims)
+    push!(out, (IR.CREF(IR.withLastSubscripts(lhs.cref, newSubs), elementTy), guard, copy(rhsIndices)))
     return true
   end
-  visit(1, IR.Subscript[], nothing, Int[]) || return Tuple{IR.CREF, Union{Nothing, IR.Expression}, Vector{Int}}[]
-  return out
+  local n::Union{Nothing, Int} = IR.dimensionSize(dims[pos])
+  local sub::IR.Subscript = subs[pos]
+  if sub isa IR.WHOLE
+    n === nothing && return false
+    for k in 1:n
+      scalarTargets!(out, lhs, subs, dims, elementTy, pos + 1, IR.Subscript[newSubs..., IR.INDEX(indexOf(dims[pos], k))],
+                     guard, Int[rhsIndices..., k]) || return false
+    end
+  elseif IR.isLiteralSubscript(sub)
+    scalarTargets!(out, lhs, subs, dims, elementTy, pos + 1, IR.Subscript[newSubs..., sub], guard, rhsIndices) || return false
+  elseif sub isa IR.INDEX
+    n === nothing && return false
+    for k in 1:n
+      scalarTargets!(out, lhs, subs, dims, elementTy, pos + 1, IR.Subscript[newSubs..., IR.INDEX(indexOf(dims[pos], k))],
+                     andCondition(guard, indexEqualsCondition(sub.exp, k)), rhsIndices) || return false
+    end
+  else
+    return false
+  end
+  return true
 end
 
 """
@@ -664,53 +672,64 @@ function scalarizedCref(e::IR.CREF, rhsIndices::Vector{Int}, fallback::IR.Expres
   padded === nothing && return e
   local (subs, dims) = padded
   length(subs) == length(dims) || return fallback
-  local elementTy = IR.elementType(e.cref.parts[end].ty)
+  local elementTy::IR.ModelicaType = IR.elementType(e.cref.parts[end].ty)
   local candidates = Tuple{Union{Nothing, IR.Expression}, IR.Expression}[]
-  local visit
-  visit = (pos, rhsPos, newSubs, guard) -> begin
-    if pos > length(dims)
-      push!(candidates, (guard, IR.CREF(IR.withLastSubscripts(e.cref, newSubs), elementTy)))
-      return
-    end
-    local sub = subs[pos]
-    if sub isa IR.WHOLE
-      rhsPos <= length(rhsIndices) || return
-      visit(pos + 1, rhsPos + 1, IR.Subscript[newSubs..., IR.INDEX(indexOf(dims[pos], rhsIndices[rhsPos]))], guard)
-    elseif IR.isLiteralSubscript(sub)
-      visit(pos + 1, rhsPos, IR.Subscript[newSubs..., sub], guard)
-    elseif sub isa IR.INDEX
-      local n = IR.dimensionSize(dims[pos])
-      n === nothing && return
-      for k in 1:n
-        visit(pos + 1, rhsPos, IR.Subscript[newSubs..., IR.INDEX(indexOf(dims[pos], k))],
-              andCondition(guard, indexEqualsCondition(sub.exp, k)))
-      end
-    elseif sub isa IR.SLICE
-      #= the slice's dimension is the right-hand side's: its index there (`x := x[{2, 1}]` read x[2], then x[1]; it
-         read x[1] and x[2], no swap) =#
-      rhsPos <= length(rhsIndices) || return
-      local picks::Union{Nothing, Vector{IR.Expression}} = sliceIndices(sub.exp)
-      (picks === nothing || !(1 <= rhsIndices[rhsPos] <= length(picks))) && return
-      local pick::IR.Expression = picks[rhsIndices[rhsPos]]
-      if pick isa Union{IR.INTEGER, IR.ENUM_LITERAL}
-        visit(pos + 1, rhsPos + 1, IR.Subscript[newSubs..., IR.INDEX(pick)], guard)
-      else
-        local n = IR.dimensionSize(dims[pos])
-        n === nothing && return
-        for k in 1:n
-          visit(pos + 1, rhsPos + 1, IR.Subscript[newSubs..., IR.INDEX(indexOf(dims[pos], k))],
-                andCondition(guard, indexEqualsCondition(pick, k)))
-        end
-      end
-    end
-  end
-  visit(1, 1, IR.Subscript[], nothing)
+  scalarizedCandidates!(candidates, e, rhsIndices, subs, dims, elementTy, 1, 1, IR.Subscript[], nothing)
   isempty(candidates) && return fallback
   local result = fallback
   for (guard, value) in Iterators.reverse(candidates)
     result = guard === nothing ? value : IR.IF_EXPRESSION(guard, value, result, elementTy)
   end
   return result
+end
+
+"""
+`scalarizedCref`'s elements of `e` from subscript `pos` on (the right-hand side's index `rhsPos`), the subscripts before
+it `newSubs` under `guard`, onto `candidates`.
+"""
+function scalarizedCandidates!(candidates::Vector{Tuple{Union{Nothing, IR.Expression}, IR.Expression}}, e::IR.CREF,
+                               rhsIndices::Vector{Int}, subs::Vector{IR.Subscript}, dims::Vector{IR.Dimension},
+                               elementTy::IR.ModelicaType, pos::Int, rhsPos::Int, newSubs::Vector{IR.Subscript},
+                               guard::Union{Nothing, IR.Expression})::Nothing
+  if pos > length(dims)
+    push!(candidates, (guard, IR.CREF(IR.withLastSubscripts(e.cref, newSubs), elementTy)))
+    return nothing
+  end
+  local sub::IR.Subscript = subs[pos]
+  local n::Union{Nothing, Int} = IR.dimensionSize(dims[pos])
+  if sub isa IR.WHOLE
+    rhsPos <= length(rhsIndices) || return nothing
+    scalarizedCandidates!(candidates, e, rhsIndices, subs, dims, elementTy, pos + 1, rhsPos + 1,
+                          IR.Subscript[newSubs..., IR.INDEX(indexOf(dims[pos], rhsIndices[rhsPos]))], guard)
+  elseif IR.isLiteralSubscript(sub)
+    scalarizedCandidates!(candidates, e, rhsIndices, subs, dims, elementTy, pos + 1, rhsPos, IR.Subscript[newSubs..., sub], guard)
+  elseif sub isa IR.INDEX
+    n === nothing && return nothing
+    for k in 1:n
+      scalarizedCandidates!(candidates, e, rhsIndices, subs, dims, elementTy, pos + 1, rhsPos,
+                            IR.Subscript[newSubs..., IR.INDEX(indexOf(dims[pos], k))],
+                            andCondition(guard, indexEqualsCondition(sub.exp, k)))
+    end
+  elseif sub isa IR.SLICE
+    #= the slice's dimension is the right-hand side's: its index there (`x := x[{2, 1}]` read x[2], then x[1]; it
+       read x[1] and x[2], no swap) =#
+    rhsPos <= length(rhsIndices) || return nothing
+    local picks::Union{Nothing, Vector{IR.Expression}} = sliceIndices(sub.exp)
+    (picks === nothing || !(1 <= rhsIndices[rhsPos] <= length(picks))) && return nothing
+    local pick::IR.Expression = picks[rhsIndices[rhsPos]]
+    if pick isa Union{IR.INTEGER, IR.ENUM_LITERAL}
+      scalarizedCandidates!(candidates, e, rhsIndices, subs, dims, elementTy, pos + 1, rhsPos + 1,
+                            IR.Subscript[newSubs..., IR.INDEX(pick)], guard)
+    else
+      n === nothing && return nothing
+      for k in 1:n
+        scalarizedCandidates!(candidates, e, rhsIndices, subs, dims, elementTy, pos + 1, rhsPos + 1,
+                              IR.Subscript[newSubs..., IR.INDEX(indexOf(dims[pos], k))],
+                              andCondition(guard, indexEqualsCondition(pick, k)))
+      end
+    end
+  end
+  return nothing
 end
 
 """
@@ -1099,22 +1118,34 @@ assignments, in if-, for-, while- and when-statements too), an element of an arr
 (`elementBase`: `x[k]` and `x[1]` are one variable's).
 """
 function assignmentCounts(stmts::Vector{IR.Statement})::Dict{Symbol, Int}
-  local counts = Dict{Symbol, Int}()
-  local visit
-  visit = s -> begin
-    if s isa IR.ASSIGNMENT
-      for t in (s.lhs isa IR.TUPLE ? s.lhs.elements : IR.Expression[s.lhs])
-        t isa IR.CREF && (counts[elementBase(t.cref)] = get(counts, elementBase(t.cref), 0) + 1)
+  local counts::Dict{Symbol, Int} = Dict{Symbol, Int}()
+  for s::IR.Statement in stmts
+    countAssignments!(counts, s)
+  end
+  return counts
+end
+
+"`assignmentCounts` of the statement `s` (its nested statements too) added to `counts`."
+function countAssignments!(counts::Dict{Symbol, Int}, s::IR.Statement)::Nothing
+  if s isa IR.ASSIGNMENT
+    for t in (s.lhs isa IR.TUPLE ? s.lhs.elements : IR.Expression[s.lhs])
+      t isa IR.CREF && (counts[elementBase(t.cref)] = get(counts, elementBase(t.cref), 0) + 1)
+    end
+  elseif s isa Union{IR.IF_STATEMENT, IR.WHEN_STATEMENT}
+    for b in s.branches, x::IR.Statement in b.body
+      countAssignments!(counts, x)
+    end
+    if s isa IR.IF_STATEMENT
+      for x::IR.Statement in s.elseBody
+        countAssignments!(counts, x)
       end
-    elseif s isa Union{IR.IF_STATEMENT, IR.WHEN_STATEMENT}
-      foreach(b -> foreach(visit, b.body), s.branches)
-      s isa IR.IF_STATEMENT && foreach(visit, s.elseBody)
-    elseif s isa Union{IR.FOR_STATEMENT, IR.WHILE_STATEMENT}
-      foreach(visit, s.body)
+    end
+  elseif s isa Union{IR.FOR_STATEMENT, IR.WHILE_STATEMENT}
+    for x::IR.Statement in s.body
+      countAssignments!(counts, x)
     end
   end
-  foreach(visit, stmts)
-  return counts
+  return nothing
 end
 
 """
@@ -1490,11 +1521,18 @@ end
 
 "Whether `e` has more than `cap` nodes, counted as a tree."
 function expressionLargerThan(@nospecialize(e::IR.Expression), cap::Int)::Bool
-  local n = Ref(0)
-  local visit
-  visit = (@nospecialize(x::IR.Expression)) -> (n[] += 1; n[] > cap && return; foreach(visit, IR.children(x)))
-  visit(e)
-  return n[] > cap
+  return nodesUpTo(e, cap, 0) > cap
+end
+
+"`n` plus the nodes of `x` (the expression and its subexpressions), counted until the count is over `cap`."
+function nodesUpTo(@nospecialize(x::IR.Expression), cap::Int, n::Int)::Int
+  n += 1
+  n > cap && return n
+  for c::IR.Expression in IR.children(x)
+    n = nodesUpTo(c, cap, n)
+    n > cap && return n
+  end
+  return n
 end
 
 """
@@ -1640,22 +1678,33 @@ end
 
 "The Real and record targets of the statements, outside when statements, as written."
 function realTargets(stmts::Vector{IR.Statement})::Vector{String}
-  local out = String[]
-  local visit
-  visit = s -> begin
-    if s isa IR.ASSIGNMENT
-      for t in (s.lhs isa IR.TUPLE ? s.lhs.elements : IR.Expression[s.lhs])
-        local ty = IR.typeOf(t)
-        (t isa IR.CREF && (isRealType(ty) || ty isa IR.T_RECORD)) && push!(out, IR.toString(t))
-      end
-    elseif s isa IR.IF_STATEMENT
-      foreach(b -> foreach(visit, b.body), s.branches); foreach(visit, s.elseBody)
-    elseif s isa Union{IR.FOR_STATEMENT, IR.WHILE_STATEMENT}
-      foreach(visit, s.body)
+  local out::Vector{String} = String[]
+  for s::IR.Statement in stmts
+    realTargets!(out, s)
+  end
+  return out
+end
+
+"`realTargets` of the statement `s` (its nested statements too) onto `out`."
+function realTargets!(out::Vector{String}, s::IR.Statement)::Nothing
+  if s isa IR.ASSIGNMENT
+    for t in (s.lhs isa IR.TUPLE ? s.lhs.elements : IR.Expression[s.lhs])
+      local ty = IR.typeOf(t)
+      (t isa IR.CREF && (isRealType(ty) || ty isa IR.T_RECORD)) && push!(out, IR.toString(t))
+    end
+  elseif s isa IR.IF_STATEMENT
+    for b in s.branches, x::IR.Statement in b.body
+      realTargets!(out, x)
+    end
+    for x::IR.Statement in s.elseBody
+      realTargets!(out, x)
+    end
+  elseif s isa Union{IR.FOR_STATEMENT, IR.WHILE_STATEMENT}
+    for x::IR.Statement in s.body
+      realTargets!(out, x)
     end
   end
-  foreach(visit, stmts)
-  return out
+  return nothing
 end
 
 """

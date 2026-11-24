@@ -566,16 +566,28 @@ function callOutputs(call::CALL, f::MODELICA_FUNCTION, ctx::Interpretation)::Uni
   (ctx.steps, ctx.depth) = (0, 0)
   try
     #= record arguments as their fields, as the function's inputs are flattened =#
-    local flat = Exp[]
-    local flatten! = nothing
-    flatten! = (@nospecialize(a::Exp)) -> (a isa RECORD ? foreach(flatten!, a.exps) : push!(flat, a))
-    foreach(flatten!, call.args)
+    local flat::Vector{Exp} = Exp[]
+    for a::Exp in call.args
+      _flattenRecordArguments!(flat, a)
+    end
     foreach((@nospecialize(a::Exp)) -> argumentValues!(args, a, env, ctx), flat)
   catch err
     err isa InterpretationBail || _fallback(err, :interpretArguments; expect = MethodError)
     return nothing
   end
   return functionValues(f, args, ctx)
+end
+
+"The argument `a` onto `flat`: a record as its fields (records in it too), as a function's inputs are flattened."
+function _flattenRecordArguments!(flat::Vector{Exp}, @nospecialize(a::Exp))::Nothing
+  if a isa RECORD
+    for x::Exp in a.exps
+      _flattenRecordArguments!(flat, x)
+    end
+  else
+    push!(flat, a)
+  end
+  return nothing
 end
 
 """

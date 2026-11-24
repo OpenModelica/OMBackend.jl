@@ -230,13 +230,15 @@ namesReadOutsidePre(e::IR.Expression)::Vector{Symbol} = Symbol[c.name for c in c
 
 "The relations in `e`, each once (structurally), in a bottom-up order."
 function relationsIn(@nospecialize(e::IR.Expression))::Vector{IR.RELATION}
-  local out = IR.RELATION[]
-  local visit
-  visit = (@nospecialize(x::IR.Expression)) -> begin
-    foreach(visit, IR.children(x))
-    x isa IR.RELATION && !(x in out) && push!(out, x)
+  return relationsIn!(IR.RELATION[], e)
+end
+
+"`relationsIn` of `x` onto `out`: the subexpressions' relations first."
+function relationsIn!(out::Vector{IR.RELATION}, @nospecialize(x::IR.Expression))::Vector{IR.RELATION}
+  for c::IR.Expression in IR.children(x)
+    relationsIn!(out, c)
   end
-  visit(e)
+  x isa IR.RELATION && !(x in out) && push!(out, x)
   return out
 end
 

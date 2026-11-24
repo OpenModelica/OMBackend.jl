@@ -1812,10 +1812,8 @@ The names `ex` defines: its arguments, the names it assigns or declares local, i
 comprehensions' variables, its closures' arguments.
 """
 function _ownNames(ex::Expr)::Set{Symbol}
-  local own = Set{Symbol}()
-  local add!(x) = x isa Symbol ? push!(own, x) :
-    x isa Expr && x.head in (:tuple, :(::), :..., :parameters) ? foreach(add!, x.head === :(::) ? x.args[1:1] : x.args) :
-    x isa Expr && x.head === :(=) ? add!(x.args[1]) : nothing
+  local own::Set{Symbol} = Set{Symbol}()
+  local add! = (@nospecialize(x)) -> _addOwnNames!(own, x)
   ex.head === :-> && add!(ex.args[1])
   local worklist = Any[ex]
   while !isempty(worklist)
@@ -1829,6 +1827,23 @@ function _ownNames(ex::Expr)::Set{Symbol}
     append!(worklist, e.args)
   end
   return own
+end
+
+"""
+The names the binding target `x` introduces into `own` (`_ownNames`): a symbol; through a tuple, a typed name (its
+name), a splat, keyword parameters and a default's left side.
+"""
+function _addOwnNames!(own::Set{Symbol}, @nospecialize(x))::Nothing
+  if x isa Symbol
+    push!(own, x)
+  elseif x isa Expr && x.head in (:tuple, :(::), :..., :parameters)
+    for a in (x.head === :(::) ? x.args[1:1] : x.args)
+      _addOwnNames!(own, a)
+    end
+  elseif x isa Expr && x.head === :(=)
+    _addOwnNames!(own, x.args[1])
+  end
+  return nothing
 end
 
 "Whether `e.args[i]` is a name that is not read: `end` and `begin` in an index, a macro's name, a keyword's name."
@@ -2383,38 +2398,41 @@ equation determines them as much as its left side (`der(v) = x - 1` fixes
 x; pinned at its start, the init solve moved the fixed v instead).
 """
 function _initializationVarStrs(initEqs; reads::Bool = false)::OrderedSet{String}
-  local out = OrderedSet{String}()
-  local visit
-  visit = function (ex, isLhs0::Bool)
-    local isLhs = isLhs0 || reads
-    local v = Symbolics.unwrap(ex)
-    if !SymbolicUtils.iscall(v)
-      #= a parameter, time or a constant (no name) =#
-      local name::Union{Nothing, String} = variableName(v)
-      isLhs && name !== nothing && push!(out, name)
-      return nothing
-    end
-    local op = SymbolicUtils.operation(v)
-    if op isa ModelingToolkit.Differential
-      #= D(x), or D(expr): an observed variable the backend replaced by its
-         definition; every variable in it. =#
-      foreach(a -> union!(out, _variableNames(Symbolics.get_variables(a))), SymbolicUtils.arguments(v))
-      return nothing
-    end
-    #= x(t) is a call of x on t: a variable, not an expression. =#
-    if SymbolicUtils.issym(op)
-      isLhs && push!(out, variableName(v))
-      return nothing
-    end
-    #= An expression on the left (`x + y = 1`) determines every variable in it. =#
-    foreach(a -> visit(a, isLhs), SymbolicUtils.arguments(v))
-    return nothing
-  end
+  local out::OrderedSet{String} = OrderedSet{String}()
   for eq in initEqs
-    visit(eq.lhs, true)
-    visit(eq.rhs, false)
+    _initializationVarStrs!(out, eq.lhs, true, reads)
+    _initializationVarStrs!(out, eq.rhs, false, reads)
   end
   return out
+end
+
+"`_initializationVarStrs` of the side `ex` of an equation (`isLhs0`: the left side) onto `out`."
+function _initializationVarStrs!(out::OrderedSet{String}, @nospecialize(ex), isLhs0::Bool, reads::Bool)::Nothing
+  local isLhs::Bool = isLhs0 || reads
+  local v = Symbolics.unwrap(ex)
+  if !SymbolicUtils.iscall(v)
+    #= a parameter, time or a constant (no name) =#
+    local name::Union{Nothing, String} = variableName(v)
+    isLhs && name !== nothing && push!(out, name)
+    return nothing
+  end
+  local op = SymbolicUtils.operation(v)
+  if op isa ModelingToolkit.Differential
+    #= D(x), or D(expr): an observed variable the backend replaced by its
+       definition; every variable in it. =#
+    foreach(a -> union!(out, _variableNames(Symbolics.get_variables(a))), SymbolicUtils.arguments(v))
+    return nothing
+  end
+  #= x(t) is a call of x on t: a variable, not an expression. =#
+  if SymbolicUtils.issym(op)
+    isLhs && push!(out, variableName(v))
+    return nothing
+  end
+  #= An expression on the left (`x + y = 1`) determines every variable in it. =#
+  for a in SymbolicUtils.arguments(v)
+    _initializationVarStrs!(out, a, isLhs, reads)
+  end
+  return nothing
 end
 
 """
@@ -3332,31 +3350,34 @@ unknowns as they were while the condition looked them up (the same system,
 the same solution).
 """
 function namedStateLookups(ex, simCode::SC.SIM_CODE)::Vector{String}
-  local names = OrderedSet{String}()
-  local walk
-  walk = function (e)
-    e isa Expr || return nothing
-    if e.head == :call && length(e.args) == 3 && e.args[1] == :(OMBackend.CodeGeneration.WhenCondition) &&
-       e.args[2] isa Vector{String}
-      union!(names, Iterators.filter(n -> !SC.isScalarParameter(last(simCode.stringToSimVarHT[n])), e.args[2]))
-    end
-    local key = if e.head == :ref && length(e.args) == 2 && e.args[1] === :lookuptableStates
-      e.args[2]
-    elseif e.head == :call && length(e.args) == 3 && e.args[1] in (:getindex, getindex) && e.args[2] === :lookuptableStates
-      e.args[3]
-    else
-      nothing
-    end
-    if key isa Expr && key.head == :call && length(key.args) == 2 && key.args[1] === :Symbol && key.args[2] isa String
-      push!(names, key.args[2])
-    elseif key isa QuoteNode && key.value isa Symbol
-      push!(names, string(key.value))
-    end
-    foreach(walk, e.args)
-    return nothing
-  end
-  walk(ex)
+  local names::OrderedSet{String} = OrderedSet{String}()
+  _namedStateLookups!(names, ex, simCode)
   return collect(names)
+end
+
+"`namedStateLookups` of the expression `e` (its subexpressions too) onto `names`."
+function _namedStateLookups!(names::OrderedSet{String}, @nospecialize(e), simCode::SC.SIM_CODE)::Nothing
+  e isa Expr || return nothing
+  if e.head == :call && length(e.args) == 3 && e.args[1] == :(OMBackend.CodeGeneration.WhenCondition) &&
+     e.args[2] isa Vector{String}
+    union!(names, Iterators.filter(n -> !SC.isScalarParameter(last(simCode.stringToSimVarHT[n])), e.args[2]))
+  end
+  local key = if e.head == :ref && length(e.args) == 2 && e.args[1] === :lookuptableStates
+    e.args[2]
+  elseif e.head == :call && length(e.args) == 3 && e.args[1] in (:getindex, getindex) && e.args[2] === :lookuptableStates
+    e.args[3]
+  else
+    nothing
+  end
+  if key isa Expr && key.head == :call && length(key.args) == 2 && key.args[1] === :Symbol && key.args[2] isa String
+    push!(names, key.args[2])
+  elseif key isa QuoteNode && key.value isa Symbol
+    push!(names, string(key.value))
+  end
+  for a in e.args
+    _namedStateLookups!(names, a, simCode)
+  end
+  return nothing
 end
 
 """

@@ -124,19 +124,23 @@ Booleans of the condition (`when boolVar then`), for which the discrete callback
 edge latch.
 """
 function _collectBareCrefStrings(@nospecialize(cond::SC.Exp))::OrderedSet{String}
-  local out = OrderedSet{String}()
-  local walk = function (@nospecialize(e::SC.Exp), insideObs::Bool)
-    if e isa Union{SC.EXP_CREF, SC.DER}
-      insideObs || push!(out, SC.crefName(e.cref))
-    elseif e isa SC.CALL
-      local nested = insideObs || e.name in (:change, :pre)
-      foreach(a -> walk(a, nested), e.args)
-    elseif e isa Union{SC.BINARY, SC.LBINARY, SC.RELATION, SC.UNARY, SC.LUNARY, SC.IFEXP}
-      foreach(c -> walk(c, insideObs), SC.children(e))
+  return _bareCrefStrings!(OrderedSet{String}(), cond, false)
+end
+
+"`_collectBareCrefStrings` of `e` onto `out`; `insideObs`: inside change() or pre(), whose references are left out."
+function _bareCrefStrings!(out::OrderedSet{String}, @nospecialize(e::SC.Exp), insideObs::Bool)::OrderedSet{String}
+  if e isa Union{SC.EXP_CREF, SC.DER}
+    insideObs || push!(out, SC.crefName(e.cref))
+  elseif e isa SC.CALL
+    local nested::Bool = insideObs || e.name in (:change, :pre)
+    for a in e.args
+      _bareCrefStrings!(out, a, nested)
     end
-    return
+  elseif e isa Union{SC.BINARY, SC.LBINARY, SC.RELATION, SC.UNARY, SC.LUNARY, SC.IFEXP}
+    for c in SC.children(e)
+      _bareCrefStrings!(out, c, insideObs)
+    end
   end
-  walk(cond, false)
   return out
 end
 
@@ -794,15 +798,16 @@ end
 The sample() calls of a condition that is only sample()s or-ed (more than one), or nothing.
 """
 function _sampleDisjuncts(@nospecialize(cond::SC.Exp))::Union{Vector{SC.CALL}, Nothing}
-  local out = SC.CALL[]
-  local collect! = nothing
-  collect! = (@nospecialize(e::SC.Exp)) -> begin
-    (e isa SC.LBINARY && e.op === SC.OP_OR) && return collect!(e.exp1) && collect!(e.exp2)
-    SC.isBuiltin(e, :sample) || return false
-    push!(out, e)
-    return true
-  end
-  return (collect!(cond) && length(out) > 1) ? out : nothing
+  local out::Vector{SC.CALL} = SC.CALL[]
+  return (_sampleDisjuncts!(out, cond) && length(out) > 1) ? out : nothing
+end
+
+"The sample() calls of the disjunction `e` onto `out`: false at the first operand that is no sample() call."
+function _sampleDisjuncts!(out::Vector{SC.CALL}, @nospecialize(e::SC.Exp))::Bool
+  (e isa SC.LBINARY && e.op === SC.OP_OR) && return _sampleDisjuncts!(out, e.exp1) && _sampleDisjuncts!(out, e.exp2)
+  SC.isBuiltin(e, :sample) || return false
+  push!(out, e)
+  return true
 end
 
 """
@@ -811,22 +816,24 @@ triggers, none of them under a sample() (Buildings' occupant lighting: `when {oc
 sampleTrigger}`, edge(occ) or sample(t0, samplePeriod)), or nothing.
 """
 function _sampleOrOthers(@nospecialize(cond::SC.Exp))::Union{Tuple{Vector{SC.CALL}, SC.Exp}, Nothing}
-  local samples = SC.CALL[]
-  local others = SC.Exp[]
-  local collect! = nothing
-  collect! = (@nospecialize(e::SC.Exp)) -> begin
-    if e isa SC.LBINARY && e.op === SC.OP_OR
-      collect!(e.exp1); collect!(e.exp2)
-    elseif SC.isBuiltin(e, :sample)
-      push!(samples, e)
-    else
-      push!(others, e)
-    end
-    return nothing
-  end
-  collect!(cond)
+  local samples::Vector{SC.CALL} = SC.CALL[]
+  local others::Vector{SC.Exp} = SC.Exp[]
+  _sampleOrOthers!(samples, others, cond)
   (isempty(samples) || isempty(others) || any(_containsSampleCall, others)) && return nothing
   return (samples, foldl((a, b) -> SC.LBINARY(a, SC.OP_OR, b), others))
+end
+
+"The operands of the disjunction `e`: its sample() calls onto `samples`, the others onto `others`."
+function _sampleOrOthers!(samples::Vector{SC.CALL}, others::Vector{SC.Exp}, @nospecialize(e::SC.Exp))::Nothing
+  if e isa SC.LBINARY && e.op === SC.OP_OR
+    _sampleOrOthers!(samples, others, e.exp1)
+    _sampleOrOthers!(samples, others, e.exp2)
+  elseif SC.isBuiltin(e, :sample)
+    push!(samples, e)
+  else
+    push!(others, e)
+  end
+  return nothing
 end
 
 """

@@ -910,17 +910,24 @@ end
 "The variables the initial algorithms assign (`which`: those of the algorithms it marks)."
 function _initAlgAssigned(g::Gen, which::BitVector = trues(length(g.initAlgs)))::Set{String}
   local names::Set{String} = Set{String}()
-  local visit!::Function = function (stmts::Vector{Stmt})
-    for st in stmts
-      st isa SAssign && push!(names, st.target.name)
-      st isa SIf && foreach(b::Tuple{IR, Vector{Stmt}} -> visit!(b[2]), st.branches)
-      (st isa SFor || st isa SWhile) && visit!(st.body)
-    end
-  end
   for (k::Int, a::AlgClass) in enumerate(g.initAlgs)
-    which[k] && visit!(a.body)
+    which[k] && _assignedIn!(names, a.body, false)
   end
   return names
+end
+
+"The variables the statements `stmts` assign (nested ones too; in when-statements if `inWhens`), into `names`."
+function _assignedIn!(names::Set{String}, stmts::Vector{Stmt}, inWhens::Bool)::Nothing
+  for st::Stmt in stmts
+    st isa SAssign && push!(names, st.target.name)
+    if st isa SIf || (inWhens && st isa SWhen)
+      for b::Tuple{IR, Vector{Stmt}} in st.branches
+        _assignedIn!(names, b[2], inWhens)
+      end
+    end
+    (st isa SFor || st isa SWhile) && _assignedIn!(names, st.body, inWhens)
+  end
+  return nothing
 end
 
 """
@@ -1031,16 +1038,12 @@ _initialFreeParams(g::Gen)::Set{String} =
 "The variables algorithms (also initial ones) and when-equations assign."
 function _assignedNames(g::Gen)::Set{String}
   local names::Set{String} = Set{String}()
-  local visit!::Function = function (stmts::Vector{Stmt})
-    for st in stmts
-      st isa SAssign && push!(names, st.target.name)
-      st isa SIf && foreach(b::Tuple{IR, Vector{Stmt}} -> visit!(b[2]), st.branches)
-      st isa SWhen && foreach(b::Tuple{IR, Vector{Stmt}} -> visit!(b[2]), st.branches)
-      (st isa SFor || st isa SWhile) && visit!(st.body)
-    end
+  for a::AlgClass in g.algs
+    _assignedIn!(names, a.body, true)
   end
-  foreach(a::AlgClass -> visit!(a.body), g.algs)
-  foreach(a::AlgClass -> visit!(a.body), g.initAlgs)
+  for a::AlgClass in g.initAlgs
+    _assignedIn!(names, a.body, true)
+  end
   for w in g.whens, (_, target, _) in w.body
     push!(names, target.name)
   end
@@ -1542,24 +1545,7 @@ with their static ranges).
 """
 function _algAccesses!(g::Gen, stmts::Vector{Stmt}, env::Dict{Int, Int}, d::Matrix{Int}, col::Int,
                        outs::Set{Int}, ins::Set{Int}, sids::Set{Int})
-  local readIR! = function (x::IR)
-    if x isa Ref
-      local info = g.vars[x.name]
-      if info.kind != :param
-        local idx = Int[_evalIntEnv(g, s, env, d, col) for s in x.subs]
-        local off = info.offset + _elementOffset(info, idx, x.name) + 1
-        local u = _unknownOf(g, info, off, x.der)
-        u > 0 && push!(ins, u)
-        info.kind == :state && !x.der && push!(sids, off)
-      end
-    elseif x isa Op
-      foreach(readIR!, x.args)
-    elseif x isa Rel
-      readIR!(x.lhs); readIR!(x.rhs)
-    elseif x isa EvFn
-      readIR!(x.arg)
-    end
-  end
+  local readIR! = (x::IR) -> _algReads!(g, x, env, d, col, ins, sids)
   for st in stmts
     if st isa SAssign
       local info = g.vars[st.target.name]
@@ -1591,6 +1577,30 @@ function _algAccesses!(g::Gen, stmts::Vector{Stmt}, env::Dict{Int, Int}, d::Matr
       readIR!(st.call)
     end
   end
+end
+
+"The unknowns (into `ins`) and the states' offsets (into `sids`) the expression `x` of an algorithm reads (`_algAccesses!`)."
+function _algReads!(g::Gen, x::IR, env::Dict{Int, Int}, d::Matrix{Int}, col::Int, ins::Set{Int}, sids::Set{Int})::Nothing
+  if x isa Ref
+    local info = g.vars[x.name]
+    if info.kind != :param
+      local idx = Int[_evalIntEnv(g, s, env, d, col) for s in x.subs]
+      local off = info.offset + _elementOffset(info, idx, x.name) + 1
+      local u = _unknownOf(g, info, off, x.der)
+      u > 0 && push!(ins, u)
+      info.kind == :state && !x.der && push!(sids, off)
+    end
+  elseif x isa Op
+    for a::IR in x.args
+      _algReads!(g, a, env, d, col, ins, sids)
+    end
+  elseif x isa Rel
+    _algReads!(g, x.lhs, env, d, col, ins, sids)
+    _algReads!(g, x.rhs, env, d, col, ins, sids)
+  elseif x isa EvFn
+    _algReads!(g, x.arg, env, d, col, ins, sids)
+  end
+  return nothing
 end
 
 function _evalIntEnv(g::Gen, x::IR, env::Dict{Int, Int}, d::Matrix{Int}, col::Int)::Int

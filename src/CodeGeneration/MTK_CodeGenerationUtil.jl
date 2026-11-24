@@ -192,17 +192,16 @@ end
 
 "The relations of a condition that generate events (not inside noEvent)."
 function _eventRelations(cond::SC.Exp)::Vector{SC.RELATION}
-  local out = SC.RELATION[]
-  local visit = function (e::SC.Exp)
-    if SC.isBuiltin(e, :noEvent)
-      return
-    elseif e isa SC.RELATION
-      push!(out, e)
-      return
-    end
-    foreach(visit, SC.children(e))
+  return _eventRelations!(SC.RELATION[], cond)
+end
+
+"`_eventRelations` of `e` onto `out`: a relation's operands and noEvent() are not searched."
+function _eventRelations!(out::Vector{SC.RELATION}, e::SC.Exp)::Vector{SC.RELATION}
+  SC.isBuiltin(e, :noEvent) && return out
+  e isa SC.RELATION && return push!(out, e)
+  for c::SC.Exp in SC.children(e)
+    _eventRelations!(out, c)
   end
-  visit(cond)
   return out
 end
 
@@ -1959,15 +1958,19 @@ function _ifConditionLiteral(condition::SC.Exp, simCode::SC.SIM_CODE)::Bool
     x isa SC.PRE || (x isa SC.CALL && x.kind === SC.CALL_BUILTIN && x.name in (:initial, :terminal, :sample, :edge, :change, :delay))
   end
   eventOperator && return false
-  local outside = OrderedSet{String}()
-  local visit = function (e::SC.Exp)
-    SC.isBuiltin(e, :noEvent) && return
-    e isa SC.EXP_CREF && push!(outside, SC.crefName(e.cref))
-    foreach(visit, SC.children(e))
-  end
-  visit(condition)
+  local outside::OrderedSet{String} = _crefNamesOutsideNoEvent!(OrderedSet{String}(), condition)
   local ht = simCode.stringToSimVarHT
   return all(n -> haskey(ht, n) && (last(ht[n]).varKind isa SC.DISCRETE || SC.isScalarParameter(last(ht[n]))), outside)
+end
+
+"The names `e` reads outside noEvent() onto `out` (`_ifConditionLiteral`)."
+function _crefNamesOutsideNoEvent!(out::OrderedSet{String}, e::SC.Exp)::OrderedSet{String}
+  SC.isBuiltin(e, :noEvent) && return out
+  e isa SC.EXP_CREF && push!(out, SC.crefName(e.cref))
+  for c::SC.Exp in SC.children(e)
+    _crefNamesOutsideNoEvent!(out, c)
+  end
+  return out
 end
 
 """

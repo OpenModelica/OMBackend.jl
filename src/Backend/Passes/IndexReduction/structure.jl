@@ -139,19 +139,35 @@ The variables a when-equation of the partition assigns: discrete, known to the c
 system (as parameters, constants and time are).
 """
 function discreteTargets(partition::IR.Partition)::Set{Symbol}
-  local out = Set{Symbol}()
-  local visit(s::IR.ASSIGNMENT) = s.lhs isa IR.CREF && push!(out, s.lhs.cref.name)
-  local visit(s::Union{IR.IF_STATEMENT, IR.WHEN_STATEMENT}) =
-    (foreach(b -> foreach(visit, b.body), s.branches); s isa IR.IF_STATEMENT && foreach(visit, s.elseBody))
-  local visit(s::Union{IR.FOR_STATEMENT, IR.WHILE_STATEMENT}) = foreach(visit, s.body)
-  local visit(::IR.Statement) = nothing
+  local out::Set{Symbol} = Set{Symbol}()
   for eq in partition.equations
     eq isa IR.WHEN_EQUATION || continue
-    for b in eq.branches
-      foreach(visit, b.body)
+    for b in eq.branches, s::IR.Statement in b.body
+      whenAssignedNames!(out, s)
     end
   end
   return out
+end
+
+"The names the statement `s` assigns a reference to (its nested statements too) into `out` (`discreteTargets`)."
+function whenAssignedNames!(out::Set{Symbol}, s::IR.Statement)::Nothing
+  if s isa IR.ASSIGNMENT
+    s.lhs isa IR.CREF && push!(out, s.lhs.cref.name)
+  elseif s isa Union{IR.IF_STATEMENT, IR.WHEN_STATEMENT}
+    for b in s.branches, x::IR.Statement in b.body
+      whenAssignedNames!(out, x)
+    end
+    if s isa IR.IF_STATEMENT
+      for x::IR.Statement in s.elseBody
+        whenAssignedNames!(out, x)
+      end
+    end
+  elseif s isa Union{IR.FOR_STATEMENT, IR.WHILE_STATEMENT}
+    for x::IR.Statement in s.body
+      whenAssignedNames!(out, x)
+    end
+  end
+  return nothing
 end
 
 """

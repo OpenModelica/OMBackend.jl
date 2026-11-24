@@ -643,24 +643,11 @@ marked to run at the start of a solve too). A tuple assignment in an initial bod
 target.
 """
 function extractInitialWhenAlgorithms(whens::Vector{IR.WHEN_EQUATION})::Tuple{Vector{RuntimeWhen}, Vector{Vector{IR.Statement}}}
-  local runtime = RuntimeWhen[]
-  local initial = Vector{IR.Statement}[]
-  local visit
-  visit = (branches::Vector{IR.WhenBranch}, w::IR.WHEN_EQUATION, afterInitial::Bool) -> begin
-    local b = branches[1]
-    if b.atInitial && isempty(b.triggers) && !b.atTerminal
-      afterInitial || push!(initial, tupleAssignmentsSplit(whenOperators(b.body)))
-      length(branches) > 1 && visit(branches[2:end], w, true)
-    elseif b.atInitial
-      afterInitial || push!(initial, tupleAssignmentsSplit(whenOperators(b.body)))
-      #= its other triggers as one condition, a terminal() one among them (not split) =#
-      local runtimeBranches = IR.WhenBranch[IR.WhenBranch(b.triggers, false, b.atTerminal, b.body), branches[2:end]...]
-      push!(runtime, RuntimeWhen(runtimeBranches, w.source, true))
-    else
-      append!(runtime, splitTerminalTrigger(RuntimeWhen(branches, w.source, false)))
-    end
+  local runtime::Vector{RuntimeWhen} = RuntimeWhen[]
+  local initial::Vector{Vector{IR.Statement}} = Vector{IR.Statement}[]
+  for w::IR.WHEN_EQUATION in whens
+    _initialWhenBranches!(runtime, initial, w.branches, w, false)
   end
-  foreach(w -> visit(w.branches, w, false), whens)
   return (runtime, initial)
 end
 
@@ -669,6 +656,28 @@ struct RuntimeWhen
   branches::Vector{IR.WhenBranch}
   source::IR.Source
   alsoInitial::Bool
+end
+
+"""
+`extractInitialWhenAlgorithms` of the branches `branches` of `w` onto `runtime` and `initial`; `afterInitial`: an
+earlier branch was the `initial()` one.
+"""
+function _initialWhenBranches!(runtime::Vector{RuntimeWhen}, initial::Vector{Vector{IR.Statement}},
+                               branches::Vector{IR.WhenBranch}, w::IR.WHEN_EQUATION, afterInitial::Bool)::Nothing
+  local b::IR.WhenBranch = branches[1]
+  if b.atInitial && isempty(b.triggers) && !b.atTerminal
+    afterInitial || push!(initial, tupleAssignmentsSplit(whenOperators(b.body)))
+    length(branches) > 1 && _initialWhenBranches!(runtime, initial, branches[2:end], w, true)
+  elseif b.atInitial
+    afterInitial || push!(initial, tupleAssignmentsSplit(whenOperators(b.body)))
+    #= its other triggers as one condition, a terminal() one among them (not split) =#
+    local runtimeBranches::Vector{IR.WhenBranch} =
+      IR.WhenBranch[IR.WhenBranch(b.triggers, false, b.atTerminal, b.body), branches[2:end]...]
+    push!(runtime, RuntimeWhen(runtimeBranches, w.source, true))
+  else
+    append!(runtime, splitTerminalTrigger(RuntimeWhen(branches, w.source, false)))
+  end
+  return nothing
 end
 
 """
