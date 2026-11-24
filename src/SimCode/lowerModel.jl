@@ -623,7 +623,7 @@ function _sampleTriggersInStatement(s::IR.Statement, defs::Dict{Symbol, IR.Expre
   s isa IR.ASSIGNMENT && return IR.ASSIGNMENT(s.lhs, _sampleTriggersInBody(s.rhs, defs), s.source)
   s isa IR.REINIT && return IR.REINIT(s.state, _sampleTriggersInBody(s.value, defs), s.source)
   s isa IR.ASSERT && return IR.ASSERT(_sampleTriggersInBody(s.condition, defs), s.message, s.level, s.source)
-  s isa IR.NORETCALL && return IR.NORETCALL(_sampleTriggersInBody(s.exp, defs), s.source)
+  s isa IR.NORETCALL && return IR.NORETCALL(_sampleTriggersInBody(s.call, defs), s.source)
   s isa IR.TERMINATE && return IR.TERMINATE(_sampleTriggersInBody(s.message, defs), s.source)
   s isa IR.IF_STATEMENT &&
     return IR.IF_STATEMENT(IR.StatementBranch[IR.StatementBranch(_sampleTriggersInBody(b.condition, defs),
