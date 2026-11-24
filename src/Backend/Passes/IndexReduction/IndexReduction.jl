@@ -88,9 +88,9 @@ import ..substituteIterators, ..foldSubscripts, ..expressionLargerThan, ..foldIn
        ..bodyRecordEquations
 import ...envSwitch
 import ...LowerUtil: assignedCrefs
-import ..Evaluation: arithmetic, asRecord, divide, elementOf, evaluate, foldScalar, genericOffset,
+import ..Evaluation: asRecord, divide, elementOf, evaluate, foldScalar, genericOffset,
        genericValues, ifThenElse, inlineBody, isLiteral, isOne, isZero, isZeroExp, literalCondition,
-       literalValue, minus, negate, ONE, ownValues, plus, power, real, selectElement, StartValues, subscripted,
+       literalValue, minus, negate, ONE, ownValues, plus, power, real, selectElement, StartValues,
        times, withKnownValues, withKnownValuesAndConstants, functionDefinedValues, ZERO, zeroOf
 const IR = OMJLIR
 

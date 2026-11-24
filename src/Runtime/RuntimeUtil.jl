@@ -39,7 +39,6 @@ import DifferentialEquations
 import DifferentialEquations.ReturnCode
 import ModelingToolkit
 import OMBackend
-import OMBackend.@BACKEND_LOGGING
 
 """
   Converts a symbol (of a MTK variable) to a string.

@@ -50,7 +50,6 @@ using LinearAlgebra
 import ...SimCode
 import ...OMBackend
 import ..AlgorithmicCodeGeneration
-import ..CodeGenerationUtil
 using ..CodeGenerationUtil
 import ..CodeGeneration: lowerKnownSymbolicFunctionCall
 import ..MTKDump: dumpPreStructuralSimplifyExpr
@@ -58,7 +57,6 @@ import ..MTKDump: dumpPreStructuralSimplifyExpr
 import ...@BACKEND_LOGGING
 
 import Symbolics
-import Symbolics.RuntimeGeneratedFunctions
 import SymbolicUtils
 import OMRuntimeExternalC
 

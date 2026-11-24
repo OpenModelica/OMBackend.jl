@@ -38,7 +38,7 @@ This file contains utility macros used by the backend.
 =#
 
 using Dates
-using DataStructures: OrderedDict, OrderedSet
+using DataStructures: OrderedSet
 
 
 """

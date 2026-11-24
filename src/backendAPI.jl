@@ -77,8 +77,6 @@ import .OMJLIR
 import .Passes
 import .SimCode
 
-import Base.Meta
-
 #= Settings =#
 const WARN_MISSING_START_VALUES = Ref(false)
 

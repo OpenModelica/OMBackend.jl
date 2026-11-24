@@ -47,10 +47,8 @@ using LinearAlgebra
 import ...SimCode
 import ...OMBackend
 import ..AlgorithmicCodeGeneration
-import ...@BACKEND_LOGGING
 
 import Symbolics
-import Symbolics.RuntimeGeneratedFunctions
 import SymbolicUtils
 import OMRuntimeExternalC
 
