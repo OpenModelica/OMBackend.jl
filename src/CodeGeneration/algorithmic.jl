@@ -731,7 +731,7 @@ function _fortranExternalBody(func::SC.EXTERNAL_MODELICA_FUNCTION)::Expr
       local v = vars[a]
       local elem = _funcParamElemType(v)
       if elem isa SC.TYPE_STRING
-        _funcParamIsArray(v) && OMBackend.unsupported("a FORTRAN 77 character array", a)
+        _funcParamIsArray(v) && CodeGeneration.OMBackend.unsupported("a FORTRAN 77 character array", a)
         push!(types, :(Ref{UInt8})); push!(args, :(UInt8(first($a))))
         push!(hiddenLengths, 1)
         continue
@@ -751,7 +751,7 @@ function _fortranExternalBody(func::SC.EXTERNAL_MODELICA_FUNCTION)::Expr
         push!(types, :(Ref{$jlType})); push!(args, r)
       end
     else
-      OMBackend.unsupported("a FORTRAN 77 argument", a)
+      CodeGeneration.OMBackend.unsupported("a FORTRAN 77 argument", a)
     end
   end
   append!(types, fill(:Clong, length(hiddenLengths))); append!(args, hiddenLengths)

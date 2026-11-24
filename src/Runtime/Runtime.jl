@@ -48,6 +48,7 @@ import ..@VSS_DEBUG
 import ModelingToolkit
 import Setfield
 import DiffEqBase
+import LinearAlgebra
 
 using DataStructures
 using ModelingToolkit
@@ -516,7 +517,7 @@ function _isDAETransferTarget(newSystem)::Bool
     if mm === nothing
       return false
     end
-    if mm isa UniformScaling
+    if mm isa LinearAlgebra.UniformScaling
       return false
     end
     local d = [mm[k, k] for k in 1:size(mm, 1)]
