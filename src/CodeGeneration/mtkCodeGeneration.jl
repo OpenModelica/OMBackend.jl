@@ -339,7 +339,6 @@ constructor in favor of the direct-RHS path.
 emitDirectRHSProblem() = :(
   problem = OMBackend.CodeGeneration.buildDirectRHSProblem(
     reducedSystem, finalInitialValues, pars, tspan, callbacks;
-    allInitialValues = initialValues,
     liftedDiscretes = (@isdefined(LIFTED_DISCRETES) ? LIFTED_DISCRETES : String[]),
     freeParameters = (@isdefined(FREE_PARAMETERS) ? FREE_PARAMETERS : String[]),
     assignedParameters = (@isdefined(ASSIGNED_PARAMETERS) ? ASSIGNED_PARAMETERS : String[]),

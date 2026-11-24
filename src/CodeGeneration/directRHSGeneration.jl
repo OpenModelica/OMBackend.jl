@@ -132,8 +132,7 @@ end
 const DAE_REINIT = IdDict{Any, Function}()
 
 """
-    buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, callbacks;
-                          allInitialValues=nothing)
+    buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, callbacks; ...)
 
 Build an ODEProblem by extracting the RHS function directly from the reduced MTK
 system's symbolic equations, bypassing MTK's ODEProblem constructor.
@@ -141,16 +140,11 @@ system's symbolic equations, bypassing MTK's ODEProblem constructor.
 Uses `Symbolics.build_function` with CSE to generate compact index-based code,
 wrapped in a `RuntimeGeneratedFunction` for world-age safety.
 
-`allInitialValues` provides Modelica start values for algebraic variables that
-`splitInitialValues` demoted to guesses. Without these, algebraic variables
-default to 0.0, which may cause InitialFailure for DAE systems.
-
 Returns an `ODEProblem` ready for `solve()`. `callbacks` is not specialized on: its type holds the generated
 module's closures (a new type per translate), and the method only passes it on; specialized, it compiled
 12-14 s again for each translate of MSL BatchPlant_StandardWater.
 """
 function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, @nospecialize(callbacks);
-                               allInitialValues=nothing,  # kept for API compat but guesses from reducedSystem are preferred
                                liftedDiscretes=String[],
                                freeParameters=String[],
                                assignedParameters=String[],
