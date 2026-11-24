@@ -50,10 +50,15 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     env:
-      # the nightly failure mail needs both mail secrets (not set: GitHub's own notification)
-      MAIL_CONFIGURED: ${{ secrets.MAIL_USERNAME != '' && secrets.MAIL_PASSWORD != '' }}
       # the depot cache's name: one per OS, arch and Julia version (the Linux shards share theirs)
       DEPOT_CACHE_NAME: ombackend-cpu-targets;os=${{ matrix.os }};arch=${{ matrix.arch }};version=${{ matrix.version }}
+      # A pull request precompiles OMBackend without its workloads; test/precompileWorkloadTests.jl still runs them.
+      # Fork A/B (JKRT/OMBackend.jl PR 2): with workloads the image took 7-16 min and the four jobs 110 runner-min
+      # (kept 36); without, 22-36 s and 88 runner-min (kept 15). The first calls then compile in the tests
+      # (scalarized +12 min), which the workloads' image time costs too. Master keeps them, as users get them.
+      OMBACKEND_NO_PRECOMPILE_WORKLOAD: ${{ github.event_name == 'pull_request' }}
+      # where master leaves its resolved versions for pull requests (the depot's logs directory: the cache saves it)
+      CI_MANIFEST: ombackend-ci-Manifest.toml
     strategy:
       fail-fast: false
       # group: OMBACKEND_TEST_GROUP (test/runtests.jl). Linux runs the whole suite in two shards, one per route of the
@@ -171,6 +176,19 @@ jobs:
           # a restored registry is as old as its cache (julia-actions/cache updates it on master; a PR's restore does not)
           Pkg.Registry.update()
 
+      # A pull request resolves the versions master's cache compiled. Else each package released since master's last
+      # run is compiled again with its dependents: 037408a's run compiled 43 packages in 33-43 min per job, SymbolicUtils
+      # 4.56.3 (released after the nightly) and the ModelingToolkit chain among them. With master's versions the fork
+      # test (JKRT/OMBackend.jl PR 2) compiled 4: OMBackend and its extensions. A change of a sibling or of OMBackend's
+      # own dependencies still resolves what it needs.
+      - name: Master's resolved versions (pull request)
+        if: github.event_name == 'pull_request'
+        shell: julia --color=yes {0}
+        run: |
+          manifest = joinpath(DEPOT_PATH[1], "logs", ENV["CI_MANIFEST"])
+          println(isfile(manifest) ? "master's versions: $manifest" : "no versions from master (none cached yet)")
+          isfile(manifest) && cp(manifest, joinpath("OMBackend.jl", "Manifest.toml"); force = true)
+
       - name: Develop the sibling checkouts
         shell: julia --color=yes --project=OMBackend.jl {0}
         run: |
@@ -183,6 +201,14 @@ jobs:
         uses: julia-actions/julia-buildpkg@v1
         with:
           project: OMBackend.jl
+
+      # master's resolved versions saved with its depot cache, for pull requests (the step before the siblings)
+      - name: Keep the resolved versions with the depot cache (master)
+        if: github.event_name != 'pull_request'
+        shell: julia --color=yes {0}
+        run: |
+          mkpath(joinpath(DEPOT_PATH[1], "logs"))
+          cp(joinpath("OMBackend.jl", "Manifest.toml"), joinpath(DEPOT_PATH[1], "logs", ENV["CI_MANIFEST"]); force = true)
 
       # Which of our packages the restored depot has precompiled for the test
       # run (its flags: coverage on Linux), and why a cache is rejected
@@ -232,27 +258,6 @@ jobs:
           name: coverage-${{ matrix.group }}
           path: lcov.info
           retention-days: 14
-
-      - name: Email maintainer on nightly failure
-        if: ${{ failure() && github.event_name == 'schedule' && env.MAIL_CONFIGURED == 'true' }}
-        continue-on-error: true
-        uses: dawidd6/action-send-mail@v3
-        with:
-          server_address: smtp.gmail.com
-          server_port: 465
-          secure: true
-          username: ${{ secrets.MAIL_USERNAME }}
-          password: ${{ secrets.MAIL_PASSWORD }}
-          from: OMBackend CI <${{ secrets.MAIL_USERNAME }}>
-          to: jtinnerholm@gmail.com
-          subject: "[OMBackend nightly] ${{ matrix.os }} Julia ${{ matrix.version }} FAILED"
-          body: |
-            The nightly CI run for OMBackend.jl failed.
-
-            Workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-            Commit:       ${{ github.sha }}
-            Branch:       ${{ github.ref_name }}
-            Matrix:       ${{ matrix.os }} / Julia ${{ matrix.version }} / ${{ matrix.arch }}
 
   # The Linux shards' coverage merged: the percentage and a table per file in the job summary, the merged lcov file
   # an artifact; on master, when all shards passed, coverage.json on gh-pages for the README's badge (the action is
