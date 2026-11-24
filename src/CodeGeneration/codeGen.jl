@@ -281,12 +281,13 @@ binding (createDataStructureAssignments), never a state or parameter slot.
 """
 function _whenLookupBindings(names::Vector{String}, simCode::SC.SIM_CODE)::Vector{Expr}
   local u = _WHEN_STATE_VECTOR
-  local readsStates = false
+  #= a Ref: a flag the closure sets is boxed =#
+  local readsStates::Base.RefValue{Bool} = Base.RefValue{Bool}(false)
   #= a state lookup `getindex(x, i)` reads `u` instead =#
   local lookup = function (key::String)
     local e = getIdxForLookupMTK(key, simCode)
     (e isa Expr && e.head === :call && e.args[1] === getindex && e.args[2] === :x) || return e
-    readsStates = true
+    readsStates[] = true
     return Expr(:call, getindex, u, e.args[3:end]...)
   end
   local out = Expr[]
@@ -305,7 +306,7 @@ function _whenLookupBindings(names::Vector{String}, simCode::SC.SIM_CODE)::Vecto
     push!(out, Expr(:(=), Symbol(name), lookup(name)))
   end
   #= taken where a lookup reads it (a callback that reads no state may have no `x`) =#
-  readsStates && pushfirst!(out, :($(u) = @isdefined($(u)) ? $(u) : x))
+  readsStates[] && pushfirst!(out, :($(u) = @isdefined($(u)) ? $(u) : x))
   return out
 end
 

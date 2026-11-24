@@ -119,7 +119,9 @@ function _columnGroups(structure::SA.SparseMatrixCSC{Float64, Int}, var_idx::Abs
       g = length(groups)
     end
     push!(groups[g], jcol)
-    foreach(r -> taken[g][r] = true, colRows)
+    for r in colRows
+      taken[g][r] = true
+    end
   end
   return groups
 end
@@ -945,8 +947,9 @@ function _solveDAEPhase!(u0, rhsFunc, p_vec, eq_idx, var_idx; targets=zeros(Floa
      at 1 so weak rows are never inflated) puts residuals in solve-variable
      units, comparable across rows AND across iterates. Refreshed once, after
      the first step, for the rows a far entry guess scaled 1e3 times too high. =#
-  local rowNorm = Float64[]
-  local lastNres = Float64[]
+  #= both set in place (`copy!`): closures below read them, and a reassigned captured variable is boxed =#
+  local rowNorm::Vector{Float64} = Float64[]
+  local lastNres::Vector{Float64} = Float64[]
   local phiEntry = Inf
   #= the equilibrated norms of the iterations: a phase whose iterate no longer moves (`stationaryPhase`) stops =#
   local norms = Float64[]
@@ -971,8 +974,8 @@ function _solveDAEPhase!(u0, rhsFunc, p_vec, eq_idx, var_idx; targets=zeros(Floa
       return false
     end
     if iter == 1
-      rowNorm = OMBackend.envSwitch("OMBACKEND_INIT_ROWSCALE") ?
-        [max(maximum(abs, @view J[i, :]), 1.0) for i in 1:nRows] : ones(nRows)
+      copy!(rowNorm, OMBackend.envSwitch("OMBACKEND_INIT_ROWSCALE") ?
+        [max(maximum(abs, @view J[i, :]), 1.0) for i in 1:nRows] : ones(nRows))
     elseif iter == 2 && OMBackend.envSwitch("OMBACKEND_INIT_ROWSCALE")
       #= A row whose entry scale came from a far guess (MSL ThreeSprings: a line force's direction
          r/s_small = -2e9 where its length's start is 0) is equilibrated again after the first
@@ -986,7 +989,7 @@ function _solveDAEPhase!(u0, rhsFunc, p_vec, eq_idx, var_idx; targets=zeros(Floa
       rescaled && (phiEntry = Inf)
     end
     local norm_res = maximum(abs, res ./ rowNorm)
-    traceInit && (lastNres = res ./ rowNorm)
+    traceInit && copy!(lastNres, res ./ rowNorm)
     traceInit && println("[initphase ", phaseLabel, "] iter=", iter,
                          " norm=", round(norm_res, sigdigits = 4),
                          " rows=", nRows, " vars=", nVar)

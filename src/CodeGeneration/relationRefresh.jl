@@ -1131,7 +1131,9 @@ function _initialize!(e::EventIteration, integrator)
     start[moved] = before[moved]
     _INSTANT_PRE[integrator].u = start
   end
-  foreach(d -> d.initialize!(start, integrator.t, integrator), e.discreteWhens)
+  for d in e.discreteWhens
+    d.initialize!(start, integrator.t, integrator)
+  end
   #= The initialization solved the discretes with pre() at the start values
      (`mode(start = Unknown, fixed = true)`); the iteration reads pre() from the
      initial values: the friction's `startBackward = pre(mode) == Stuck and sa <
@@ -1338,18 +1340,26 @@ function _sweepOrder(clusters::Vector{DiscreteCluster}, whens::Vector{DiscreteWh
   local group::Vector{Int} = _cycleGroups(before)
   local placed::Vector{Bool} = fill(false, n)
   local order::Vector{Int} = Int[]
-  local place!(g::Int)::Nothing = begin
-    local members::Vector{Int} = Int[k for k in 1:n if group[k] == g && !placed[k]]
-    isempty(members) && return nothing
-    foreach(k -> placed[k] = true, members)
-    for k in members, a in before[k]
-      group[a] == g || placed[a] || place!(group[a])
-    end
-    append!(order, items[members])
-    return nothing
+  for k in 1:n
+    _placeGroup!(order, placed, group, before, items, group[k])
   end
-  foreach(k -> place!(group[k]), 1:n)
   return order
+end
+
+"""
+The items of the group `g` (`group`: each item's) appended to `order` (`_sweepOrder`), after the groups of the items
+they run after (`before`); `placed` marks the items placed.
+"""
+function _placeGroup!(order::Vector{Int}, placed::Vector{Bool}, group::Vector{Int}, before::Vector{Vector{Int}},
+                      items::Vector{Int}, g::Int)::Nothing
+  local members::Vector{Int} = Int[k for k in eachindex(group) if group[k] == g && !placed[k]]
+  isempty(members) && return nothing
+  placed[members] .= true
+  for k in members, a in before[k]
+    group[a] == g || placed[a] || _placeGroup!(order, placed, group, before, items, group[a])
+  end
+  append!(order, items[members])
+  return nothing
 end
 
 """

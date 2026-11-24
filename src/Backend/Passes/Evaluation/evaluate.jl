@@ -266,12 +266,7 @@ end
 
 "Whether `e` calls a function that is no built-in."
 function callsFunction(e::IR.Expression)::Bool
-  local found = false
-  IR.foreachExp(e) do x
-    (x isa IR.CALL && !x.attributes.builtin) && (found = true)
-    nothing
-  end
-  return found
+  return IR.anyExp((x::IR.Expression) -> x isa IR.CALL && !x.attributes.builtin, e)
 end
 
 "A parameter's reference as its literal where `values` knows its value; `e` else."

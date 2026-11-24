@@ -464,15 +464,11 @@ Whether `x` calls a function (`:fcall`) and reads parameters only (`_parametersO
 """
 function _callOfParameters(g::Gen, x::IR)::Bool
   _parametersOnly(g, x) || return false
-  local found = false
-  local visit = function (y)
-    y isa Op || return
-    y.op == :fcall && (found = true)
-    foreach(visit, y.args)
-  end
-  visit(x)
-  return found
+  return _holdsFunctionCall(x)
 end
+
+"Whether `x` is or holds (through operators) a call of a Modelica function (`:fcall`)."
+_holdsFunctionCall(x::IR)::Bool = x isa Op && (x.op == :fcall || any(_holdsFunctionCall, x.args))
 
 """
 Whether x reads only literals, iterators and parameters (no variable, no time).
@@ -945,43 +941,11 @@ function _parameterAlgorithms(g::Gen)::BitVector
   for w::WhenClass in g.whens, (kind::Symbol, target::Ref, _) in w.body
     (w.everyEvent && kind == :assign) && push!(clusterNames, target.name)
   end
-  local isDiscrete::Function = (r::Ref) -> g.vars[r.name].kind == :discrete && !r.der
-  local isParam::Function = (r::Ref) -> g.vars[r.name].kind == :param && !r.der
-  local isTarget::Function = (r::Ref) -> isParam(r) || (isDiscrete(r) && !(r.name in clusterNames))
+  local isDiscrete::Function = (r::Ref) -> _isVarKind(g, r, :discrete)
+  local isParam::Function = (r::Ref) -> _isVarKind(g, r, :param)
   local reads::Vector{Vector{Ref}} = Vector{Ref}[Ref[] for _ in g.initAlgs]
-  local exp!::Function = (acc::Vector{Ref}, x::IR) -> begin
-    if x isa Ref
-      push!(acc, x)
-      foreach(s::IR -> exp!(acc, s), x.subs)
-    elseif x isa Pre
-      exp!(acc, x.ref)
-    elseif x isa Rel
-      exp!(acc, x.lhs); exp!(acc, x.rhs)
-    elseif x isa Op
-      x.op in (:sample, :initial) && return false
-      all(a::IR -> exp!(acc, a), x.args) || return false
-    elseif !(x isa Lit || x isa Slot)
-      return false
-    end
-    return true
-  end
-  local stmts!::Function = (acc::Vector{Ref}, body::Vector{Stmt}) -> all(body) do st::Stmt
-    if st isa SAssign || st isa SPreStart
-      isTarget(st.target) && all(s::IR -> exp!(acc, s), st.target.subs) && exp!(acc, st.value)
-    elseif st isa SIf
-      all(b::Tuple{IR, Vector{Stmt}} -> exp!(acc, b[1]) && stmts!(acc, b[2]), st.branches)
-    elseif st isa SFor
-      stmts!(acc, st.body)
-    elseif st isa SCall && st.call isa Op && st.call.op == :setlocal
-      #= the local of a tuple-valued call, its outputs assigned from it: (cr, c0, c1) = f(...) (MSL
-         Blocks.Continuous.Filter's coefficients, read by its steady-state initial equations der(x) = 0) =#
-      exp!(acc, st.call)
-    else
-      false
-    end
-  end
   local readable::Function = (r::Ref) -> isParam(r) || isDiscrete(r)
-  local candidate::BitVector = BitVector([stmts!(reads[k], a.body) && all(readable, reads[k])
+  local candidate::BitVector = BitVector([_parameterAlgorithmBody!(reads[k], a.body, g, clusterNames) && all(readable, reads[k])
                                           for (k::Int, a::AlgClass) in enumerate(g.initAlgs)])
   #= a parameter with fixed = false or a discrete value it reads: assigned by such an algorithm (a fixed point, from
      all candidates) =#
@@ -992,9 +956,69 @@ function _parameterAlgorithms(g::Gen)::BitVector
     local given::Function = (r::Ref) -> !(r.name in g.freeParams || isDiscrete(r)) || r.name in known
     local next::BitVector = BitVector([early[k] && all(given, reads[k]) for k in eachindex(early)])
     changed = next != early
-    early = next
+    early .= next
   end
   return early
+end
+
+"Whether `r` is a variable of `kind` of `g` (`:param`, `:discrete`), not its derivative."
+_isVarKind(g::Gen, r::Ref, kind::Symbol)::Bool = g.vars[r.name].kind == kind && !r.der
+
+"""
+    _parameterAlgorithmBody!(acc, body, g, clusterNames) -> Bool
+
+Whether the statements `body` of an initial algorithm can be a parameter algorithm (`_parameterAlgorithms`): each
+assigns a parameter or a discrete variable no lifted cluster assigns (`clusterNames`), or sets a tuple call's local.
+The references they read go into `acc`.
+"""
+function _parameterAlgorithmBody!(acc::Vector{Ref}, body::Vector{Stmt}, g::Gen, clusterNames::Set{String})::Bool
+  for st::Stmt in body
+    local ok::Bool = if st isa SAssign || st isa SPreStart
+      local target::Ref = st.target
+      (_isVarKind(g, target, :param) || (_isVarKind(g, target, :discrete) && !(target.name in clusterNames))) &&
+        all(s::IR -> _parameterAlgorithmReads!(acc, s), target.subs) && _parameterAlgorithmReads!(acc, st.value)
+    elseif st isa SIf
+      all(b::Tuple{IR, Vector{Stmt}} -> _parameterAlgorithmReads!(acc, b[1]) &&
+                                        _parameterAlgorithmBody!(acc, b[2], g, clusterNames), st.branches)
+    elseif st isa SFor
+      _parameterAlgorithmBody!(acc, st.body, g, clusterNames)
+    elseif st isa SCall && st.call isa Op && st.call.op == :setlocal
+      #= the local of a tuple-valued call, its outputs assigned from it: (cr, c0, c1) = f(...) (MSL
+         Blocks.Continuous.Filter's coefficients, read by its steady-state initial equations der(x) = 0) =#
+      _parameterAlgorithmReads!(acc, st.call)
+    else
+      false
+    end
+    ok || return false
+  end
+  return true
+end
+
+"""
+    _parameterAlgorithmReads!(acc, x) -> Bool
+
+The references the expression `x` of a parameter algorithm reads, into `acc`; false when `x` holds anything but
+literals, iterators, references, pre(), relations and operators other than sample() and initial(). Subscripts and the
+operands of a relation are collected without that check.
+"""
+function _parameterAlgorithmReads!(acc::Vector{Ref}, x::IR)::Bool
+  if x isa Ref
+    push!(acc, x)
+    for s::IR in x.subs
+      _parameterAlgorithmReads!(acc, s)
+    end
+  elseif x isa Pre
+    _parameterAlgorithmReads!(acc, x.ref)
+  elseif x isa Rel
+    _parameterAlgorithmReads!(acc, x.lhs)
+    _parameterAlgorithmReads!(acc, x.rhs)
+  elseif x isa Op
+    x.op in (:sample, :initial) && return false
+    all(a::IR -> _parameterAlgorithmReads!(acc, a), x.args) || return false
+  elseif !(x isa Lit || x isa Slot)
+    return false
+  end
+  return true
 end
 
 """
@@ -2222,7 +2246,10 @@ function _tearBlock(g::Gen, el::InstanceTable, block::Vector{Int}, matchRow::Vec
     local cascaded::Tuple{Vector{Tuple{Int, Int, Int}}, Vector{Int}, BitVector} = _tearOrder(reads, readers, solves, TEAR_LOOKAHEAD[])
     length(cascaded[2]) < length(tears) && ((order, tears, used) = cascaded)
   end
-  local residuals::Vector{Int} = Int[e for e in 1:n if !used[e]]
+  local residuals::Vector{Int} = Int[]
+  for e in 1:n
+    used[e] || push!(residuals, e)
+  end
   #= as many as iteration variables: each instance solved determines one unknown, each other unknown is torn =#
   #= levels: an instance after the instances that solve what it reads =#
   local level::Vector{Int} = zeros(Int, n)   #= by unknown: 0 for an iteration variable =#
@@ -2354,7 +2381,9 @@ function _scheduleWithLoops(el::InstanceTable, matchRow::Vector{Int}, producer::
     end
   end
   local members::Dict{Int, Vector{Int}} = Dict{Int, Vector{Int}}()
-  foreach(r::Int -> push!(get!(() -> Int[], members, comp[r]), r), 1:N)
+  for r in 1:N
+    push!(get!(() -> Int[], members, comp[r]), r)
+  end
   local blocks::Vector{Vector{Int}} = Vector{Int}[]
   local blockOf::Vector{Int} = zeros(Int, N)
   for c in sort!(collect(keys(members)))
@@ -2564,23 +2593,27 @@ function _solveFor(lhs::IR, rhs::IR, pos::Int, text::String)
   local acc::Vector{Ref} = accesses!(accesses!(Ref[], lhs), rhs)
   local key::String = irKey(acc[pos])
   count(r::Ref -> irKey(r) == key, acc) > 1 && return _solveLinear(lhs, rhs, acc[pos], text)
-  local nl = _nAccesses(lhs)
-  local (s, o, k) = pos <= nl ? (lhs, rhs, pos) : (rhs, lhs, pos - nl)
+  local nl::Int = _nAccesses(lhs)
+  local inLhs::Bool = pos <= nl
+  local s::IR = inLhs ? lhs : rhs
+  local o::IR = inLhs ? rhs : lhs
+  local k::Int = inLhs ? pos : pos - nl
   while true
     s isa Ref && k == 1 && return (s, o)
     s isa Op || ns("cannot solve for an unknown in: $(text)")
     #= the argument holding access k =#
-    local j = 0; local before = 0
-    for (ai, a) in enumerate(s.args)
-      local na = _nAccesses(a)
+    local j::Int = 0; local before::Int = 0
+    for (ai::Int, a::IR) in enumerate(s.args)
+      local na::Int = _nAccesses(a)
       if k <= before + na
         j = ai
         break
       end
       before += na
     end
-    local a = s.args[j]
-    local others = IR[s.args[i] for i in eachindex(s.args) if i != j]
+    local a::IR = s.args[j]
+    #= without a comprehension: its filter would box the reassigned s and j =#
+    local others::Vector{IR} = deleteat!(copy(s.args), j)
     if s.op == :+
       o = Op(:-, IR[o, length(others) == 1 ? others[1] : Op(:+, others)])
     elseif s.op == :- && j == 1

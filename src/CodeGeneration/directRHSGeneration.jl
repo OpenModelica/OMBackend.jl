@@ -252,15 +252,14 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, @
   end
 
   # 1. Build the RHS function expression from symbolic equations
-  local rhs_list = [eq.rhs for eq in eqs]
+  local rhs_init = [eq.rhs for eq in eqs]
   #= A model with homotopy(): the simulation's RHS at λ = 1, where the blend
      is the actual expression (the simplified one folds away); only the
      initialization's (`rhsInitFunc`) reads λ. The simplified expression was
      evaluated at every step otherwise (an assert in it stopped a run). =#
   local homotopyIdx::Union{Nothing, Int} = findfirst(p -> variableName(p) == String(HOMOTOPY_LAMBDA), params)
-  local rhs_init = rhs_list
-  homotopyIdx === nothing ||
-    (rhs_list = [Symbolics.substitute(r, Dict(params[homotopyIdx] => 1.0)) for r in rhs_list])
+  local rhs_list = homotopyIdx === nothing ? rhs_init :
+    [Symbolics.substitute(r, Dict(params[homotopyIdx] => 1.0)) for r in rhs_init]
   local f_ip_expr = _buildRHSExpression(rhs_list, states, params, iv)
 
   # Dump the actual generated RHS expression — see MTKDump.
@@ -310,11 +309,14 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, @
      its own arguments. Without them the solver finite-differenced the states, by their
      magnitude, past a flow function's regularization (Buildings' Airflow.Multizone
      powerLaw05 around dp = 0 at pressures of 1e5 Pa: 47,225 steps for 36). =#
-  local (symJac, jacProto) = withNumericPartials(() -> _buildSparseJacobian(rhs_list, states, params, iv,
-                                                                            u0, p_vec, tspan[1]))
+  #= `u` the start state (u0 is the solved one later) =#
+  local (symJac, jacProto) = let u = u0
+    withNumericPartials(() -> _buildSparseJacobian(rhs_list, states, params, iv, u, p_vec, tspan[1]))
+  end
   local jacFunc = symJac === nothing ? nothing : _finiteJacobian(symJac, rhsFunc)
-  local tgradFunc = withNumericPartials(() -> _buildTimeDerivative(rhs_list, states, params, iv, rhsFunc,
-                                                                   u0, p_vec, tspan[1]))
+  local tgradFunc = let u = u0
+    withNumericPartials(() -> _buildTimeDerivative(rhs_list, states, params, iv, rhsFunc, u, p_vec, tspan[1]))
+  end
 
   # 4. Extract event callbacks from the reduced system and merge with custom callbacks.
   #    Our structural_simplify wrapper uses split=false, so the compiled event
@@ -403,7 +405,6 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, @
                                                      ModelingToolkit.get_iv(reducedSystem), mm;
                                                      resolvedParams=initResolved,
                                                      excludeNames=union(discreteNames, assignedNames))
-    local extraResiduals = nothing
     #= The residual rows for parameter values `pv` (a re-initialization for
        other tunable parameter values evaluates them at those). =#
     local symRowsAt = symInit === nothing ? nothing : let (gF, dIdxs, mmS) = symInit
@@ -465,9 +466,6 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, @
         end
       end
     end
-    #= The kinds of rows are probed apart below: a part that fails at the
-       entry guesses is left out on its own. =#
-    local residualsAt = nothing
     #= The init solve's RHS assigns the initialization-defined parameters
        first. Their f may assert where the model's own equations only guard
        (the MSL selectBranch asserts a regular loop position): at a trial point
@@ -483,14 +481,17 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, @
       end
       rhsInitFunc(du, u, p, t)
     end
-    local probeRows = rowsAt -> try
-      local duProbe = similar(u0)
-      initRhs(duProbe, u0, p_vec, t0)
-      all(isfinite, rowsAt(p_vec)(duProbe, u0))
-    catch _e
-      OMBackend._fallback(_e, :buildDirectRHSProblem_6, impact = :result)
-      false
+    local probeRows = let u = u0
+      rowsAt -> try
+        local duProbe = similar(u)
+        initRhs(duProbe, u, p_vec, t0)
+        all(isfinite, rowsAt(p_vec)(duProbe, u))
+      catch _e
+        OMBackend._fallback(_e, :buildDirectRHSProblem_6, impact = :result)
+        false
+      end
     end
+    #= The kinds of rows are probed apart: a part that fails at the entry guesses is left out on its own. =#
     local parts = Any[]
     for (label, rowsAt) in (("symbolic initialization", symRowsAt), ("derivative", derRowsAt))
       rowsAt === nothing && continue
@@ -499,11 +500,9 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, @
       probeRows(rowsAt) || OMBackend.unsupported("$(label) initial-equation rows not finite at the entry guesses", label)
       push!(parts, rowsAt)
     end
-    if !isempty(parts)
-      residualsAt = length(parts) == 1 ? parts[1] :
-        pv -> (local fs = [r(pv) for r in parts]; (du, u) -> reduce(vcat, [f(du, u) for f in fs]))
-      extraResiduals = residualsAt(p_vec)
-    end
+    local residualsAt = isempty(parts) ? nothing : length(parts) == 1 ? parts[1] :
+      pv -> (local fs = [r(pv) for r in parts]; (du, u) -> reduce(vcat, [f(du, u) for f in fs]))
+    local extraResiduals = residualsAt === nothing ? nothing : residualsAt(p_vec)
     local initDiscretes = _initialDiscreteClusters(initClusters, reducedSystem, discreteStarts)
     local keptIdx = vcat(pinnedIdx, discretePinnedIdx)
     #= The relations' literal values select the branches the initialization
@@ -600,7 +599,7 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, @
        only without it (`x(start = 1, fixed = true)` with an initial equation
        that wants another x: x = 0.48, `v(fixed = true)` with `v = xa^2 + 1`:
        v = 1). OpenModelica refuses such a model. =#
-    local userPinIdx = Int[]
+    local userPinIdx::Vector{Int} = Int[]
     if !isempty(userPins)
       local userPinSet = Set{String}(userPins)
       #= A pin whose value reads a parameter the initialization computes (free,
@@ -623,8 +622,8 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, @
         end
         any(v -> variableName(v) in unknownParamNames, vars)
       end
-      userPinIdx = Int[i for i in pinnedIdx if (local nm::Union{Nothing, String} = variableName(states[i]); nm in userPinSet) &&
-                                          !readsComputed(nm)]
+      append!(userPinIdx, (i for i in pinnedIdx if (local nm::Union{Nothing, String} = variableName(states[i]); nm in userPinSet) &&
+                                                  !readsComputed(nm)))
     end
     local checkUserPins = (u, uIn) -> begin
       local moved = Int[i for i in userPinIdx if !isapprox(u[i], uIn[i]; rtol = 1e-8, atol = 1e-10)]
@@ -1012,10 +1011,11 @@ function _symbolicInitializationResiduals(reducedSystem, states, params, iv, mm;
   local mmScales = Float64[]
   #= A derivative a row reads (`der(x) = der(y)`) by its equation: left in, the
      row did not reduce to states and was dropped (x(0) = 0, OpenModelica 1). =#
-  local systemEqs = nothing
+  #= Filled on first use; a Ref, so the closure does not box it. =#
+  local systemEqs::Base.RefValue{Union{Nothing, Vector{Symbolics.Equation}}} = Base.RefValue{Union{Nothing, Vector{Symbolics.Equation}}}(nothing)
   local withDerivatives = e -> begin
     _hasDerivative(Symbolics.unwrap(e)) || return e
-    systemEqs === nothing && (systemEqs = ModelingToolkit.full_equations(reducedSystem))
+    systemEqs[] === nothing && (systemEqs[] = ModelingToolkit.full_equations(reducedSystem))
     #= An observed variable's definition inside D() (`D(2y)`): 2 D(y) first. =#
     local ex = try
       Symbolics.expand_derivatives(e)
@@ -1023,7 +1023,7 @@ function _symbolicInitializationResiduals(reducedSystem, states, params, iv, mm;
       OMBackend._fallback(err, :initExpandDerivatives; impact = :result)
       e
     end
-    local r = substituteDerivatives(ex, systemEqs)
+    local r = substituteDerivatives(ex, systemEqs[])
     r === nothing ? ex : r
   end
   for eq in initEqs
@@ -1073,9 +1073,10 @@ function _symbolicInitializationResiduals(reducedSystem, states, params, iv, mm;
     OMBackend.unsupported("initialization equations that do not reduce to the states and parameters",
                           join((string(exprs[i]) for i in setdiff(eachindex(exprs), keep)), "; "))
   isempty(keep) && return nothing
-  exprs = exprs[keep]
-  derIdxs = derIdxs[keep]
-  mmScales = mmScales[keep]
+  #= In place: a reassigned `exprs` is boxed by the generator above. =#
+  keepat!(exprs, keep)
+  keepat!(derIdxs, keep)
+  keepat!(mmScales, keep)
   #= With CSE, as the RHS: the rows have the observed equations substituted,
      which a multibody model (MSL fullRobot: 119 unknowns, 1809 observed
      equations) expands to millions of terms as a tree; Julia never finishes
@@ -2092,18 +2093,26 @@ function _sinkBranchAssignmentsInBlock!(block::Expr)::Expr
     isempty(place[i]) || push!(get!(moved, last(place[i]), Int[]), i)
   end
   isempty(moved) && return block
-  local branchStatements = b -> b isa Expr && b.head === :block ? b.args : Any[b]
-  function rebuild(i::Int)
-    local st = stmts[i]
-    local ifex = _assignedIf(st)
-    (ifex === nothing || !(haskey(moved, (i, 2)) || haskey(moved, (i, 3)))) && return st
-    local branches = [Expr(:block, Any[rebuild(j) for j in get(moved, (i, k), Int[])]..., branchStatements(ifex.args[k])...)
-                      for k in (2, 3)]
-    return Expr(:(=), st.args[1], Expr(:if, ifex.args[1], branches...))
-  end
-  block.args = Any[rebuild(i) for i in eachindex(stmts) if isempty(place[i])]
+  block.args = Any[_withSunkStatements(stmts, moved, i) for i in eachindex(stmts) if isempty(place[i])]
   return block
 end
+
+"""
+Statement `i` of `stmts` (`_sinkBranchAssignmentsInBlock!`): an if-expression's assignment with the statements
+`moved` places in its branches (each one rebuilt alike) before the branch's own; any other statement as it is.
+"""
+function _withSunkStatements(stmts::Vector{Any}, moved::Dict{Tuple{Int, Int}, Vector{Int}}, i::Int)
+  local st = stmts[i]
+  local ifex = _assignedIf(st)
+  (ifex === nothing || !(haskey(moved, (i, 2)) || haskey(moved, (i, 3)))) && return st
+  local branches::Vector{Expr} = Expr[Expr(:block, Any[_withSunkStatements(stmts, moved, j) for j in get(moved, (i, k), Int[])]...,
+                                           _branchStatements(ifex.args[k])...)
+                                      for k in (2, 3)]
+  return Expr(:(=), st.args[1], Expr(:if, ifex.args[1], branches...))
+end
+
+"The statements of an if-expression's branch `b`: a block's, else `b` alone."
+_branchStatements(@nospecialize(b))::Vector{Any} = b isa Expr && b.head === :block ? b.args : Any[b]
 
 
 """

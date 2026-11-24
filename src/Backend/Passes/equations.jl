@@ -184,11 +184,15 @@ function equationKey(eq::IR.Equation, h::UInt = zero(UInt))::UInt
     if x isa IR.Equation
       h = equationKey(x, h)
     elseif x isa Vector{IR.Equation}
-      foreach((@nospecialize(e::IR.Equation)) -> (h = equationKey(e, h)), x)
+      for e::IR.Equation in x
+        h = equationKey(e, h)
+      end
     elseif x isa Vector{IR.EquationBranch}
-      for b in x
+      for b::IR.EquationBranch in x
         h = hash(b.condition, h)
-        foreach(e -> (h = equationKey(e, h)), b.equations)
+        for e::IR.Equation in b.equations
+          h = equationKey(e, h)
+        end
       end
     elseif x isa IR.EquationAttributes
       h = hash((x.kind, x.differentiated, x.derivativeLink), h)

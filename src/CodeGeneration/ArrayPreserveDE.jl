@@ -2133,6 +2133,22 @@ function _functionDefinitions(mfs::Vector{SimCode.ModelicaFunction})
   return (defs, outs)
 end
 
+"The sample() calls of `x` into `samples`, by their number (the call's third argument)."
+function _collectSamples!(samples::Dict{Int, Op}, x::IR)::Nothing
+  if x isa Op
+    x.op == :sample && (samples[x.args[3].v] = x)
+    for a::IR in x.args
+      _collectSamples!(samples, a)
+    end
+  elseif x isa Rel
+    _collectSamples!(samples, x.lhs)
+    _collectSamples!(samples, x.rhs)
+  elseif x isa EvFn
+    _collectSamples!(samples, x.arg)
+  end
+  return nothing
+end
+
 """
 The module of an array model from its variables and classes (`g`, the domain level of its simulation code:
 `SimCode.Domains.domainSystem`), its Modelica functions' definitions, the initial values of the states, discrete
@@ -2449,13 +2465,7 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
     g.sampleBase = length(sampleSchedule); g.sampleCount = w.nsample
     if w.nsample > 0
       local samples = Dict{Int, Op}()
-      local collect! = function (x)
-        x isa Op && x.op == :sample && (samples[x.args[3].v] = x)
-        x isa Op && foreach(collect!, x.args)
-        x isa Rel && (collect!(x.lhs); collect!(x.rhs))
-        x isa EvFn && collect!(x.arg)
-      end
-      collect!(w.cond)
+      _collectSamples!(samples, w.cond)
       for j in 1:size(w.domain, 2), id in 1:w.nsample
         local sx = samples[id]
         (_parametersOnly(g, sx.args[1]) && _parametersOnly(g, sx.args[2])) ||
@@ -2545,14 +2555,8 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
   for (ci, c) in enumerate(g.classes)
     c.nsample > 0 || continue
     local samples::Dict{Int, Op} = Dict{Int, Op}()
-    local collect!::Function = function (x)
-      x isa Op && x.op == :sample && (samples[x.args[3].v] = x)
-      x isa Op && foreach(collect!, x.args)
-      x isa Rel && (collect!(x.lhs); collect!(x.rhs))
-      x isa EvFn && collect!(x.arg)
-      return nothing
-    end
-    collect!(c.lhs); collect!(c.rhs)
+    _collectSamples!(samples, c.lhs)
+    _collectSamples!(samples, c.rhs)
     for j in 1:size(c.domain, 2), id in 1:c.nsample
       local sx::Op = samples[id]
       (_parametersOnly(g, sx.args[1]) && _parametersOnly(g, sx.args[2])) ||

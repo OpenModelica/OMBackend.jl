@@ -421,10 +421,10 @@ end
 Whether an initial algorithm reads der().
 """
 function _readsDerivative(ia::SC.INITIAL_ALGORITHM)::Bool
-  local found = false
-  foreach((@nospecialize(s::SC.Statement)) ->
-            SC.mapStatementExps((@nospecialize(e::SC.Exp)) -> (found |= containsDerCall(e); e), s), ia.statements)
-  return found
+  #= a Ref: a flag the closure sets is boxed =#
+  local found::Base.RefValue{Bool} = Base.RefValue{Bool}(false)
+  SC.foreachStatementExp((@nospecialize(e::SC.Exp)) -> (found[] = found[] || containsDerCall(e); nothing), ia.statements)
+  return found[]
 end
 
 """

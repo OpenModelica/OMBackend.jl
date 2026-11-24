@@ -315,12 +315,7 @@ also writes a subscripted reference on its parts: `observed.offset[\$i1]` of a r
 elements are variables, then read as a variable of its own).
 """
 function inlinedEquation(eq::IR.Equation, functions::Dict{Symbol, IR.ModelicaFunction})::IR.Equation
-  local calls::Bool = false
-  IR.foreachExp(eq) do x::IR.Expression
-    (x isa IR.CALL && haskey(functions, x.name)) && (calls = true)
-    nothing
-  end
-  calls || return eq
+  IR.anyExp((x::IR.Expression) -> x isa IR.CALL && haskey(functions, x.name), eq) || return eq
   (eq isa IR.SCALAR_EQUATION || eq isa IR.ARRAY_EQUATION || eq isa IR.IF_EQUATION) &&
     return IndexReduction.inlineEquation(eq, functions; noEvents = true)
   eq isa IR.FOR_EQUATION &&
@@ -462,20 +457,17 @@ Whether the equation reads an array that is no variable by subscripts (`frame_a.
 whose elements are variables of their own, `expandRecordFieldArrays!`, read by a for-equation rolled before).
 """
 function readsElementArray(eq::IR.Equation, isVariable::Function)::Bool
-  local found::Bool = false
-  IR.foreachExp(eq) do x::IR.Expression
+  return IR.anyExp(eq) do x::IR.Expression
     #= also as a reference subscripted on its last part (`observed.offset[\$i1]`, inlined: `subscriptedReference`) =#
     local base::Union{Nothing, IR.ComponentRef} =
       (x isa IR.SUBSCRIPTED && x.exp isa IR.CREF && !IR.hasSubscripts(x.exp.cref) && IR.typeOf(x.exp) isa IR.T_ARRAY) ? x.exp.cref :
       (x isa IR.CREF && length(x.cref.parts) > 1 && !isempty(x.cref.parts[end].subscripts) &&
        !any(IR.isSubscripted, @view x.cref.parts[1:end - 1])) ? x.cref : nothing
-    base === nothing && return nothing
+    base === nothing && return false
     local last::IR.CrefPart = base.parts[end]
     local nm::Symbol = IR.ComponentRef(IR.CrefPart[base.parts[1:end - 1]; IR.CrefPart(last.name, IR.Subscript[], last.ty)]).name
-    isVariable(nm) || (found = true)
-    nothing
+    return !isVariable(nm)
   end
-  return found
 end
 
 """
@@ -483,15 +475,12 @@ Whether the equation subscripts an array literal by the iterator `it` (an inline
 `{{R.T[1, 1], ...}, ...}[\$i1, 2]`): unrolled, the subscripts are literal and the element is picked.
 """
 function subscriptsLiteral(eq::IR.Equation, it::Symbol)::Bool
-  local found::Bool = false
   local isIterator::Function = (y::IR.Expression) -> y isa IR.CREF && length(y.cref.parts) == 1 && y.cref.name === it &&
                                                       !IR.hasSubscripts(y.cref)
-  IR.foreachExp(eq) do x::IR.Expression
-    (x isa IR.SUBSCRIPTED && x.exp isa IR.ARRAY) || return nothing
-    any((s::IR.Subscript) -> s isa IR.INDEX && IR.anyExp(isIterator, (s::IR.INDEX).exp), x.subscripts) && (found = true)
-    nothing
+  return IR.anyExp(eq) do x::IR.Expression
+    (x isa IR.SUBSCRIPTED && x.exp isa IR.ARRAY) || return false
+    return any((s::IR.Subscript) -> s isa IR.INDEX && IR.anyExp(isIterator, (s::IR.INDEX).exp), x.subscripts)
   end
-  return found
 end
 
 "A copy of the equation `eq` with the iterators of `values` replaced by their values (`IndexReduction.withIterators`)."

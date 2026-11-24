@@ -177,11 +177,12 @@ function arrayAliasBlocked(model::IR.Model, E::Elements)::Union{Nothing, Set{Sym
   local antiderivative::Dict{Symbol, Symbol} = antiderivatives(variables)
   local blocked::Set{Symbol} = Set{Symbol}()
   local resolve::Resolver = Resolver(Symbol[v.name for v in variables])
-  local sliced::Bool = false
+  #= a Ref: a flag the closure sets is boxed =#
+  local sliced::Base.RefValue{Bool} = Base.RefValue{Bool}(false)
   local scan = (@nospecialize(e::IR.Expression)) -> begin
     IR.foreachExp(e) do @nospecialize(x::IR.Expression)
       x isa IR.CREF || return nothing
-      any(p -> p.ty isa IR.T_SLICE, x.cref.parts) && (sliced = true; return nothing)
+      any(p -> p.ty isa IR.T_SLICE, x.cref.parts) && (sliced[] = true; return nothing)
       local (name::Symbol, subscripts::Vector{IR.Subscript}) = aliasReference(x.cref, variables)
       if haskey(variables, name)
         local n::Int = length(subscripts)
@@ -200,7 +201,7 @@ function arrayAliasBlocked(model::IR.Model, E::Elements)::Union{Nothing, Set{Sym
   for eq in partition.initialEquations
     IR.foreachRootExp(scan, eq)
   end
-  return sliced ? nothing : blocked
+  return sliced[] ? nothing : blocked
 end
 
 """

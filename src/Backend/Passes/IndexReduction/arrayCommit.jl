@@ -1031,12 +1031,7 @@ function initialDummyDerivatives(eq::IR.Equation, variables::IR.VariableSet)::IR
     v === nothing && (v = get(variables, IR.withoutSubscripts(a.cref).name, nothing))
     return v !== nothing && v.kind isa IR.DUMMY_STATE
   end
-  local found::Bool = false
-  IR.foreachRootExp(eq) do @nospecialize(e::IR.Expression)
-    found || (found = IR.anyExp(isDummy, e))
-    nothing
-  end
-  found || return eq
+  IR.anyExp(isDummy, eq) || return eq
   local replace::Function = (@nospecialize(x::IR.Expression)) ->
     isDummy(x) ? IR.CREF(IR.derivativeCref(only((x::IR.CALL).arguments).cref), IR.T_REAL()) : x
   return IR.mapEquation!(replace, deepcopy(eq))
@@ -1064,6 +1059,15 @@ function exposeArrayLinearConstraints!(model::IR.Model, view::Scalarized)::Bool
     written = true
   end
   return written
+end
+
+"The elements of the continuous arrays of `model` that the element view `view` lists."
+function continuousArrayElements(model::IR.Model, view::Scalarized)::Int
+  local n::Int = 0
+  for v in model.variables
+    (isContinuousArray(v) && haskey(view.elements.elements, v.name)) && (n += length(view.elements.elements[v.name]))
+  end
+  return n
 end
 
 """
@@ -1109,8 +1113,7 @@ function reduceIndexArrays!(model::IR.Model; arrays::Bool = true)::Bool
   local splits::Int = 0
   local stale::Bool = false
   local final::Union{Nothing, Tuple{Scalarized, Plan, ArrayCommit}} = nothing
-  local arrayElements::Int = sum((length(view.elements.elements[v.name]) for v in model.variables
-                                  if isContinuousArray(v) && haskey(view.elements.elements, v.name)); init = 0)
+  local arrayElements::Int = continuousArrayElements(model, view)
   while true
     try
       arrayCommit(model, model.continuous[1], view, written)
@@ -1124,8 +1127,7 @@ function reduceIndexArrays!(model::IR.Model; arrays::Bool = true)::Bool
       splits += 1
       #= split down to no array equations, or most of the arrays' elements split: little the array form keeps, the
          scalarized path is the one (MSL EngineV6: its frames' vectors and rotations, 10877 elements split) =#
-      local kept::Int = sum((length(view.elements.elements[v.name]) for v in model.variables
-                             if isContinuousArray(v) && haskey(view.elements.elements, v.name)); init = 0)
+      local kept::Int = continuousArrayElements(model, view)
       (hasArrayEquations(model) && 2 * kept >= arrayElements) ||
         throw(NotHandled("slicing that splits most of the arrays ($(arrayElements - kept) of $(arrayElements) elements, " *
                          "starting at $(err.reason))"))

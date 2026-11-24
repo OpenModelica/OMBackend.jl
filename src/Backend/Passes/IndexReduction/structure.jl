@@ -241,15 +241,13 @@ end
 "Whether the body of an array constructor reads a reference subscripted by one of its iterators (`x[i]`)."
 function readsIterated(e::IR.ARRAY_CONSTRUCTOR)::Bool
   local names = Set{Symbol}(it.name for it in e.iterators)
-  local found = false
-  IR.foreachExp(e.body) do x
-    x isa IR.CREF || return nothing
-    for p in x.cref.parts, sub in p.subscripts
-      sub isa IR.INDEX && any(c -> c.name in names, IR.crefsOf(sub.exp)) && (found = true)
+  return IR.anyExp(e.body) do x::IR.Expression
+    x isa IR.CREF || return false
+    for p::IR.CrefPart in x.cref.parts, sub::IR.Subscript in p.subscripts
+      (sub isa IR.INDEX && any((c::IR.ComponentRef) -> c.name in names, IR.crefsOf(sub.exp))) && return true
     end
-    nothing
+    return false
   end
-  return found
 end
 
 """
@@ -323,10 +321,11 @@ function equationReads(@nospecialize(eq::IR.Equation), resolve::F, functions::Di
     end
     return Union{Nothing, Vector{Symbol}}[r === nothing ? nothing : unique!(r) for r in rows]
   elseif eq isa IR.ALGORITHM
-    local out = Symbol[]
-    IR.foreachRootExp(e -> continuousReads!(out, e, resolve), eq)
+    #= its own name: `if` opens no scope, and the closure boxed the `out` the branches above assign =#
+    local algorithmReads = Symbol[]
+    IR.foreachRootExp(e -> continuousReads!(algorithmReads, e, resolve), eq)
     local outputs = sum(c -> length(resolve(c.name)), eq.outputs; init = 0)
-    return Union{Nothing, Vector{Symbol}}[copy(out) for _ in 1:outputs]
+    return Union{Nothing, Vector{Symbol}}[copy(algorithmReads) for _ in 1:outputs]
   elseif eq isa Union{IR.ASSERT_EQUATION, IR.WHEN_EQUATION}
     return Union{Nothing, Vector{Symbol}}[]
   end

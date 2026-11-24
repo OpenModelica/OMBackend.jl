@@ -1590,8 +1590,8 @@ function _addEquation!(g::Gen, eq::SC.Equation, iterNames::Vector{String}, idom:
        `outPort[i].available = if i == 1 then active else outPort[i - 1].available and not outPort[i - 1].reset`):
        each instance its branch, the class split by the condition (as an if-equation's, `_addIfEquation!`). As one
        class the branch not taken was read at every instance: "subscript 0 out of 1:1" at i = 1 =#
-    local split::Union{Nothing, IteratorIf} = nIter == 0 ? nothing : _iteratorIf(g, eq.rhs, iters)
-    (split === nothing && nIter > 0) && (split = _iteratorIf(g, eq.lhs, iters))
+    local ofRhs::Union{Nothing, IteratorIf} = nIter == 0 ? nothing : _iteratorIf(g, eq.rhs, iters)
+    local split::Union{Nothing, IteratorIf} = (ofRhs === nothing && nIter > 0) ? _iteratorIf(g, eq.lhs, iters) : ofRhs
     if split !== nothing
       local taken::Vector{Int} = Int[j for j in 1:size(idom, 2) if _evalStatic(g, split[2], idom, j) == true]
       local others::Vector{Int} = setdiff(1:size(idom, 2), taken)
@@ -2498,14 +2498,7 @@ end
 function _startReadsAny(sv::SC.SIMVAR, names::Vector{String})::Bool
   local exps::Union{Nothing, Vector{SC.Exp}} = sv.attributes.startExps
   exps === nothing && return false
-  local hit::Bool = false
-  for x in exps
-    SC.foreachExp(x) do y::SC.Exp
-      (y isa SC.EXP_CREF && String(y.cref.sym) in names) && (hit = true)
-      nothing
-    end
-  end
-  return hit
+  return any((x::SC.Exp) -> SC.anyExp((y::SC.Exp) -> y isa SC.EXP_CREF && String(y.cref.sym) in names, x), exps)
 end
 
 "The subscripts of the elements of an array of dimensions `dims`, row-major (one empty tuple for a scalar)."

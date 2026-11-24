@@ -502,9 +502,7 @@ function ifReadsIterator(eq::IR.FOR_EQUATION, scope::Set{Symbol} = Set{Symbol}()
       ifReadsIterator(b, inner) && return true
       continue
     end
-    local hit = false
-    IR.foreachExp(x -> ((x isa IR.IF_EXPRESSION && IR.anyExp(readsInner, x)) && (hit = true); nothing), b)
-    hit && return true
+    IR.anyExp((x::IR.Expression) -> x isa IR.IF_EXPRESSION && IR.anyExp(readsInner, x), b) && return true
   end
   return false
 end
@@ -613,19 +611,18 @@ dependsOnTime(e::IR.Expression)::Bool = IR.anyExp(isTime, e)
 
 "Whether every relation of `e` is inside `noEvent`, and `e` has a `noEvent`: `e` makes no events."
 function relationsAllInNoEvent(e::IR.Expression)::Bool
-  local (sawNoEvent, bare) = (false, false)
-  local visit
-  visit = x -> begin
-    if IR.isBuiltinCall(x, :noEvent)
-      sawNoEvent = true
-    elseif x isa IR.RELATION
-      bare = true
-    else
-      foreach(visit, IR.children(x))
-    end
+  local seen::Tuple{Bool, Bool} = _noEventsAndBareRelations(e, (false, false))
+  return seen[1] && !seen[2]
+end
+
+"`seen` and whether `e` has a noEvent() and whether it has a relation outside one (`relationsAllInNoEvent`)."
+function _noEventsAndBareRelations(e::IR.Expression, seen::Tuple{Bool, Bool})::Tuple{Bool, Bool}
+  IR.isBuiltinCall(e, :noEvent) && return (true, seen[2])
+  e isa IR.RELATION && return (seen[1], true)
+  for c::IR.Expression in IR.children(e)
+    seen = _noEventsAndBareRelations(c, seen)
   end
-  visit(e)
-  return sawNoEvent && !bare
+  return seen
 end
 
 "A record value: a reference, a call or a record of a record type, or an if-expression of one."

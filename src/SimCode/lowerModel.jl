@@ -595,28 +595,42 @@ function substituteSampleTriggers(whens::Vector{IR.WHEN_EQUATION}, equations::Ve
     end
   end
   isempty(defs) && return whens
-  local subst
-  subst = c -> c isa IR.CREF ? get(defs, c.cref.name, c) :
-               c isa IR.LBINARY ? IR.LBINARY(subst(c.exp1), c.op, subst(c.exp2)) : c
-  local inBody = e -> IR.mapExpTopDown(e) do x
+  return IR.WHEN_EQUATION[IR.WHEN_EQUATION(IR.WhenBranch[IR.WhenBranch(IR.Expression[_sampleTriggersInCondition(t, defs) for t in b.triggers],
+                                                                      b.atInitial, b.atTerminal,
+                                                                      IR.Statement[_sampleTriggersInStatement(s, defs) for s in whenOperators(b.body)])
+                                                          for b in w.branches], w.kind, w.source, w.attributes)
+                          for w in whens]
+end
+
+"The trigger `c` with the sample triggers `defs` substituted (`substituteSampleTriggers`): in references, and, or."
+function _sampleTriggersInCondition(c::IR.Expression, defs::Dict{Symbol, IR.Expression})::IR.Expression
+  c isa IR.CREF && return get(defs, c.cref.name, c)
+  c isa IR.LBINARY && return IR.LBINARY(_sampleTriggersInCondition(c.exp1, defs), c.op, _sampleTriggersInCondition(c.exp2, defs))
+  return c
+end
+
+"The when body's expression `e` with the sample triggers `defs` substituted, outside pre(), edge() and change()."
+function _sampleTriggersInBody(e::IR.Expression, defs::Dict{Symbol, IR.Expression})::IR.Expression
+  return IR.mapExpTopDown(e) do x
     isBuiltinCallOf(x, (:pre, :edge, :change)) && return (x, false)
     x isa IR.CREF && return (get(defs, x.cref.name, x), false)
     return (x, true)
   end
-  local bodyStatement
-  bodyStatement = s -> s isa IR.ASSIGNMENT ? IR.ASSIGNMENT(s.lhs, inBody(s.rhs), s.source) :
-                       s isa IR.REINIT ? IR.REINIT(s.state, inBody(s.value), s.source) :
-                       s isa IR.ASSERT ? IR.ASSERT(inBody(s.condition), s.message, s.level, s.source) :
-                       s isa IR.NORETCALL ? IR.NORETCALL(inBody(s.exp), s.source) :
-                       s isa IR.TERMINATE ? IR.TERMINATE(inBody(s.message), s.source) :
-                       s isa IR.IF_STATEMENT ? IR.IF_STATEMENT(IR.StatementBranch[IR.StatementBranch(inBody(b.condition), IR.Statement[bodyStatement(x) for x in b.body])
-                                                                                   for b in s.branches],
-                                                                IR.Statement[bodyStatement(x) for x in s.elseBody], s.source) : s
-  return IR.WHEN_EQUATION[IR.WHEN_EQUATION(IR.WhenBranch[IR.WhenBranch(IR.Expression[subst(t) for t in b.triggers],
-                                                                      b.atInitial, b.atTerminal,
-                                                                      IR.Statement[bodyStatement(s) for s in whenOperators(b.body)])
-                                                          for b in w.branches], w.kind, w.source, w.attributes)
-                          for w in whens]
+end
+
+"The when body's statement `s` with `_sampleTriggersInBody` in the expressions it reads (if-statements recursively)."
+function _sampleTriggersInStatement(s::IR.Statement, defs::Dict{Symbol, IR.Expression})::IR.Statement
+  s isa IR.ASSIGNMENT && return IR.ASSIGNMENT(s.lhs, _sampleTriggersInBody(s.rhs, defs), s.source)
+  s isa IR.REINIT && return IR.REINIT(s.state, _sampleTriggersInBody(s.value, defs), s.source)
+  s isa IR.ASSERT && return IR.ASSERT(_sampleTriggersInBody(s.condition, defs), s.message, s.level, s.source)
+  s isa IR.NORETCALL && return IR.NORETCALL(_sampleTriggersInBody(s.exp, defs), s.source)
+  s isa IR.TERMINATE && return IR.TERMINATE(_sampleTriggersInBody(s.message, defs), s.source)
+  s isa IR.IF_STATEMENT &&
+    return IR.IF_STATEMENT(IR.StatementBranch[IR.StatementBranch(_sampleTriggersInBody(b.condition, defs),
+                                                                 IR.Statement[_sampleTriggersInStatement(x, defs) for x in b.body])
+                                              for b in s.branches],
+                           IR.Statement[_sampleTriggersInStatement(x, defs) for x in s.elseBody], s.source)
+  return s
 end
 
 """

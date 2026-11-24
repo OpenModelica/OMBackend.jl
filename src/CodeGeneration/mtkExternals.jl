@@ -1377,10 +1377,9 @@ Symbolics._linear_expansion.
 Each element is a scalar symbolic term created via `makeSymbolicTerm`.
 """
 function createSymbolicArrayCall(funcRef, uwArgs::Vector{Any}, dims::Tuple{Vararg{Int}}; funcName::Symbol = Symbol())
-  #= If funcName not provided, try to extract it from funcRef =#
-  if funcName === Symbol()
-    funcName = funcRef isa Symbol ? funcRef : nameof(funcRef)
-  end
+  #= If funcName not provided, try to extract it from funcRef (a new local: the reassigned keyword is boxed by the
+     comprehensions below) =#
+  local name::Symbol = funcName !== Symbol() ? funcName : funcRef isa Symbol ? funcRef : nameof(funcRef)
   #= Check if any argument is an array. ALL arrays must be flattened to scalars
      because SymbolicUtils wraps Term arguments with array shape metadata that
      triggers "Differentiation with array expressions" in Pantelides. =#
@@ -1389,22 +1388,22 @@ function createSymbolicArrayCall(funcRef, uwArgs::Vector{Any}, dims::Tuple{Varar
     local flatArgs, shapes = _flattenSymArgs(uwArgs)
     local nFlat = length(flatArgs)
     if length(dims) == 1
-      return [makeSymbolicTerm(_getOrCreateFlatElemFunc(funcName, (i,), nFlat, shapes), flatArgs) for i in 1:dims[1]]
+      return [makeSymbolicTerm(_getOrCreateFlatElemFunc(name, (i,), nFlat, shapes), flatArgs) for i in 1:dims[1]]
     elseif length(dims) == 2
-      return [makeSymbolicTerm(_getOrCreateFlatElemFunc(funcName, (i, j), nFlat, shapes), flatArgs) for i in 1:dims[1], j in 1:dims[2]]
+      return [makeSymbolicTerm(_getOrCreateFlatElemFunc(name, (i, j), nFlat, shapes), flatArgs) for i in 1:dims[1], j in 1:dims[2]]
     else
       local totalLen = prod(dims)
-      return [makeSymbolicTerm(_getOrCreateFlatElemFunc(funcName, (i,), nFlat, shapes), flatArgs) for i in 1:totalLen]
+      return [makeSymbolicTerm(_getOrCreateFlatElemFunc(name, (i,), nFlat, shapes), flatArgs) for i in 1:totalLen]
     end
   else
     local nArgs = length(uwArgs)
     if length(dims) == 1
-      return [makeSymbolicTerm(getOrCreateElemFunc(funcName, (i,), nArgs), uwArgs) for i in 1:dims[1]]
+      return [makeSymbolicTerm(getOrCreateElemFunc(name, (i,), nArgs), uwArgs) for i in 1:dims[1]]
     elseif length(dims) == 2
-      return [makeSymbolicTerm(getOrCreateElemFunc(funcName, (i, j), nArgs), uwArgs) for i in 1:dims[1], j in 1:dims[2]]
+      return [makeSymbolicTerm(getOrCreateElemFunc(name, (i, j), nArgs), uwArgs) for i in 1:dims[1], j in 1:dims[2]]
     else
       local totalLen = prod(dims)
-      return [makeSymbolicTerm(getOrCreateElemFunc(funcName, (i,), nArgs), uwArgs) for i in 1:totalLen]
+      return [makeSymbolicTerm(getOrCreateElemFunc(name, (i,), nArgs), uwArgs) for i in 1:totalLen]
     end
   end
 end
@@ -2912,18 +2911,19 @@ through `System(...)` (mutating the field via `@set`/`substitute` is a no-op:
 `setmetadata` leaves variables `isequal`, so MTK keeps the original priority).
 """
 function neutralizeSoftStatePriority(sys::ModelingToolkit.AbstractSystem)
-  local n = 0
+  #= a Ref: a counter the closure increments is boxed =#
+  local n::Base.RefValue{Int} = Base.RefValue{Int}(0)
   local newUnknowns = map(ModelingToolkit.get_unknowns(sys)) do u
     local uv = Symbolics.unwrap(u)
     local p = SymbolicUtils.getmetadata(uv, ModelingToolkit.VariableStatePriority, nothing)
     if p !== nothing && abs(p) <= 2
-      n += 1
+      n[] += 1
       SymbolicUtils.setmetadata(uv, ModelingToolkit.VariableStatePriority, 0)
     else
       uv
     end
   end
-  n == 0 && return (0, sys)
+  n[] == 0 && return (0, sys)
   local relaxed = ModelingToolkit.System(
     equations(sys),
     ModelingToolkit.get_iv(sys),
@@ -2935,7 +2935,7 @@ function neutralizeSoftStatePriority(sys::ModelingToolkit.AbstractSystem)
     guesses = ModelingToolkit.get_guesses(sys),
     initialization_eqs = ModelingToolkit.get_initialization_eqs(sys),
   )
-  return (n, relaxed)
+  return (n[], relaxed)
 end
 
 #= simplify=true polynomial normalization rationalizes Float64 coefficients;
@@ -2970,18 +2970,13 @@ function _demoteWideNumerics(ex)
 end
 
 function _demoteWideNumericsInEquations(eqs)
-  local changed = 0
-  local newEqs = map(eqs) do eq
-    local l = Symbolics.unwrap(eq.lhs)
-    local r = Symbolics.unwrap(eq.rhs)
-    if _containsWideNumeric(l) || _containsWideNumeric(r)
-      changed += 1
-      Symbolics.Equation(_demoteWideNumerics(l), _demoteWideNumerics(r))
-    else
-      eq
-    end
+  #= which first, then the count: a counter the closure increments is boxed =#
+  local wide::Vector{Bool} = Bool[_containsWideNumeric(Symbolics.unwrap(eq.lhs)) || _containsWideNumeric(Symbolics.unwrap(eq.rhs))
+                                  for eq in eqs]
+  local newEqs = map(eqs, wide) do eq, w::Bool
+    w ? Symbolics.Equation(_demoteWideNumerics(Symbolics.unwrap(eq.lhs)), _demoteWideNumerics(Symbolics.unwrap(eq.rhs))) : eq
   end
-  return (newEqs, changed)
+  return (newEqs, count(wide))
 end
 
 """
@@ -3104,6 +3099,30 @@ function scaleNonUnitIntegerEquations(sys::ModelingToolkit.AbstractSystem)::Tupl
 end
 
 """
+The array-shaped subtrees of `expr` into `results` as (path, shape, node), a raw array with the shape `:raw_array`;
+50 levels deep at most. A diagnostic of `structural_simplify` (BACKEND_LOGGING).
+"""
+function _findArrayShapes!(results::Vector{Tuple{String, Any, Any}}, @nospecialize(expr), path::String,
+                           depth::Int)::Nothing
+  depth > 50 && return nothing
+  if expr isa SymbolicUtils.BasicSymbolic
+    local sh::Any = try; Symbolics.shape(expr); catch; nothing; end
+    if sh !== nothing && sh !== () && SymbolicUtils.is_array_shape(sh)
+      push!(results, (path, sh, expr))
+      return nothing
+    end
+    if SymbolicUtils.iscall(expr)
+      for (j, a) in enumerate(SymbolicUtils.arguments(expr))
+        _findArrayShapes!(results, a, "$path.args[$j]", depth + 1)
+      end
+    end
+  elseif expr isa AbstractArray
+    push!(results, (path, :raw_array, expr))
+  end
+  return nothing
+end
+
+"""
   The irreducible variables scheme does not work using plain simplify.
 
   It should be noted that for some models both running tearing and structural simplification are needed.
@@ -3133,34 +3152,12 @@ function structural_simplify(sys::ModelingToolkit.AbstractSystem,
      set, and the assertion in mslTests.jl handles the off case. =#
   @BACKEND_LOGGING begin
     let
-      function _find_array_shapes(expr, path, results; depth=0)
-        depth > 50 && return  # guard against infinite recursion
-        if expr isa SymbolicUtils.BasicSymbolic
-          local sh = try; Symbolics.shape(expr); catch; nothing; end
-          if sh !== nothing && sh !== () && SymbolicUtils.is_array_shape(sh)
-            push!(results, (path, sh, expr))
-            return  # do not recurse further into this subtree
-          end
-          if SymbolicUtils.iscall(expr)
-            local args = SymbolicUtils.arguments(expr)
-            for (j, a) in enumerate(args)
-              _find_array_shapes(a, "$path.args[$j]", results; depth=depth+1)
-            end
-          end
-        elseif expr isa AbstractArray
-          push!(results, (path, :raw_array, expr))
-        end
-      end
-      local allResults = Tuple{Int,String,Symbol,Any}[]
+      local allResults::Vector{Tuple{Int, String, Any, Any}} = Tuple{Int, String, Any, Any}[]
       for (i, eq) in enumerate(equations(sys))
-        local lhsR = Pair{String,Any}[]
-        local rhsR = Pair{String,Any}[]
-        _find_array_shapes(Symbolics.unwrap(eq.lhs), "eq[$i].lhs", lhsR)
-        _find_array_shapes(Symbolics.unwrap(eq.rhs), "eq[$i].rhs", rhsR)
-        for (p, sh, node) in lhsR
-          push!(allResults, (i, p, sh, node))
-        end
-        for (p, sh, node) in rhsR
+        local found::Vector{Tuple{String, Any, Any}} = Tuple{String, Any, Any}[]
+        _findArrayShapes!(found, Symbolics.unwrap(eq.lhs), "eq[$i].lhs", 0)
+        _findArrayShapes!(found, Symbolics.unwrap(eq.rhs), "eq[$i].rhs", 0)
+        for (p, sh, node) in found
           push!(allResults, (i, p, sh, node))
         end
       end
@@ -3262,7 +3259,9 @@ function structural_simplify(sys::ModelingToolkit.AbstractSystem,
   #= Diagnostic only: full_equations expands observed eqs and can hit
      SymbolicUtils Rational{Int64} overflow on some systems. A log count must
      never abort the build, so fall back to -1 (rendered as "n/a") on failure. =#
-  local post_full_eqs = OMBackend._tryOr(() -> length(ModelingToolkit.full_equations(sys)), -1, :fullEquationsCount)
+  local post_full_eqs = let reduced = sys
+    OMBackend._tryOr(() -> length(ModelingToolkit.full_equations(reduced)), -1, :fullEquationsCount)
+  end
   local post_unknowns = length(unknowns(sys))
   @info "[MTK GEN: simplify] After structural_simplify: equations=$(post_eqs), full_equations=$(post_full_eqs), unknowns=$(post_unknowns)"
   if post_eqs != post_unknowns

@@ -1549,9 +1549,9 @@ function _discreteClusterSpecs(simCode::SC.SIM_CODE)::Vector{Expr}
       (rels, assigns) = _inlineReadBooleanRelations(rels, assigns, relationOf, simCode)
     end
     graph === nothing && (graph = _equationGraph(simCode))
-    push!(specs, Base.ScopedValues.with(CLUSTER_TICKS => true) do
-      _discreteClusterSpec(weq.whenEquation.condition, rels, assigns, simCode, table, graph)
-    end)
+    #= @with, not with(...) do: the closure would box the reassigned rels, assigns and graph =#
+    push!(specs, Base.ScopedValues.@with(CLUSTER_TICKS => true,
+                                         _discreteClusterSpec(weq.whenEquation.condition, rels, assigns, simCode, table, graph)))
   end
   return specs
 end

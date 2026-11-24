@@ -87,22 +87,26 @@ function _assertStep(u::AbstractVector, t::Real, integrator::DiffEqBase.DEIntegr
     _violated!(u, p, t) || return false
     local stepStart::Tuple{Vector{Float64}, Vector{Float64}, Vector{Bool}, Vector{Float64}} = p.state.stepStart
     local uLeft::AbstractVector = p.state.leftLimit[1] == t ? p.state.leftLimit[2] : u
-    local lo::Float64 = integrator.tprev; local hi::Float64 = t
     _withDiscreteState(() -> _violated!(uLeft, p, t), p, stepStart) || return (c.checkAsserts(u, p, t); false)
     _withDiscreteState(p, stepStart) do
-      if hi > lo
-        for _ in 1:100
-          local mid::Float64 = (lo + hi) / 2
-          _violated!(integrator(mid), p, mid) ? (hi = mid) : (lo = mid)
-          hi - lo <= 1.0e-12 * max(1.0, abs(hi)) && break
-        end
-      end
+      local hi::Float64 = _firstViolation(integrator, p, Float64(integrator.tprev), Float64(t))
       c.checkAsserts(hi == t ? uLeft : integrator(hi), p, hi)
     end
     return false
   finally
     p.state.stepStart = _discreteState(p)
   end
+end
+
+"The time in (`lo`, `hi`] an assert is first violated at, `hi` violating, to 1e-12 relative (bisection, `_assertStep`)."
+function _firstViolation(integrator::DiffEqBase.DEIntegrator, p::ArrayModelParameters, lo::Float64, hi::Float64)::Float64
+  hi > lo || return hi
+  for _ in 1:100
+    local mid::Float64 = (lo + hi) / 2
+    _violated!(integrator(mid), p, mid) ? (hi = mid) : (lo = mid)
+    hi - lo <= 1.0e-12 * max(1.0, abs(hi)) && break
+  end
+  return hi
 end
 
 """

@@ -744,10 +744,9 @@ NotHandled for an array value of other dimensions.
 function elementValue(@nospecialize(a::IR.Expression), v::IR.Variable, E::Elements)::ElementValue
   local sizes = E.sizes[v.name]
   local ty = IR.typeOf(a)
-  local lead::Int = length(sizes)
+  local dims::Vector{Int} = ty isa IR.T_ARRAY ? Int[something(IR.dimensionSize(d), -1) for d in IR.dimensions(ty)] : Int[]
+  local lead::Int = length(sizes) - length(dims)
   if ty isa IR.T_ARRAY
-    local dims = Int[something(IR.dimensionSize(d), -1) for d in IR.dimensions(ty)]
-    lead -= length(dims)
     (lead >= 0 && all(k -> dims[k] == -1 || dims[k] == sizes[lead + k], eachindex(dims))) ||
       throw(NotHandled("an attribute of $(v.name) of dimensions $(dims), the variable's $(sizes)"))
   end

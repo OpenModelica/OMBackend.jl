@@ -1810,6 +1810,20 @@ function _anyExp(s::_Any, e::Expression)::Bool
   return last(traverseFields(e, s, false))
 end
 
+"""
+    anyExp(p, x::Union{Statement, Equation})
+
+Whether `p` holds for an expression of a statement or an equation (or of the equations and statements in it), or for
+one of its subexpressions, as `foreachExp` visits them; the expressions after the first that holds are not visited.
+"""
+anyExp(@nospecialize(p), @nospecialize(x::Union{Statement, Equation}))::Bool = _anyRootExp(_Any(p), x)
+
+(s::_Any)(x::Union{Statement, Equation}, found::Bool) = (x, found || _anyRootExp(s, x))
+
+"`anyExp` of a statement or an equation by its wrapper; a reinit's state as a reference (`foreachRootExp`)."
+_anyRootExp(s::_Any, x::Union{Statement, Equation})::Bool = last(traverseFields(x, s, false))
+_anyRootExp(s::_Any, r::REINIT)::Bool = _anyExp(s, CREF(r.state, T_REAL())) || _anyExp(s, r.value)
+
 "The direct subexpressions of `e`, the subscripts' expressions included, in field order."
 children(@nospecialize(e::Expression))::Vector{Expression} = last(traverseFields(e, _pushChild, Expression[]))
 

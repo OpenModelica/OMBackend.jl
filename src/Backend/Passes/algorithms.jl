@@ -406,15 +406,7 @@ end
 function conditionsReadAssigned(conditions::Vector{IR.Expression}, s::IR.IF_STATEMENT)::Bool
   local targets::Set{Symbol} = Set{Symbol}(keys(assignmentCounts(IR.Statement[s])))
   isempty(targets) && return false
-  local hit::Bool = false
-  for c in conditions
-    IR.mapExpTopDown(c) do x
-      isBuiltinCallOf(x, (:pre,)) && return (x, false)
-      (x isa IR.CREF && elementBase(x.cref) in targets) && (hit = true)
-      return (x, true)
-    end
-  end
-  return hit
+  return any((c::IR.Expression) -> any((r::IR.ComponentRef) -> elementBase(r) in targets, crefsReadOutsidePre(c)), conditions)
 end
 
 function appendStatement!(ops::Vector{IR.Statement}, assigned::Vector{Symbol}, s::IR.FOR_STATEMENT,
@@ -532,16 +524,10 @@ function readsEarlierTarget(writes::Vector{Tuple{IR.CREF, Union{Nothing, IR.Expr
   local bases::Set{Symbol} = Set{Symbol}()
   local earlier::Vector{IR.ComponentRef} = IR.ComponentRef[]
   for (target, _, value) in writes
-    local hit::Bool = false
-    IR.mapExpTopDown(value) do x
-      isBuiltinCallOf(x, (:pre,)) && return (x, false)
-      if x isa IR.CREF
-        local subs::Vector{IR.Subscript} = IR.subscripts(x.cref)
-        (x.cref.name in names ||
-         (elementBase(x.cref) in bases && (isempty(subs) || !all(IR.isLiteralSubscript, subs))) ||
-         any(t::IR.ComponentRef -> length(t.parts) > length(x.cref.parts) && IR.crefsOverlap(x.cref, t), earlier)) && (hit = true)
-      end
-      return (x, true)
+    local hit::Bool = any(crefsReadOutsidePre(value)) do r::IR.ComponentRef
+      local subs::Vector{IR.Subscript} = IR.subscripts(r)
+      return r.name in names || (elementBase(r) in bases && (isempty(subs) || !all(IR.isLiteralSubscript, subs))) ||
+             any((t::IR.ComponentRef) -> length(t.parts) > length(r.parts) && IR.crefsOverlap(r, t), earlier)
     end
     hit && return true
     push!(names, target.cref.name)
@@ -1089,9 +1075,18 @@ function targetElements(c::IR.ComponentRef)::Union{Nothing, Vector{IR.ComponentR
       sub isa IR.INDEX || return nothing
       local n::Union{Nothing, Int} = IR.dimensionSize(dims[k])
       n === nothing && return nothing
-      choices = Vector{IR.Subscript}[IR.Subscript[ch; IR.INDEX(IR.dimensionIndex(dims[k], i))] for ch in choices for i in 1:n]
+      #= loops, not nested comprehensions: the inner one would capture (box) the reassigned choices =#
+      local nextChoices::Vector{Vector{IR.Subscript}} = Vector{IR.Subscript}[]
+      for ch::Vector{IR.Subscript} in choices, i::Int in 1:n
+        push!(nextChoices, IR.Subscript[ch; IR.INDEX(IR.dimensionIndex(dims[k], i))])
+      end
+      choices = nextChoices
     end
-    prefixes = Vector{IR.CrefPart}[IR.CrefPart[q; IR.CrefPart(p.name, ch, p.ty)] for q in prefixes for ch in choices]
+    local nextPrefixes::Vector{Vector{IR.CrefPart}} = Vector{IR.CrefPart}[]
+    for q::Vector{IR.CrefPart} in prefixes, ch::Vector{IR.Subscript} in choices
+      push!(nextPrefixes, IR.CrefPart[q; IR.CrefPart(p.name, ch, p.ty)])
+    end
+    prefixes = nextPrefixes
   end
   return IR.ComponentRef[IR.ComponentRef(q) for q in prefixes]
 end
@@ -1283,14 +1278,8 @@ end
 The variables the statements' expressions read outside `pre()`.
 """
 function readOutsidePre(ops::Vector{IR.Statement})::Set{Symbol}
-  local out = Set{Symbol}()
-  local visit
-  visit = e -> begin
-    IR.isBuiltinCall(e, :pre) && return nothing
-    e isa IR.CREF && push!(out, e.cref.name)
-    foreach(visit, IR.children(e))
-    nothing
-  end
+  local out::Set{Symbol} = Set{Symbol}()
+  local visit::Function = (e::IR.Expression) -> union!(out, namesReadOutsidePre(e))
   for op in ops
     if op isa IR.ASSIGNMENT
       visit(op.rhs)

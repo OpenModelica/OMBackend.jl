@@ -164,7 +164,9 @@ function planStructure(s::Structure, nRows::Int, partition::IR.Partition, model:
     differentiated = differentiatedEquations(s, partition, model.functions)
     trace === nothing || empty!(trace)
     dummies = dummyDerivatives(s, partition, differentiated, model.variables, model.functions; sets, trace, start)
-    foreach(set -> union!(dummies, set.candidates, set.linked...), sets)
+    for set in sets
+      union!(dummies, set.candidates, set.linked...)
+    end
   end
   #= the derivatives the initial equations read of variables that are no states, after the choice of states (which
      they do not change): their equations differentiated, the derivatives dummies =#

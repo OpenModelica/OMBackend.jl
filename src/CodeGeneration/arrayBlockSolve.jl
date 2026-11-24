@@ -73,7 +73,9 @@ function columnColors(S::_SPARSE.SparseMatrixCSC{Float64, Int})::Vector{Int}
       push!(used, falses(size(S, 1)))
       c = length(used)
     end
-    foreach(r::Int -> (used[c][r] = true), rows)
+    for r::Int in rows
+      used[c][r] = true
+    end
     colors[j] = c
   end
   return colors
