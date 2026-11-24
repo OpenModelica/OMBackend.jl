@@ -43,6 +43,79 @@
    compiles its own generated code. =#
 using PrecompileTools: @setup_workload, @compile_workload
 
+#= ---------------------------------------------------------------------------------------------------------------
+   The precompile display, as OMFrontend's: a header, one line per workload step (a mark, the step, its time), the
+   total; in color when Julia has color. Julia shows it live above its progress bar when `using OMBackend`
+   precompiles the package, and after the bar when Pkg precompiles it as a dependency. The OMFrontend extension's
+   workload prints its own with these functions.
+   --------------------------------------------------------------------------------------------------------------- =#
+
+"""The stream of the display: stdout, in color when Julia runs with color (`--color`, passed on to precompilation)."""
+_precompileIO()::IOContext = IOContext(stdout, :color => Base.get_have_color())
+
+"""`ns` nanoseconds as `850 ms` or `1.9 s`."""
+function _precompileDuration(ns::UInt64)::String
+  local s::Float64 = ns / 1e9
+  return s < 1 ? string(round(Int, 1000 * s), " ms") : string(round(s; digits = 1), " s")
+end
+
+"""
+The display's header: `name` with OMBackend's version, Julia's version, and the `pipeline` the workload compiles.
+Returns the time it started (`time_ns`), for `_precompileDone`.
+"""
+function _precompileHeader(io::IOContext, name::String, pipeline::String)::UInt64
+  local version::String = string(something(pkgversion(@__MODULE__), "dev"))
+  println(io)
+  printstyled(io, "  ", name, " ", version; bold = true, color = :blue)
+  printstyled(io, "   precompiling with Julia ", VERSION, "\n"; color = :light_black)
+  printstyled(io, "  ", pipeline, "\n"; color = :blue)
+  return time_ns()
+end
+
+"""A bar of `width` cells, `done` of `total` filled, with the count: `━━━━────  2/5  `."""
+function _precompileBar(done::Int, total::Int, width::Int = 16)::String
+  local filled::Int = round(Int, width * done / total)
+  return string("━"^filled, "─"^(width - filled), " ", lpad(done, ndigits(total)), "/", total, "  ")
+end
+
+"""`✓ <prefix><label>  <time>`, or `✗ <prefix><label>  failed`; `prefix` in blue (a progress bar)."""
+function _precompileLine(io::IOContext, label::String, ns::UInt64, failed::Bool; prefix::String = "")::Nothing
+  printstyled(io, failed ? "  ✗ " : "  ✓ "; color = failed ? :red : :green, bold = failed)
+  printstyled(io, prefix; color = :blue)
+  print(io, rpad(label, 60 - length(prefix)))
+  printstyled(io, failed ? "failed" : _precompileDuration(ns), "\n"; color = failed ? :red : :light_black)
+  return nothing
+end
+
+"""
+Runs `f` as a step of the display: its line (`_precompileLine`), and when `f` throws, the error as a warning (the
+workload goes on). What `f` prints to stdout and stderr is dropped (`[SIMCODE: ...: check]` lines), and of its log
+messages only the warnings show; `quiet`: none (the workload models' expected warnings, as Guard's assert). Returns
+whether `f` ran without an error.
+"""
+function _precompileStep(f::F, io::IOContext, label::String; prefix::String = "", quiet::Bool = false)::Bool where {F <: Function}
+  local logger::Base.CoreLogging.AbstractLogger =
+    quiet ? Base.CoreLogging.NullLogger() : Base.CoreLogging.SimpleLogger(stderr, Base.CoreLogging.Warn)
+  local t0::UInt64 = time_ns()
+  local err::Any = nothing
+  try
+    redirect_stdout(devnull) do
+      redirect_stderr(() -> Base.CoreLogging.with_logger(f, logger), devnull)
+    end
+  catch e
+    err = (e, catch_backtrace())
+  end
+  _precompileLine(io, label, time_ns() - t0, err !== nothing; prefix)
+  err === nothing || @warn "[OMBackend] precompile workload: $(label) failed" exception = err
+  return err === nothing
+end
+
+"""The display's last line: the time since `t0` (`_precompileHeader`)."""
+function _precompileDone(io::IOContext, t0::UInt64)::Nothing
+  printstyled(io, "  Workload done in ", _precompileDuration(time_ns() - t0), "\n"; bold = true, color = :blue)
+  return nothing
+end
+
 """
 Small index-1 system whose algebraic row folds away, leaving a pure-ODE
 reduced system (UniformScaling mass matrix) — the most common DirectRHS class.
@@ -267,23 +340,34 @@ function _precompileIRModel(model::Function, name::String, arrayCode::Bool)::Not
 end
 
 """
-The OMJLIR workload (`_precompileIRModel`): Decay and Counter by the array code and by the passes and `translate`, Guard
-by the array code (its asserts' and homotopy()'s drivers: arrayAsserts.jl, arrayInitialization.jl), the registries
-restored afterwards (`_registries`). A frontend's translate workload adds the lowering and the passes of
-larger models (OMBackendOMFrontendExt); the build and the solve compile here, where OMBackend is open.
+The models of the OMJLIR workload (`_precompileWarmupIR`): the model, its name, and whether by the array code (else
+through the passes and `translate`). Guard by the array code only (its asserts' and homotopy()'s drivers:
+arrayAsserts.jl, arrayInitialization.jl).
 """
-function _precompileWarmupIR()::Nothing
+const PRECOMPILE_IR_MODELS = ((_irDecay, "Decay", true), (_irDecay, "Decay", false), (_irCounter, "Counter", true),
+                              (_irCounter, "Counter", false), (_irGuard, "Guard", true))
+
+"""
+The OMJLIR workload: each model of `PRECOMPILE_IR_MODELS` (`_precompileIRModel`) a step of the display on `io`, the
+registries restored afterwards (`_registries`). Returns the number of models that failed. A frontend's translate
+workload adds the lowering and the passes of larger models (OMBackendOMFrontendExt); the build and the solve compile
+here, where OMBackend is open.
+"""
+function _precompileWarmupIR(io::IOContext = IOContext(devnull))::Int
   local registries::Vector{Pair{Any, Any}} = _registries()
+  local failed::Int = 0
   try
-    for (model, name) in ((_irDecay, "OMBackendIRWorkloadDecay"), (_irCounter, "OMBackendIRWorkloadCounter"))
-      _precompileIRModel(model, name * "Arrays", true)
-      _precompileIRModel(model, name, false)
+    local n::Int = length(PRECOMPILE_IR_MODELS)
+    for (i, (model, name, arrayCode)) in enumerate(PRECOMPILE_IR_MODELS)
+      local label::String = string(name, arrayCode ? " (array code)" : " (passes, translate)")
+      _precompileStep(io, label; prefix = _precompileBar(i, n), quiet = true) do
+        _precompileIRModel(model, string("OMBackendIRWorkload", name, arrayCode ? "Arrays" : ""), arrayCode)
+      end || (failed += 1)
     end
-    _precompileIRModel(_irGuard, "OMBackendIRWorkloadGuardArrays", true)
   finally
     _restoreRegistries!(registries)
   end
-  return nothing
+  return failed
 end
 
 "The residual of `_precompileWarmupArrayHelpers`'s initial system: z = (1, 2), two blocks."
@@ -321,32 +405,22 @@ end
 
 @setup_workload begin
   @compile_workload begin
-    #= Escape hatch for fast dev precompiles. A workload failure must never break
-       loading, but must be seen: a rename or a broken path otherwise leaves the
-       workload silently empty (efficiency review 2026-09-29). =#
+    #= Escape hatch for fast dev precompiles. A workload failure must never break loading, but must be seen
+       (`_precompileStep`: a ✗ line and the error): a rename or a broken path otherwise leaves the workload silently
+       empty (efficiency review 2026-09-29). =#
     if !envSwitch("OMBACKEND_NO_PRECOMPILE_WORKLOAD")
+      local io::IOContext = _precompileIO()
+      local t0::UInt64 = _precompileHeader(io, "OMBackend", "OMJLIR ▸ Passes ▸ SimCode ▸ Code generation ▸ Build ▸ Solve")
+      _precompileStep(_precompileWarmup, io, "MTK System-form solve (structural modes)")
+      _precompileStep(() -> _precompileWarmupDirectRHS(false), io, "DirectRHS solve of an ODE")
+      _precompileStep(() -> _precompileWarmupDirectRHS(true), io, "DirectRHS solve with an event")
+      _precompileStep(_precompileWarmupArrayHelpers, io, "Array code helpers (initial system, asserts)")
       try
-        _precompileWarmup()
+        _precompileWarmupIR(io)
       catch err
-        @warn "[OMBackend] precompile warmup skipped" exception = (err, catch_backtrace())
+        @warn "[OMBackend] precompile workload: the OMJLIR models failed" exception = (err, catch_backtrace())
       end
-      for eventful in (false, true)
-        try
-          _precompileWarmupDirectRHS(eventful)
-        catch err
-          @warn "[OMBackend] DirectRHS precompile warmup skipped" eventful exception = (err, catch_backtrace())
-        end
-      end
-      try
-        _precompileWarmupArrayHelpers()
-      catch err
-        @warn "[OMBackend] array helpers precompile warmup skipped" exception = (err, catch_backtrace())
-      end
-      try
-        Base.CoreLogging.with_logger(_precompileWarmupIR, Base.CoreLogging.NullLogger())
-      catch err
-        @warn "[OMBackend] OMJLIR precompile warmup skipped" exception = (err, catch_backtrace())
-      end
+      _precompileDone(io, t0)
     end
   end
 end

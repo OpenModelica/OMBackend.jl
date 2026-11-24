@@ -93,47 +93,71 @@ an assert). A fresh process's first translate compiled 3-18 s of OMBackend's, MT
 4.1.0 Rotational First 12.9 s, MultiBody DoublePendulum 17.9 s; EngineV6 2371 methods for reducedArrayModel); the
 registries are restored afterwards (`OMBackend._registries`). `simulate`: also build and simulate them, where an
 evaluation into OMBackend is allowed (a session; not while the extension's image is generated: OMBackend is closed
-then, `evaluationRejected`, and the models are only translated).
+then, `evaluationRejected`, and the models are only translated). Each model is a step of the display on `io`
+(`OMBackend._precompileStep`). Returns the number of models that failed.
 """
-function _precompileWarmupTranslate(; simulate::Bool = !OMBackend.evaluationRejected(OMBackend))::Nothing
+function _precompileWarmupTranslate(io::IOContext = IOContext(devnull);
+                                    simulate::Bool = !OMBackend.evaluationRejected(OMBackend))::Int
   local registries::Vector{Pair{Any, Any}} = OMBackend._registries()
+  local failed::Int = 0
   try
-    for (file, package, models) in ((TRANSLATE_WORKLOAD, "OMBackendTranslateWorkload",
-                                     ("Drive" => true, "Thermostat" => true, "Rectifier" => true, "Pendulum" => true)),
-                                    (ARRAYS_KEPT_WORKLOAD, "OMBackendWorkload",
-                                     ("Chain" => true, "Volumes" => true, "LoopEvents" => true)))
+    local n::Int = sum(length(last(w)) for w in PRECOMPILE_TRANSLATE_MODELS)
+    local i::Int = 0
+    for (file, package, models) in PRECOMPILE_TRANSLATE_MODELS
       local scode::OMFrontend.SCode.Program = OMFrontend.translateToSCode(OMFrontend.parseFile(file))
       for (model, arrayCode) in models
-        _precompileTranslateAndSimulate(scode, package * "." * model, arrayCode; simulate)
+        i += 1
+        OMBackend._precompileStep(io, string(model, " (", basename(file), ")"); prefix = OMBackend._precompileBar(i, n),
+                                  quiet = true) do
+          _precompileTranslateAndSimulate(scode, package * "." * model, arrayCode; simulate)
+        end || (failed += 1)
       end
     end
   finally
     OMBackend._restoreRegistries!(registries)
   end
-  return nothing
+  return failed
 end
+
+"""
+The models of the translate workload (`_precompileWarmupTranslate`): a file, its package, and its models with
+whether each takes the array code.
+"""
+const PRECOMPILE_TRANSLATE_MODELS = ((TRANSLATE_WORKLOAD, "OMBackendTranslateWorkload",
+                                      ("Drive" => true, "Thermostat" => true, "Rectifier" => true, "Pendulum" => true)),
+                                     (ARRAYS_KEPT_WORKLOAD, "OMBackendWorkload",
+                                      ("Chain" => true, "Volumes" => true, "LoopEvents" => true)))
+
+"""The time the extension's display started (`time_ns`), 0 when its workload did not run."""
+const PRECOMPILE_START = Base.RefValue{UInt64}(0)
 
 @setup_workload begin
   @compile_workload begin
-    #= Escape hatch for fast dev precompiles; a workload failure must never break loading, but must be seen. =#
+    #= Escape hatch for fast dev precompiles; a workload failure must never break loading, but must be seen (a ✗
+       line and the error). Of the log messages outside the steps (the parse of the workload's files) only the
+       warnings show. =#
     if !OMBackend.envSwitch("OMBACKEND_NO_PRECOMPILE_WORKLOAD")
+      local io::IOContext = OMBackend._precompileIO()
+      PRECOMPILE_START[] = OMBackend._precompileHeader(io, "OMBackendOMFrontendExt",
+                                                       "Modelica ▸ OMFrontend ▸ OMJLIR ▸ Passes ▸ SimCode ▸ Code generation")
       try
-        Base.CoreLogging.with_logger(_precompileWarmupTranslate, Base.CoreLogging.NullLogger())
+        Base.CoreLogging.with_logger(() -> _precompileWarmupTranslate(io),
+                                     Base.CoreLogging.SimpleLogger(stderr, Base.CoreLogging.Warn))
       catch err
-        @warn "[OMBackend] translate precompile warmup skipped" exception = (err, catch_backtrace())
+        @warn "[OMBackend] precompile workload: the translate workload failed" exception = (err, catch_backtrace())
       end
     end
   end
 end
 
 """
-    _precompileSignatures(file::String) -> Nothing
+    _precompileSignatures(file::String) -> Tuple{Int, Int}
 
 The `precompile` statements of `file`, each evaluated on its own: a statement naming a function or type that was
 renamed or removed is skipped (counted in one line), not an error that fails the extension's image and with it
-OM.jl's load.
+OM.jl's load. Returns the number of statements and the number skipped.
 """
-function _precompileSignatures(file::String)::Nothing
+function _precompileSignatures(file::String)::Tuple{Int, Int}
   include_dependency(file)
   local total::Int = 0
   local stale::Int = 0
@@ -147,10 +171,19 @@ function _precompileSignatures(file::String)::Nothing
       @debug "[OMBackend] stale precompile signature skipped" statement exception = err
     end
   end
-  stale > 0 && @info "[OMBackend] precompile signatures: $(stale) of $(total) no longer resolve; regenerate $(basename(file))"
-  return nothing
+  return (total, stale)
 end
 
 #= what the workloads do not reach, from a trace (precompileSignatures.jl): with the workload's switch, as the
-   workloads =#
-OMBackend.envSwitch("OMBACKEND_NO_PRECOMPILE_WORKLOAD") || _precompileSignatures(joinpath(@__DIR__, "precompileSignatures.jl"))
+   workloads; its line and the total close the display, a hint to regenerate the file follows it. =#
+if !OMBackend.envSwitch("OMBACKEND_NO_PRECOMPILE_WORKLOAD")
+  let file::String = joinpath(@__DIR__, "precompileSignatures.jl"), io::IOContext = OMBackend._precompileIO(),
+      t0::UInt64 = time_ns(), (total, stale) = _precompileSignatures(file)
+    if PRECOMPILE_START[] > 0
+      OMBackend._precompileLine(io, string("Traced precompile signatures (", stale > 0 ? "$(stale) of " : "", total,
+                                           stale > 0 ? " stale)" : ")"), time_ns() - t0, false)
+      OMBackend._precompileDone(io, PRECOMPILE_START[])
+    end
+    stale > 0 && @info "[OMBackend] precompile signatures: $(stale) of $(total) no longer resolve; regenerate $(basename(file))"
+  end
+end
