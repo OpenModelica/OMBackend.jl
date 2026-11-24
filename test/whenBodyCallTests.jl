@@ -70,3 +70,21 @@ end
     @test [_wbcFinal(sol, "y$(out)[$i]") for i in 1:4] ≈ k .* [1.0, 2.0, 3.0, 4.0]
   end
 end
+
+#= A call without outputs in the body of a when on a Boolean defined by sample() (Buildings' Printer and
+   Plotters): substituteSampleTriggers rebuilt the call statement from a field it does not have (FieldError:
+   NORETCALL has no field `exp`), on both routes. n counts initial() and the ticks 0.1, 0.35, 0.6, 0.85. =#
+@testset "A call without outputs in a when on a sample() Boolean" begin
+  local file::String = joinpath(@__DIR__, "Models", "WhenBodyCalls.mo")
+  for scalarize::Bool in (true, false)
+    local (fm::OMFrontend.Frontend.FLAT_MODEL, cache::OMFrontend.Frontend.FunctionTreeImpl.Tree) =
+      OMFrontend.instantiateSCodeToFM("WhenBodyCalls.SampleTriggerCall", OMFrontend.translateToSCode(OMFrontend.parseFile(file));
+                                      scalarize = scalarize)
+    OMBackend.translate(fm; functionList = OMFrontend.cacheToFunctionList(cache), scalarize = scalarize)
+    local name::String = OMBackend.canonicalName("WhenBodyCalls.SampleTriggerCall")
+    @test (name in OMBackend.ARRAY_PRESERVE_DE_MODELS) == !scalarize
+    local sol::WBC_SOLUTION = OMBackend.simulate(name; tspan = (0.0, 1.0))
+    @test string(sol.retcode) == "Success"
+    @test [sol(t; idxs = :n) for t in (0.05, 0.2, 0.4, 0.7, 0.9)] == [1.0, 2.0, 3.0, 4.0, 5.0]
+  end
+end

@@ -75,4 +75,20 @@ package WhenBodyCalls "A call a when body reads in several statements, evaluated
       end if;
     end when;
   end TwoBodies;
+
+  function note "No outputs: its call is a statement of its own"
+    input Real x;
+  algorithm
+    assert(x >= 0, "note: a negative count");
+  end note;
+
+  model SampleTriggerCall "As Buildings' Printer: a call without outputs in a when-equation on a Boolean defined by sample()"
+    Boolean sampleTrigger = sample(0.1, 0.25);
+    Integer n(start = 0, fixed = true);
+  equation
+    when {sampleTrigger, initial()} then
+      n = pre(n) + 1;
+      note(n);
+    end when;
+  end SampleTriggerCall;
 end WhenBodyCalls;
