@@ -36,26 +36,18 @@ end
   Plots all part of the solution on the same graph.
 """
 function OMBackend.plot(sol::Runtime.OMSolutions; legend = false, limX = 0.0, limY = 1.0)
-  local sols = sol.diffEqSol
-  local prevP = Plots.plot!(sols[1]; legend = legend, xlim=limX, ylim = limY)
-  for sol in sols[2:end]
-    p = Plots.plot!(prevP; legend = legend, xlim=limX, ylim = limY)
-    prevP = p
-  end
-  return prevP
+  return OMBackend.plot(sol.diffEqSol; legend, limX, limY)
 end
 
 """
-  Plots a vector of solutions
+  Plots a vector of solutions, all on one new plot.
 """
-function OMBackend.plot(sol::Vector; legend = false, limX = 0.0, limY = 1.0, kwargs...)
-  sols = sol
-  local prevP = Plots.plot!(sols[1]; legend = legend, xlim=limX, ylim = limY, kwargs...)
-  for sol in sols[2:end]
-    p = Plots.plot!(prevP; legend = legend, xlim=limX, ylim = limY, kwargs...)
-    prevP = p
+function OMBackend.plot(sols::Vector; legend = false, limX = 0.0, limY = 1.0, kwargs...)
+  local p = Plots.plot(first(sols); legend, xlim = limX, ylim = limY, kwargs...)
+  for s in @view sols[2:end]
+    Plots.plot!(p, s; legend, xlim = limX, ylim = limY, kwargs...)
   end
-  return prevP
+  return p
 end
 
 end # module OMBackendPlotsExt

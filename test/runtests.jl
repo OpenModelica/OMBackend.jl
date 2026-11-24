@@ -374,6 +374,8 @@ TEST_GROUP == "kept" || @testset "OMBackend" begin
   include("errorPolicyTests.jl")
   #= error paths that read a name their module did not define =#
   include("undefinedNamesTests.jl")
+  #= the Plots extension: several solutions on one plot =#
+  include("plotsExtTests.jl")
 
   #= ── 12. The Modelica builtins of generated code ─────────────── =#
   include("modelicaBuiltinsTests.jl")
