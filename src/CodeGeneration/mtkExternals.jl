@@ -763,9 +763,10 @@ end
 Get or create a per-element extractor function for an array-returning Modelica function.
 The extractor calls the implementation directly via MODELICA_FUNCTION_IMPLS and extracts
 a single element by index. This avoids creating getindex(Term{Real}(...), i) symbolic
-terms which crash Symbolics._linear_expansion (OffsetArrays.Origin error).
+terms which crash Symbolics._linear_expansion (OffsetArrays.Origin error). `indices`: one index (a vector
+result, or a linear index) or two (a matrix).
 """
-function getOrCreateElemFunc(funcName::Symbol, indices::Tuple{Vararg{Int}}, nArgs::Int)
+function getOrCreateElemFunc(funcName::Symbol, indices::Union{Tuple{Int}, Tuple{Int, Int}}, nArgs::Int)
   local key = (funcName, indices, nArgs)
   if haskey(ELEM_FUNC_CACHE, key)
     return ELEM_FUNC_CACHE[key]
@@ -773,7 +774,7 @@ function getOrCreateElemFunc(funcName::Symbol, indices::Tuple{Vararg{Int}}, nArg
   local fnQuote = QuoteNode(funcName)
   local argNames = [Symbol("a", k) for k in 1:nArgs]
   local implCall = Expr(:call, :_memoizedCall, fnQuote, :impl, argNames...)
-  local body
+  local body::Expr
   #= Results pass through exactly. Converting to Float64 corrupts Integer
      results (RNG state words exceed 2^53) and float-ifies integer exponents,
      so non-float Reals must keep their type. =#
@@ -784,7 +785,7 @@ function getOrCreateElemFunc(funcName::Symbol, indices::Tuple{Vararg{Int}}, nArg
       :(result = $implCall),
       :(return result[$idx])
     ))
-  elseif length(indices) == 2
+  else
     local i = indices[1]
     local j = indices[2]
     body = Expr(:->, Expr(:tuple, argNames...), Expr(:block,
@@ -848,9 +849,10 @@ end
 Get or create a flat element extractor that accepts individual scalar arguments,
 reassembles them into the original array shapes, calls the implementation, and
 extracts a single element. This avoids array_literal in Term arguments, which
-Pantelides index reduction cannot differentiate.
+Pantelides index reduction cannot differentiate. `indices` as `getOrCreateElemFunc`'s.
 """
-function _getOrCreateFlatElemFunc(funcName::Symbol, indices::Tuple{Vararg{Int}}, nFlat::Int, shapes::Tuple)
+function _getOrCreateFlatElemFunc(funcName::Symbol, indices::Union{Tuple{Int}, Tuple{Int, Int}}, nFlat::Int,
+                                  shapes::Tuple)
   local key = (funcName, :flat, indices, nFlat, shapes)
   if haskey(TUPLE_ELEM_FUNC_CACHE, key)
     return TUPLE_ELEM_FUNC_CACHE[key]
@@ -888,7 +890,7 @@ function _getOrCreateFlatElemFunc(funcName::Symbol, indices::Tuple{Vararg{Int}},
      so non-float Reals must keep their type. =#
   if length(indices) == 1
     push!(stmts, :(return result[$(indices[1])]))
-  elseif length(indices) == 2
+  else
     local i = indices[1]
     local j = indices[2]
     push!(stmts, :(row = result[$i]))

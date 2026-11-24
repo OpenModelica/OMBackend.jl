@@ -138,6 +138,11 @@ function withAssertCallback(callbacks, problem, asserts::Vector; discrete::Vecto
   end
   isempty(checks) && return callbacks
   local violated = falses(length(checks))
+  #= A failure just past a crossing, decided at the next check: a relation that
+     touches its boundary (a piston at its top dead center, s_rel = L, MSL
+     Engine1b_analytic) is past it by rounding there and holds again; one that
+     crosses fails halfway to the next check too (reported at the crossing). =#
+  local pending::Vector{Float64} = fill(NaN, length(checks))
   #= the state and parameters where a crossing was left to decide: an event at the step end that decides it set the
      discrete states (`x <= 0.5 or d == 0` with d set at 0.6: the state at 0.55 interpolated d's new value); within the
      step the discrete states keep their values there =#
@@ -168,11 +173,6 @@ function withAssertCallback(callbacks, problem, asserts::Vector; discrete::Vecto
     a.warning || throw(ModelicaAssertionError(τ, msg, a.text))
     @warn "Assertion violated at time $(τ): $(msg)" condition = a.text
   end
-  #= A failure just past a crossing, decided at the next check: a relation that
-     touches its boundary (a piston at its top dead center, s_rel = L, MSL
-     Engine1b_analytic) is past it by rounding there and holds again; one that
-     crosses fails halfway to the next check too (reported at the crossing). =#
-  local pending = fill(NaN, length(checks))
   #= At a step end (`all`: after the initialization, every assert) or at a
      crossing (the solver's state just past it). A failure at a step end whose
      relations are crossings came with the step's event: there. =#
