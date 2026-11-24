@@ -2156,12 +2156,11 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
      parameter computed at the start =#
   local startsAtEachStart::Bool = placeholderStarts ||
     any(r::Tuple{Symbol, Int, IR} -> _readsParameterOf(r[3], g.startComputed), startRules)
-  local (el::InstanceTable, nU::Int, matchRow::Vector{Int}) = (schedule.elements, schedule.nUnknowns, schedule.matchRow)
+  local (el::InstanceTable, matchRow::Vector{Int}) = (schedule.elements, schedule.matchRow)
   local (batches::Vector{Tuple{Tuple{Int, Int}, Vector{Int}}}, pos::Vector{Int}, producer::Vector{Int}, loops::LoopBlocks) =
     (schedule.batches, schedule.pos, schedule.producer, schedule.loops)
-  local (hasArrays::Bool, large::BitVector) = (schedule.hasArrays, schedule.large)
-  local (deps::Union{Nothing, Vector{Vector{Int}}}, pattern::Union{Nothing, Tuple{Vector{Int}, Vector{Int}}}) =
-    (schedule.deps, schedule.pattern)
+  local large::BitVector = schedule.large
+  local pattern::Union{Nothing, Tuple{Vector{Int}, Vector{Int}}} = schedule.pattern
   local solutions::Dict{Tuple{Int, Int}, Union{Nothing, Tuple{Ref, IR}}} = schedule.solutions
   local (needed::BitVector, relNeeded::BitVector, invariant::BitVector) = (schedule.needed, schedule.relNeeded, schedule.invariant)
   local functionAsserts::Bool = _containsErrorCall(functionDefs)
@@ -2680,7 +2679,7 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
     nm in g.structural && ns("parameter $(nm) with fixed = false used structurally")
     haskey(layoutOf, nm) || continue
   end
-  for (sym, deps, _) in rules
+  for (_, deps, _) in rules
     any(d -> d in Symbol[g.paramSyms[f] for f in g.freeParams if haskey(g.paramSyms, f)], deps) &&
       ns("a parameter binding depends on a parameter with fixed = false")
   end
@@ -3658,7 +3657,7 @@ function _literalChanges!(@nospecialize(equations!::Function), @nospecialize(whe
   p.rel .= rel0
   p.d .= d0
   p.hyst[1] = 0.0
-  local changed::Vector{Int} = Int[]
+  local changed::Vector{Int}
   try
     equations!(du, a, u, p, t, NO_CROSSINGS, true, fire)
     whens!(du, a, u, p, t, NO_CROSSINGS, true, fire)

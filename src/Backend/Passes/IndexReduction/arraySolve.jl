@@ -340,7 +340,6 @@ function solvedInArrays(model::IR.Model;
       arrayTemplates(model, view, solution)
       solution = derivativeSolution(view.model, view.model.continuous[1]; known, literalCoefficients = false)
       solution === nothing && return (model, Symbol[])
-      stale = false
       return solvedInArraysOnce(model, view, solution)
     catch err
       (err isa NotHandled && needsSplit(err)) || rethrow()

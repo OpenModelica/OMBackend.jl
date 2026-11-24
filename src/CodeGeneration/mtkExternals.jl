@@ -2762,7 +2762,7 @@ function splitInitialValues(reducedSystem, finalInitialValues::AbstractVector,
     local _targets = Any[k for (k, v) in ModelingToolkit.guesses(reducedSystem)
                          if (Symbolics.value(v) isa Number && iszero(Symbolics.value(v)))]
     local _resolved = Dict{Any, Float64}()
-    for _round in 1:6
+    for _ in 1:6
       local _progress = false
       for X in _targets
         haskey(_resolved, X) && continue
@@ -3177,7 +3177,7 @@ function structural_simplify(sys::ModelingToolkit.AbstractSystem,
       if !isempty(allResults)
         @warn "Found $(length(allResults)) array-shaped subtree(s) in equations before structural_simplify"
         for (idx, p, sh, node) in allResults[1:min(10, length(allResults))]
-          nodeStr = try; string(node)[1:min(200, length(string(node)))]; catch e; "$(typeof(node))"; end
+          nodeStr = try; string(node)[1:min(200, length(string(node)))]; catch; "$(typeof(node))"; end
           @warn "  eq $idx at $p: shape=$sh node=$nodeStr"
         end
       else

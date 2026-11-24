@@ -1116,8 +1116,6 @@ function reduceIndexArrays!(model::IR.Model; arrays::Bool = true)::Bool
       arrayCommit(model, model.continuous[1], view, written)
       stale || break
       (view, written) = knownPlan(model, view, nothing)
-      partition = view.model.continuous[1]
-      stale = false
       final = (view, written, arrayCommit(model, model.continuous[1], view, written))
       break
     catch err
@@ -1132,7 +1130,6 @@ function reduceIndexArrays!(model::IR.Model; arrays::Bool = true)::Bool
         throw(NotHandled("slicing that splits most of the arrays ($(arrayElements - kept) of $(arrayElements) elements, " *
                          "starting at $(err.reason))"))
       view = scalarizeArrays(model; cache)
-      partition = view.model.continuous[1]
       stale = true
     end
   end

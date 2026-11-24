@@ -1991,8 +1991,8 @@ A tuple's target that is an array: a variable as a whole (`r`), or an array by i
 generators, "partial subscripts on uniformNoise1|uniformNoise2.state"). Nothing for a scalar or an element.
 """
 function _arrayTarget(g::Gen, e::SC.Exp, ctx::Ctx)::Union{Nothing, ArrayTarget}
-  local name::String = ""
-  local leading::Vector{IR} = IR[]
+  local name::String
+  local leading::Vector{IR}
   if e isa SC.EXP_CREF
     name = String(e.cref.sym)
     leading = IR[Lit(k) for k in e.cref.subs]

@@ -150,7 +150,6 @@ structural changes.
 function orientReciprocalEquations(simCode::SIM_CODE)::SIM_CODE
   (hasSubModels(simCode) || hasFrontendModel(simCode)) && return simCode
   isempty(simCode.residualEquations) && return simCode
-  local ht = simCode.stringToSimVarHT
   local excluded = eventAndComplexNames(simCode)
   for eq in simCode.initialEquations
     eq isa ARRAY_EQUATION && continue

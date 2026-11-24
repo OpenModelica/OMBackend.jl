@@ -1112,7 +1112,7 @@ function _inlineObservedRows!(exprs, reducedSystem, states, params, iv)::Vector{
   end
   push!(allowed, variableName(iv))
   for i in 1:length(exprs)
-    for _pass in 1:(length(obsEqs) + 1)
+    for _ in 1:(length(obsEqs) + 1)
       local pending = OrderedDict{Any, Any}()
       for v in Symbolics.get_variables(exprs[i])
         local vs::Union{Nothing, String} = variableName(v)
@@ -1210,7 +1210,7 @@ function _parameterDependents(pars, params, roots::AbstractSet{String};
      dependents substituted by their bindings (bounded, bindings are acyclic),
      names outside `params` by their resolved values. =#
   local byVar = Dict{Any, Any}()
-  for (k, v) in pars
+  for (k, _) in pars
     local nm::Union{Nothing, String} = variableName(k)
     local uk = k isa Symbolics.Num ? Symbolics.unwrap(k) : k
     if nm in deps
@@ -2430,7 +2430,7 @@ function _resolveParamValues(pars; used::Union{Nothing, Set{String}} = nothing)
 
   # Build a substitution dict from numeric values (using unwrapped symbolic keys)
   local subDict = Dict{Any, Any}()
-  for (k, v) in pars
+  for (k, _) in pars
     local kStr::Union{Nothing, String} = variableName(k)
     if haskey(numericByStr, kStr)
       local uk = k isa Symbolics.Num ? Symbolics.unwrap(k) : k
@@ -2563,7 +2563,7 @@ Requires the reduced system to have been compiled with `split=false` so that
 the generated event callback functions expect a flat parameter vector.
 """
 function _extractAndMergeEventCallbacks(reducedSystem, @nospecialize(customCallbacks))
-  local eventCBs = nothing
+  local eventCBs
   try
     eventCBs = ModelingToolkit.process_events(reducedSystem)
   catch ex

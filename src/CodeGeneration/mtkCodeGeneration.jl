@@ -146,7 +146,7 @@ function classifyVariables(simCode::SC.SIM_CODE)::ClassifiedVariables
   local dataStructureVariables = String[]
   local statePriorityPairs     = Tuple{Symbol, Int}[]
   local whenTargets = SC.whenAssignedNames(simCode)
-  for (varName, (idx, var)) in simCode.stringToSimVarHT
+  for (varName, (_, var)) in simCode.stringToSimVarHT
     local varType = var.varKind
     if varType isa SC.INPUT
       unsupported("INPUT variable", varName)
@@ -738,13 +738,12 @@ function ODE_MODE_MTK(simCode::SC.SIM_CODE)
   #=If our model name is separated by . replace it with __ =#
   local MODEL_NAME = simCode.name
   #= Generate code for algorithmic Modelica =#
-  (functions, functionNames) = AlgorithmicCodeGeneration.generateFunctions(simCode.functions)
+  (functions, _) = AlgorithmicCodeGeneration.generateFunctions(simCode.functions)
   if !SC.hasStructuralTransitions(simCode) && !SC.hasSubModels(simCode)
     #= Generate using the standard name =#
     return ODE_MODE_MTK_PROGRAM_GENERATION(simCode, simCode.name, functions)
   end
   #= Handle structural submodels =#
-  local activeModelSimCode = getActiveModel(simCode)
   local activeModelName = simCode.activeModel
   local structuralModes = Expr[]
   for mode in simCode.subModels
@@ -1098,8 +1097,6 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SC.SIM_CODE, modelName::String, 
   local discreteVariables      = vars.discreteVariables
   local parameters             = vars.parameters
   local arrayParameters        = vars.arrayParameters
-  local stateDerivatives       = vars.stateDerivatives
-  local dataStructureVariables = vars.dataStructureVariables
   local statePriorityPairs     = vars.statePriorityPairs
 
 
@@ -1141,7 +1138,6 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SC.SIM_CODE, modelName::String, 
                                    MTK_CodeGenerationUtil.buildT0TrustedDerivedPairs(simCode)]
   #= Symbolic names =#
   local algebraicVariablesSym = Symbol[:($(Symbol(v))) for v in algebraicVariables]
-  local dataStructureVariablesSym = Symbol[Symbol(v) for v in dataStructureVariables]
   local stateVariablesSym = Symbol[:($(Symbol(v))) for v in stateVariables]
   local parVariablesSym = Symbol[Symbol(p) for p in parameters]
   #= Discrete-dummy demotion. Each discrete variable starts with a

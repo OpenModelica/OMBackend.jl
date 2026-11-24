@@ -70,7 +70,7 @@ function booleanizeWhenConditions!(variables::IR.VariableSet, partition::IR.Part
   local known = knownNames(variables)
   local count = Ref(0)
   local define = e -> begin
-    local name = :_
+    local name::Symbol
     while true
       count[] += 1
       name = Symbol("__whenCondition", count[])

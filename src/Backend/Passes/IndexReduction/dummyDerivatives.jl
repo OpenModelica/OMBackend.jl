@@ -397,7 +397,7 @@ function numericChoice(s::Structure, rows::Vector{Int}, order::Vector{Int}, clas
   for c in forced
     local bj = get(at, c, 0)
     bj == 0 && return nothing
-    local (best, bi, _) = largestEntry(A, bj:bj, tolerance)
+    local (_, bi, _) = largestEntry(A, bj:bj, tolerance)
     bi == 0 && return nothing
     eliminate!(A, bi, bj)
     push!(chosen, order[bj])
@@ -410,7 +410,7 @@ function numericChoice(s::Structure, rows::Vector{Int}, order::Vector{Int}, clas
       j1 += 1
     end
     while length(chosen) < length(rows)
-      local (best, bi, bj) = largestEntry(A, j0:j1, tolerance)
+      local (_, bi, bj) = largestEntry(A, j0:j1, tolerance)
       bi == 0 && break
       eliminate!(A, bi, bj)
       push!(chosen, order[bj])
@@ -592,7 +592,6 @@ The first columns in `order` that can be matched to the rows (a greedy choice in
 matroid: a column is taken where a matching of the rows to the taken columns grows).
 """
 function structuralChoice(s::Structure, rows::Vector{Int}, order::Vector{Int})::Vector{Int}
-  local rowIndex = Dict{Int, Int}(r => i for (i, r) in enumerate(rows))
   local columnRows = Dict{Int, Vector{Int}}(c => Int[] for c in order)
   for (i, r) in enumerate(rows), c in s.incidence[r]
     haskey(columnRows, c) && push!(columnRows[c], i)

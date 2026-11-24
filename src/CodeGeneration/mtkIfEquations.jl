@@ -105,7 +105,6 @@ So the first will have 1 and so on.
 """
 function createIfEquations(stateVariables::Vector, algebraicVariables::Vector, simCode::SC.SIM_CODE)
   local ifEquations = IfEquationComponent[]
-  local identifier::Int
   local sortedIfEquations = _sortedIfEquations(simCode)
   #= Shared relay-t0 map: targets computed by earlier if-equations feed the
      condition initial values of later ones. =#
@@ -386,7 +385,6 @@ function createIfEquation(stateVariables::Vector,
                                                                                   atInitial = true),
                                         simCode; closedBoundary = _closedB, extraVals = _rT0)
     local numVal = ivCond ? 1.0 : 0.0
-    local invVal = ivCond ? 0.0 : 1.0
     #= Build ImperativeAffect: function returns a NamedTuple of new values.
        modified NamedTuple maps aliases to the symbolic parameter variables.
        Callback fires for every branch condition; ifCondN is the load-bearing

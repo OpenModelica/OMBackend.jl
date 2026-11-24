@@ -353,7 +353,7 @@ function functionValues(f::MODELICA_FUNCTION, args::Vector{Any}, ctx::Interpreta
   ctx.depth >= MAX_CALL_DEPTH && return unknown
   ctx.memo[key] = nothing
   local env = Env()
-  local result = unknown
+  local result::Vector{Any}
   ctx.depth += 1
   try
     length(args) == length(f.inputs) || throw(InterpretationBail())

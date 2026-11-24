@@ -945,7 +945,7 @@ end
 function printModel(modelName::String; MTK = true, keepComments = true, keepBeginBlocks = true)
   try
     println(modelToString(modelName::String; MTK = MTK, keepComments = keepComments, keepBeginBlocks = keepBeginBlocks))
-  catch e
+  catch
     @error "Model: $(modelName) is not compiled. Available models are: $(join(availableModels(), ", "))"
     error("Error printing model: $(modelName)")
   end
@@ -1345,7 +1345,7 @@ function variableValues(sol::ODESolution, varName::String)
     :t
   end
   try
-    res = sol[varAsJLSym]
+    sol[varAsJLSym]
   catch e
     @warn "Did not locate a variable named '$(varName)' in the model" exception=(e, catch_backtrace())
     nothing

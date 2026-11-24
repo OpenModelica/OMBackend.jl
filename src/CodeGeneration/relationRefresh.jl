@@ -783,7 +783,7 @@ function _sweep!(e::EventIteration, integrator, firstSweep::Bool)
   local moves::Int = 0
   local evaluatedAt::Vector{Int} = zeros(Int, length(e.clusters))
   local wrote::Vector{Bool} = fill(false, length(e.clusters))
-  for pass in 1:e.limit
+  for _ in 1:e.limit
     local stale::Bool = false       # the algebraic unknowns, for a coupled cluster or a discrete when next
     local whenStale::Bool = false   # the same after a discrete when, for a coupled cluster next
     local fired::Bool = false

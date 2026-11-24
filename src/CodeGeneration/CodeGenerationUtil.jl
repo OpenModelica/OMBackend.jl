@@ -554,7 +554,7 @@ function writeEqsToFile(elems::Vector{Expr}, filename)
       eqStr = replace(eqStr, "Differential" => "der")
       println(buffer, eqStr)
     end
-  catch e
+  catch
     @error string("Failed writing the model to the file:",  filename)
     rethrow()
   end

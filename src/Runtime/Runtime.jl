@@ -315,7 +315,6 @@ function solve(omProblem::OM_ProblemStructural, tspan, alg; kwargs...)
   local oldSystem = problem
   local structuralCallbacks = omProblem.structuralCallbacks
   local commonVariableSet = omProblem.commonVariables
-  local symsOfInitialMode = getSyms(problem)
   local activeModeName = omProblem.activeModeName
   #= Create integrator =#
   integrator = init(problem, alg; solverVerbosity(kwargs)..., kwargs...)
@@ -1011,7 +1010,7 @@ function solve(omProblem::OM_Problem, tspan, alg; kwargs...)
   #= Create integrator =#
   integrator = init(problem, alg; stop_at_next_tstop = true, solverVerbosity(kwargs)..., kwargs...)
   add_tstop!(integrator, tspan[2])
-  for i in integrator
+  for _ in integrator
   end
   #= Return the final solution =#
   return integrator.sol
