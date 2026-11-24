@@ -1739,18 +1739,28 @@ function _buildSparseJacobian(rhs_list, states, params, iv, u0, p_vec, t0)
        nodes and 10 GB; as a vector 14,123 nodes). The solver's Jacobian has
        the prototype's structure, so they are its nzval. =#
     local nzSym = collect(Symbolics.SparseArrays.nonzeros(jacSym))
-    local result = Symbolics.build_function(nzSym, states, params, iv;
-                                            expression=Val{true}, cse=true)
-    local nzFunc = _exprToRTGFunction(_sinkBranchAssignments!(_demoteWideNumericLiterals!(result[2])))
+    local nzFuncs::Vector{Tuple{UnitRange{Int}, Function}} = _nonzeroFunctions(nzSym, states, params, iv)
     local jacProto = similar(jacSym, Float64)
     jacProto.nzval .= 0.0
     local nnz0 = length(nzSym)
-    local jacFunc = (J, u, p, t) -> begin
-      local nz = Symbolics.SparseArrays.nonzeros(J)
-      #= The generated code writes by position, without bounds checks. =#
-      length(nz) == nnz0 || throw(DimensionMismatch("Jacobian with $(length(nz)) stored entries, not $(nnz0)"))
-      nzFunc(nz, u, p, t)
-      nothing
+    #= The generated code writes by position, without bounds checks. =#
+    local jacFunc = if length(nzFuncs) == 1
+      local nzFunc = nzFuncs[1][2]
+      (J, u, p, t) -> begin
+        local nz = Symbolics.SparseArrays.nonzeros(J)
+        length(nz) == nnz0 || throw(DimensionMismatch("Jacobian with $(length(nz)) stored entries, not $(nnz0)"))
+        nzFunc(nz, u, p, t)
+        nothing
+      end
+    else
+      (J, u, p, t) -> begin
+        local nz = Symbolics.SparseArrays.nonzeros(J)
+        length(nz) == nnz0 || throw(DimensionMismatch("Jacobian with $(length(nz)) stored entries, not $(nnz0)"))
+        for part::Tuple{UnitRange{Int}, Function} in nzFuncs
+          part[2](view(nz, part[1]), u, p, t)
+        end
+        nothing
+      end
     end
     local probe = copy(jacProto)
     jacFunc(probe, u0, p_vec, t0)
@@ -1761,6 +1771,47 @@ function _buildSparseJacobian(rhs_list, states, params, iv, u0, p_vec, t0)
     @debug "DirectRHS: symbolic Jacobian generation failed; solver will finite-difference" exception=(e, catch_backtrace())
     return (nothing, nothing)
   end
+end
+
+"""
+    _nonzeroFunctions(nz, states, params, iv) -> Vector{Tuple{UnitRange{Int}, Function}}
+
+The generated functions of `(out, u, p, t)` that write the values of the nonzeros `nz` (a Jacobian's, in its stored
+order) of their range to `out`, each of at most `DIRECT_JAC_FUNCTION_NODE_LIMIT` Expr nodes (`_nonzeroExpression`): a
+range of more nodes split into parts of about the limit, each split again where it still has more (a single nonzero
+is one function however large). One function compiles in time and memory far beyond linear in its size: MSL
+Spice3BenchmarkFourBitBinaryAdder's 5706 nonzeros, 275k nodes, took 149 s and 5.8 GB; parts of 45k-79k nodes 3-4 s
+each.
+"""
+function _nonzeroFunctions(nz::AbstractVector, states::AbstractVector, params::AbstractVector,
+                           iv::SymbolicUtils.BasicSymbolic)::Vector{Tuple{UnitRange{Int}, Function}}
+  local limit::Int = OMBackend.DIRECT_JAC_FUNCTION_NODE_LIMIT[]
+  local functions::Vector{Tuple{UnitRange{Int}, Function}} = Tuple{UnitRange{Int}, Function}[]
+  local pending::Vector{UnitRange{Int}} = UnitRange{Int}[1:length(nz)]
+  while !isempty(pending)
+    local r::UnitRange{Int} = popfirst!(pending)
+    local ex::Expr = _nonzeroExpression(nz[r], states, params, iv)
+    local nodes::Int = _exprNodes(ex)
+    if nodes > limit && length(r) > 1
+      local parts::Int = min(length(r), cld(nodes, limit))
+      local bounds::Vector{Int} = [first(r) - 1 + div(k * length(r), parts) for k in 0:parts]
+      prepend!(pending, UnitRange{Int}[bounds[k] + 1:bounds[k + 1] for k in 1:parts])
+      continue
+    end
+    push!(functions, (r, _exprToRTGFunction(ex)))
+  end
+  return functions
+end
+
+"""
+The in-place generated code of the values `nz` (build_function with CSE): the branches' assignments in their branches,
+the numeric partials of a call's element extractors grouped (`_hoistCallPartials!`), its extractor calls one call of
+its whole result (`_hoistExtractorCalls!`).
+"""
+function _nonzeroExpression(nz::AbstractVector, states::AbstractVector, params::AbstractVector,
+                            iv::SymbolicUtils.BasicSymbolic)::Expr
+  local result::Tuple{Expr, Expr} = Symbolics.build_function(nz, states, params, iv; expression = Val{true}, cse = true)
+  return _hoistExtractorCalls!(_hoistCallPartials!(_sinkBranchAssignments!(_demoteWideNumericLiterals!(result[2]))))
 end
 
 """

@@ -2491,8 +2491,9 @@ end DivideInLoop;
     local reads::Vector{Vector{Tuple{Int, Int}}} = [[(1, 1), (2, 1)], [(2, 1), (3, 1)], [(1, 1), (2, 1), (3, 1)]]
     local readers::Vector{Vector{Int}} = [[1, 3], [1, 2, 3], [2, 3]]
     local known::BitVector = falses(3); local used::BitVector = falses(3); local open::Vector{Int} = [2, 2, 3]
-    @test D._tearCascade(1, known, used, open, reads, readers, (e::Int, v::Int, access::Int) -> true) == 3
-    @test D._tearCascade(1, known, used, open, reads, readers, (e::Int, v::Int, access::Int) -> e != 1) == 1
+    local noOuts::Vector{Vector{Int}} = [Int[] for _ in 1:3]   #= equations only: no algorithm's outputs =#
+    @test D._tearCascade(1, known, used, open, reads, readers, noOuts, (e::Int, v::Int, access::Int) -> true) == 3
+    @test D._tearCascade(1, known, used, open, reads, readers, noOuts, (e::Int, v::Int, access::Int) -> e != 1) == 1
     @test known == falses(3) && used == falses(3) && open == [2, 2, 3]
   end
 
@@ -2503,9 +2504,20 @@ end DivideInLoop;
     local reads::Vector{Vector{Tuple{Int, Int}}} = [[(1, 1), (2, 1)], [(2, 1), (3, 1)], [(1, 1), (2, 1), (3, 1)]]
     local readers::Vector{Vector{Int}} = [[1, 3], [1, 2, 3], [2, 3]]
     local all3::Function = (e::Int, v::Int, access::Int) -> true
-    local (order, tears, used) = D._tearOrder(reads, readers, all3, 1)
+    local noOuts::Vector{Vector{Int}} = [Int[] for _ in 1:3]
+    local (order, tears, used) = D._tearOrder(reads, readers, noOuts, all3, 1)
     @test order == [(1, 1, 1), (2, 3, 1)] && tears == [2] && used == BitVector([true, true, false])
-    @test D._tearOrder(reads, readers, all3, 3)[2] == [2]
+    @test D._tearOrder(reads, readers, noOuts, all3, 3)[2] == [2]
+    #= an algorithm: e2 reads v1 and assigns v2 (`outs`), e1 reads v1 and v2. v1 is torn (v2, an algorithm's output,
+       never is), e2 runs once v1 is known (0 unknowns left; an equation is solved at 1), e1 is the residual. Two
+       algorithms that read each other's outputs leave nothing to tear: NotSupported =#
+    local notV2::Function = (e::Int, v::Int, access::Int) -> v != 2
+    for lookahead in (1, 3)
+      local (aOrder, aTears, aUsed) = D._tearOrder([[(1, 1), (2, 1)], [(1, 1)]], [[1, 2], [1]], [Int[], [2]], notV2,
+                                                    lookahead)
+      @test aOrder == [(2, 0, 0)] && aTears == [1] && aUsed == BitVector([false, true])
+    end
+    @test_throws D.NotSupported D._tearOrder([[(2, 1)], [(1, 1)]], [[2], [1]], [[1], [2]], all3, 1)
     #= piecewise in the unknowns (x), with which `_tearBlock` tears greedily only (MSL DifferentialAmplifier's
        op-amp limiter): an if-expression whose condition reads x under noEvent, abs of x. Not piecewise in them: a
        smooth function, an if-expression on a mode held through the solve (a thyristor's `off`), a relation with
@@ -3955,5 +3967,116 @@ end DivideInLoop;
       local sol = OMBackend.simulate(name; tspan = (0.0, 1.0), reltol = 1e-10, abstol = 1e-12)
       @test _values(sol, ["x[2]", "y[1]", "y[2]", "z[2]"]) ≈ expected rtol = 1e-8
     end
+  end
+
+  #= A tuple call, `(y1, y2) = f(x, k)`, is an algorithm of the array code (its outputs are its own); in an algebraic
+     loop it runs from the loop's iterates, all its outputs at once, as omc's tearing solves an algorithm: in a family's
+     solve (its equations' unknowns iterated, `_loopFamilyCode`) and in a torn block (`_tearBlock`). Declined before
+     ("an algorithm in an algebraic loop": MSL Spice3BenchmarkFourBitBinaryAdder's DIODEs, `(cc, m_dCap) =
+     diodeNoBypassCode(..., {pin, n.v})`). Each loop k x^3 + 4 x = s, der(s) = -x: 1.5 k x^2 + 4 log(x) = C - t =#
+  @testset "An algorithm in an algebraic loop: run from the loop's iterates" begin
+    local loops = Modelica"""
+      package AlgLoop
+        function f
+          input Real x;
+          input Real k;
+          output Real y1;
+          output Real y2;
+        algorithm
+          y1 := k * x^3 + x;
+          y2 := 2 * x;
+        end f;
+        model One
+          Real s(start = 1, fixed = true);
+          Real x(start = 0.5);
+          Real y1, y2;
+        equation
+          der(s) = -x;
+          (y1, y2) = f(x, 1);
+          y1 + y2 + x = s;
+        end One;
+        model Init "s free, x = 0.4 at the start: the initial solve through the loop"
+          Real s(start = 1);
+          Real x(start = 0.5);
+          Real y1, y2;
+        initial equation
+          x = 0.4;
+        equation
+          der(s) = -x;
+          (y1, y2) = f(x, 1);
+          y1 + y2 + x = s;
+        end Init;
+        model Family
+          parameter Integer n = 200;
+          parameter Real k[n] = {1 + i / n for i in 1:n};
+          Real s[n](each start = 1, each fixed = true);
+          Real x[n](each start = 0.5);
+          Real y1[n], y2[n];
+        equation
+          for i in 1:n loop
+            der(s[i]) = -x[i];
+            (y1[i], y2[i]) = f(x[i], k[i]);
+            y1[i] + y2[i] + x[i] = s[i];
+          end for;
+        end Family;
+        model Coupled "one loop through the elements: k x^3 + 4 x = s + 0.1 (x[i - 1] - 2 x[i] + x[i + 1])"
+          parameter Integer n = 10;
+          Real s[n](each start = 1, each fixed = true);
+          Real x[n](each start = 0.5);
+          Real y1[n], y2[n];
+        equation
+          for i in 1:n loop
+            der(s[i]) = -x[i] + 0.05 * i;
+            (y1[i], y2[i]) = f(x[i], 1 + 0.1 * i);
+          end for;
+          y1[1] + y2[1] + x[1] = s[1] + 0.1 * (x[2] - 2 * x[1]);
+          for i in 2:n - 1 loop
+            y1[i] + y2[i] + x[i] = s[i] + 0.1 * (x[i - 1] - 2 * x[i] + x[i + 1]);
+          end for;
+          y1[n] + y2[n] + x[n] = s[n] + 0.1 * (x[n - 1] - 2 * x[n]);
+        end Coupled;
+      end AlgLoop;
+      """
+    #= x at t from x0 at 0 (1.5 k x^2 + 4 log(x) = C - t); x0 from s(0) = 1 (k x0^3 + 4 x0 = 1) =#
+    function loopValue(k::Float64, x0::Float64, t::Float64)::Float64
+      local C::Float64 = 1.5k * x0^2 + 4log(x0)
+      local x::Float64 = x0
+      for _ in 1:50
+        x -= (1.5k * x^2 + 4log(x) - (C - t)) / (3k * x + 4 / x)
+      end
+      return x
+    end
+    function startValue(k::Float64)::Float64
+      local x::Float64 = 0.25
+      for _ in 1:50
+        x -= (k * x^3 + 4x - 1) / (3k * x^2 + 4)
+      end
+      return x
+    end
+    local tight::NamedTuple = (reltol = 1e-10, abstol = 1e-10)
+    local name::String = _translateProgram(loops, "AlgLoop.One"; scalarized = false)
+    @test _arrayPathTaken(name)
+    local sol = OMBackend.simulate(name; tspan = (0.0, 1.0), tight...)
+    @test _values(sol, ["x"])[1] ≈ loopValue(1.0, startValue(1.0), 1.0) rtol = 1e-9
+    #= the initial system holds the loop's iterate (x) and solves s from it: s(0) = 0.4^3 + 1.6 =#
+    name = _translateProgram(loops, "AlgLoop.Init"; scalarized = false)
+    @test _arrayPathTaken(name)
+    sol = OMBackend.simulate(name; tspan = (0.0, 1.0), tight...)
+    @test OMBackend.variableValues(sol, "s")[1] ≈ 1.664 rtol = 1e-9
+    @test _values(sol, ["x"])[1] ≈ loopValue(1.0, 0.4, 1.0) rtol = 1e-9
+    #= one family solve for the 200 loops (its unknowns x[i], the call run from them): no torn block per element =#
+    name = _translateProgram(loops, "AlgLoop.Family"; scalarized = false)
+    @test _arrayPathTaken(name)
+    sol = OMBackend.simulate(name; tspan = (0.0, 1.0), tight...)
+    @test isempty(sol.prob.p.blocks) && size(only(sol.prob.p.loops)) == (1, 200)
+    @test _values(sol, ["x[1]", "x[100]", "x[200]"]) ≈ [loopValue(k, startValue(k), 1.0) for k in (1.005, 1.5, 2.0)] rtol = 1e-8
+    #= a torn block of 20 instances: 10 iteration variables, the calls run from them =#
+    name = _translateProgram(loops, "AlgLoop.Coupled"; scalarized = false)
+    @test _arrayPathTaken(name)
+    sol = OMBackend.simulate(name; tspan = (0.0, 1.0), tight...)
+    @test length(only(sol.prob.p.blocks).y) == 10
+    local x::Vector{Float64} = _values(sol, ["x[$i]" for i in 1:10]); local s::Vector{Float64} = _values(sol, ["s[$i]" for i in 1:10])
+    local coupling::Vector{Float64} = [0.1 * ((i > 1 ? x[i - 1] : 0.0) - 2x[i] + (i < 10 ? x[i + 1] : 0.0)) for i in 1:10]
+    @test maximum(abs.((1 .+ 0.1 .* (1:10)) .* x .^ 3 .+ 4x .- s .- coupling)) < 1e-12
   end
 end
