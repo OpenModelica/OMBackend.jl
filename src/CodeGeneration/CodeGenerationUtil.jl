@@ -583,22 +583,6 @@ function replaceVars(expr::Expr; kwargs...)
 end
 replaceVars(x; kwargs...) = x
 
-
-"""
-  Utility function to check if a given expression contains a specific datatype.
-"""
-function exprContainsDatatype(ex, datatype)
-  if ex isa Symbol
-    return false
-  elseif ex isa datatype
-    return true
-  elseif ex isa Expr
-    return any(arg -> exprContainsDatatype(arg, datatype), ex.args)
-  else
-    return false
-  end
-end
-
 """
     flattenRecordCallArg(arg, simCode)
 

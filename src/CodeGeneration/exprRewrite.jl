@@ -39,27 +39,6 @@ instead of the old Symbolics round-trip.
 =#
 
 """
-Find `:(der(x))` in an Expr tree. Returns the variable symbol or `nothing`.
-"""
-function findDerivativeVar(expr::Expr)
-    # Match both :der (DAE-emit) and :D (SIM-Exp-emit) so the residual→explicit
-    # rewrite recognises the derivative regardless of which codegen path produced it.
-    if expr.head == :call && length(expr.args) >= 2 &&
-       (expr.args[1] === :der || expr.args[1] === :D)
-        return expr.args[2]
-    end
-    for a in expr.args
-        result = findDerivativeVar(a)
-        if result !== nothing
-            return result
-        end
-    end
-    return nothing
-end
-
-findDerivativeVar(_) = nothing
-
-"""
 Collect all distinct `:(der(x))` / `:(D(x))` argument exprs in an Expr tree.
 """
 function findAllDerivativeVars!(found::Vector{Any}, expr::Expr)
