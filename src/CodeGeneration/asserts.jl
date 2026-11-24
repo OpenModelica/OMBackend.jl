@@ -228,8 +228,8 @@ function withAssertCallback(callbacks, problem, asserts::Vector; discrete::Vecto
     end
     return false
   end
-  local cb = DiffEqBase.DiscreteCallback(NotAnEvent((u, t, integrator) -> check!(integrator, false)), integrator -> nothing;
-                                         initialize = function (c, u, t, integrator)
+  local cb = DiffEqBase.DiscreteCallback(NotAnEvent((_, _, integrator) -> check!(integrator, false)), _ -> nothing;
+                                         initialize = function (_, _, _, integrator)
                                            fill!(violated, false)
                                            fill!(pending, NaN)
                                            fill!(pendingU, nothing)
@@ -239,7 +239,7 @@ function withAssertCallback(callbacks, problem, asserts::Vector; discrete::Vecto
                                            nothing
                                          end,
                                          #= A failure still pending at the end: decided on the final state. =#
-                                         finalize = function (c, u, t, integrator)
+                                         finalize = function (_, _, _, integrator)
                                            for (i, (a, getter)) in enumerate(checks)
                                              isnan(pending[i]) && continue
                                              a.condition(_assertValues(a, getter, integrator), integrator) ||

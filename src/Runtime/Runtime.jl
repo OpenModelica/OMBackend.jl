@@ -964,7 +964,7 @@ end
   use an external server compatible with MockAgentServer.jl.
 """
 const AGENT_CALLBACK = Ref{Function}(
-  (componentsToChange, context, metamodel, t) -> [nothing for _ in componentsToChange]
+  (componentsToChange, _, _, _) -> [nothing for _ in componentsToChange]
 )
 
 """

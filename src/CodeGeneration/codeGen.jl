@@ -116,7 +116,7 @@ function _statementWrites!(out::Vector{String}, s::SC.IF)::Nothing
   foreach(x -> _statementWrites!(out, x), Iterators.flatten((Iterators.flatten(b.body for b in s.branches), s.elseBody)))
   return nothing
 end
-_statementWrites!(out::Vector{String}, ::SC.Statement)::Nothing = nothing
+_statementWrites!(::Vector{String}, ::SC.Statement)::Nothing = nothing
 
 """
 The names a condition reads OUTSIDE any `change(...)` or `pre(...)`: the level-valued

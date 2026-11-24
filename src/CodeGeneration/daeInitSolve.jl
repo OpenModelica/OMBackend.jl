@@ -338,7 +338,7 @@ ErasedRHS(f::Function) = ErasedRHS(f, nothing)
 "The Jacobian structure of `rhs` (an `ErasedRHS`'s, of `n` unknowns), else nothing."
 _rhsStructure(rhs::ErasedRHS, n::Int)::Union{Nothing, SA.SparseMatrixCSC{Float64, Int}} =
   rhs.structure !== nothing && size(rhs.structure) == (n, n) ? rhs.structure : nothing
-_rhsStructure(@nospecialize(rhs), n::Int)::Nothing = nothing
+_rhsStructure(@nospecialize(_rhs), ::Int)::Nothing = nothing
 
 """
     ErasedResiduals(f)

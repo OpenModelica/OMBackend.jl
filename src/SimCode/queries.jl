@@ -112,9 +112,9 @@ isUnknownVarKind(k::SimVarType)::Bool = k isa Union{STATE, STATE_DERIVATIVE, ALG
 bindingOf(k::SimVarType)::Union{Nothing, Exp} = hasproperty(k, :bindExp) ? k.bindExp : nothing
 
 "A variable category with its binding replaced by `b` (of one that has a binding)."
-withBinding(k::PARAMETER, b::Union{Nothing, Exp})::SimVarType = PARAMETER(b)
-withBinding(k::DATA_STRUCTURE, b::Union{Nothing, Exp})::SimVarType = DATA_STRUCTURE(b)
-withBinding(k::STRING, b::Union{Nothing, Exp})::SimVarType = STRING(b)
+withBinding(::PARAMETER, b::Union{Nothing, Exp})::SimVarType = PARAMETER(b)
+withBinding(::DATA_STRUCTURE, b::Union{Nothing, Exp})::SimVarType = DATA_STRUCTURE(b)
+withBinding(::STRING, b::Union{Nothing, Exp})::SimVarType = STRING(b)
 withBinding(k::SimVarType, ::Union{Nothing, Exp})::SimVarType = k
 
 "The keys of the states' derivative entries by the states' keys (`STATE_DERIVATIVE`, `createIndices`)."
@@ -200,7 +200,7 @@ end
 equationExps(eq::RESIDUAL_EQUATION)::Vector{Exp} = Exp[eq.exp]
 equationExps(eq::EQUATION)::Vector{Exp} = Exp[eq.lhs, eq.rhs]
 equationExps(eq::ARRAY_EQUATION)::Vector{Exp} = Exp[eq.left, eq.right]
-equationExps(eq::Equation)::Vector{Exp} = Exp[]
+equationExps(::Equation)::Vector{Exp} = Exp[]
 
 """
     whenCrefNames!(names, w)

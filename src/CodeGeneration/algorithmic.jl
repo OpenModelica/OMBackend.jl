@@ -64,11 +64,11 @@ function ensureAlgArrayLength!(arr::Vector, idx)
   end
   return arr
 end
-ensureAlgArrayLength!(arr, idx) = arr
+ensureAlgArrayLength!(arr, _) = arr
 
 _algAssignedMaxIndex(idx::Int) = Int(idx)
 _algAssignedMaxIndex(idx::AbstractUnitRange) = isempty(idx) ? 0 : Int(last(idx))
-_algAssignedMaxIndex(idx::Colon) = 0
+_algAssignedMaxIndex(::Colon) = 0
 function _algAssignedMaxIndex(idx)
   try
     return maximum(Int, idx; init=0)

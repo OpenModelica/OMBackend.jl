@@ -57,7 +57,7 @@ function findDerivativeVar(expr::Expr)
     return nothing
 end
 
-findDerivativeVar(x) = nothing
+findDerivativeVar(_) = nothing
 
 """
 Collect all distinct `:(der(x))` / `:(D(x))` argument exprs in an Expr tree.
@@ -74,7 +74,7 @@ function findAllDerivativeVars!(found::Vector{Any}, expr::Expr)
     return found
 end
 
-findAllDerivativeVars!(found::Vector{Any}, x) = found
+findAllDerivativeVars!(found::Vector{Any}, _) = found
 
 """
 Replace `:(der(var))` with `val` throughout an Expr tree. Returns a new Expr.
@@ -88,7 +88,7 @@ function substituteDer(expr::Expr, var, val)
     return Expr(expr.head, newargs...)
 end
 
-substituteDer(x, var, val) = x
+substituteDer(x, _, _) = x
 
 """
 Transform `:(0 ~ expr)` into `:(D(x) ~ -rest/coeff)` where the derivative
@@ -170,7 +170,7 @@ function qualifyModelicaFunctions!(expr::Expr, funcNames::OrderedSet{Symbol})
     return expr
 end
 
-qualifyModelicaFunctions!(x, funcNames::OrderedSet{Symbol}) = x
+qualifyModelicaFunctions!(x, ::OrderedSet{Symbol}) = x
 
 """
 Return true when `x` is a zero numeric literal.
@@ -211,7 +211,7 @@ function _containsDerivativeCall(x::Expr)
     end
     return any(_containsDerivativeCall, x.args)
 end
-_containsDerivativeCall(x) = false
+_containsDerivativeCall(_) = false
 
 """
 Return true when `x` is a single resolvable leaf: a plain Symbol (but not `:t`)

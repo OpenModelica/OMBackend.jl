@@ -211,7 +211,7 @@ function whenStatementExps(s::IF)::Vector{Exp}
   end
   return out
 end
-whenStatementExps(s::Statement)::Vector{Exp} = Exp[]
+whenStatementExps(::Statement)::Vector{Exp} = Exp[]
 
 #= ==================================================================================== =#
 #= If-equations                                                                         =#

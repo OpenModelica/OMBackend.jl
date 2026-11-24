@@ -430,15 +430,15 @@ function appendStatement!(ops::Vector{IR.Statement}, assigned::Vector{Symbol}, s
 end
 
 #= Nested whens are not Modelica; the top-level ones are lifted on their own. =#
-appendStatement!(ops::Vector{IR.Statement}, assigned::Vector{Symbol}, s::IR.WHEN_STATEMENT,
-                 active::Union{Nothing, IR.Expression}, iterValues::Dict{Symbol, Int}, lowering::BodyLowering)::Bool = true
+appendStatement!(::Vector{IR.Statement}, ::Vector{Symbol}, ::IR.WHEN_STATEMENT,
+                 ::Union{Nothing, IR.Expression}, ::Dict{Symbol, Int}, ::BodyLowering)::Bool = true
 
 """
 An assert in a when body (`allowContinuous`: the when lifter) is checked where the body runs,
 under its conditions: `not guard or c`. In a regular algorithm the top-level asserts are
 `assertsOfAlgorithms`'.
 """
-function appendStatement!(ops::Vector{IR.Statement}, assigned::Vector{Symbol}, s::IR.ASSERT,
+function appendStatement!(ops::Vector{IR.Statement}, ::Vector{Symbol}, s::IR.ASSERT,
                           active::Union{Nothing, IR.Expression}, iterValues::Dict{Symbol, Int}, lowering::BodyLowering)::Bool
   lowering.allowContinuous || return true
   local c = prepare(s.condition, iterValues, lowering)
@@ -451,7 +451,7 @@ end
 `terminate()`; under a condition an if-statement of it (a when body runs it where the condition holds, an algorithm
 section's run makes it the when-equations of its condition: `realAssignmentEquations`).
 """
-function appendStatement!(ops::Vector{IR.Statement}, assigned::Vector{Symbol}, s::IR.TERMINATE,
+function appendStatement!(ops::Vector{IR.Statement}, ::Vector{Symbol}, s::IR.TERMINATE,
                           active::Union{Nothing, IR.Expression}, iterValues::Dict{Symbol, Int}, lowering::BodyLowering)::Bool
   (lowering.allowContinuous && !isFalse(active)) || return true
   local t::IR.TERMINATE = IR.TERMINATE(prepare(s.message, iterValues, lowering), s.source)
@@ -461,11 +461,11 @@ function appendStatement!(ops::Vector{IR.Statement}, assigned::Vector{Symbol}, s
 end
 
 #= A call for its side effects (a print, a file): no variable depends on it. Not run. =#
-appendStatement!(ops::Vector{IR.Statement}, assigned::Vector{Symbol}, s::IR.NORETCALL,
-                 active::Union{Nothing, IR.Expression}, iterValues::Dict{Symbol, Int}, lowering::BodyLowering)::Bool = true
+appendStatement!(::Vector{IR.Statement}, ::Vector{Symbol}, ::IR.NORETCALL,
+                 ::Union{Nothing, IR.Expression}, ::Dict{Symbol, Int}, ::BodyLowering)::Bool = true
 
-function appendStatement!(ops::Vector{IR.Statement}, assigned::Vector{Symbol}, s::IR.Statement,
-                          active::Union{Nothing, IR.Expression}, iterValues::Dict{Symbol, Int}, lowering::BodyLowering)::Bool
+function appendStatement!(::Vector{IR.Statement}, ::Vector{Symbol}, s::IR.Statement,
+                          ::Union{Nothing, IR.Expression}, ::Dict{Symbol, Int}, lowering::BodyLowering)::Bool
   lowering.allowContinuous && unsupported("this statement in $(lowering.where)", s)
   return true
 end

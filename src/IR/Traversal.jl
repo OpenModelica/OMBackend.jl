@@ -87,7 +87,7 @@ A field's value traversed (see `Traversal`): a leaf by default, kept. The repres
 methods for their children (`recur(value, arg)`), their containers (`traverseFields`) and
 vectors of those (`traverseElements`).
 """
-traverseField(value::Any, recur::R, arg::A) where {R, A} = (value, arg)
+traverseField(value::Any, ::R, arg::A) where {R, A} = (value, arg)
 
 """
     traverseElements(xs, recur, arg) -> (xs2, arg2)

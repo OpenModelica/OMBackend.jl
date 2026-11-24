@@ -246,7 +246,7 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, @
     @debug "DirectRHS: empty system (0 unknowns), building trivial dummy problem"
     isempty(freeIdx) || OMBackend.unsupported("free parameters (fixed = false) of a system without states",
                                               join((variableName(params[k]) for k in freeIdx), ", "))
-    local emptyRHS = (du, u, p, t) -> (du[1] = 0.0)
+    local emptyRHS = (du, _, _, _) -> (du[1] = 0.0)
     local f0 = ModelingToolkit.ODEFunction{true}(emptyRHS; sys = reducedSystem)
     local p0 = _buildParamVector(params, pars; resolvedParams=resolvedParams)
     if assignParams! !== nothing
@@ -845,7 +845,7 @@ function _runEntry(reducedSystem; states, params, pars, finalInitialValues, syst
                                       OMBackend.isTunableParameter(nm, tunableSet))
   local followTunable! = something(_dependentsWriter(isempty(roots) ? nothing :
                                                       _parameterDependents(pars, params, roots; resolvedParams=resolvedParams)),
-                                   pv -> nothing)
+                                   _ -> nothing)
   local parsByName::Dict{String, Any} = Dict{String, Any}(variableName(k) => v for (k, v) in pars)
   local entryParams = _entryParameters(Iterators.flatten(((p.second for p in finalInitialValues),
                                                           (eq.rhs for eq in ModelingToolkit.initialization_equations(reducedSystem)),
@@ -1355,7 +1355,7 @@ end
 """
 The time derivative of rows that do not read t.
 """
-_zeroTimeDerivative(dT, u, p, t) = (fill!(dT, 0); nothing)
+_zeroTimeDerivative(dT, _, _, _) = (fill!(dT, 0); nothing)
 
 """
 ∂F/∂t of the rows `exprs` (explicit time) by the DAG differentiation, as an
@@ -2728,7 +2728,7 @@ struct _MergedContinuousInitialize{S}
   nsub::Int
 end
 
-function (m::_MergedContinuousInitialize)(c, u, t, integrator)::Nothing
+function (m::_MergedContinuousInitialize)(_, u, t, integrator)::Nothing
   for k in 1:m.nsub
     local s = m.subs[k]
     s.initialize(s, u, t, integrator)

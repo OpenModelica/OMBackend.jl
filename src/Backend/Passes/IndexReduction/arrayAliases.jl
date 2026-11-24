@@ -71,7 +71,7 @@ function arrayAliasPairs(view::Scalarized, blocked::Set{Symbol})::Dict{Tuple{Sym
     v !== nothing && v.ty isa IR.T_REAL && v.kind isa Union{IR.STATE, IR.ALGEBRAIC, IR.ALGEBRAIC_DER} &&
       !(name in discretes) && v.direction !== IR.INPUT
   end
-  local noConstant = (e::IR.Expression) -> false
+  local noConstant = (::IR.Expression) -> false
   local pairs::Dict{Tuple{Symbol, Symbol}, ArrayPair} = Dict{Tuple{Symbol, Symbol}, ArrayPair}()
   for (j::Int, eq::IR.Equation) in enumerate(partition.equations)
     local a::Union{Nothing, Tuple} = aliasEquation(eq, isCandidate, noConstant)

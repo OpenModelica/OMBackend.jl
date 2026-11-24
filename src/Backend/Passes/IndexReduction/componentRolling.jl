@@ -98,7 +98,7 @@ end
 const MEMBER_PLACEHOLDER = Symbol("§")
 
 "The subscript of the instance `k` of the group `gi` in a reference outside a rolled equation: its literal index."
-instanceLiteral(gi::Int, k::Int)::IR.Expression = IR.INTEGER(k)
+instanceLiteral(::Int, k::Int)::IR.Expression = IR.INTEGER(k)
 
 """
 The share of the instances' equations rolled into for-equations below which a group is left as it is (`rollGroup!`):
@@ -702,7 +702,7 @@ equations (the instance's literal subscript).
 """
 function rolledEquations(equations::Vector{IR.Equation}, groups::Vector{ComponentGroup}, memberOf::Dict{Symbol, Tuple{Int, Int}},
                          names::RolledNames, n::Int, iterator::Symbol; aliases::Bool)::Vector{IR.Equation}
-  local loop::Function = (gi::Int, k::Int) -> IR.CREF(IR.ComponentRef(iterator, IR.T_INTEGER()), IR.T_INTEGER())
+  local loop::Function = (::Int, ::Int) -> IR.CREF(IR.ComponentRef(iterator, IR.T_INTEGER()), IR.T_INTEGER())
   local rewrite::Function = (@nospecialize(eq::IR.Equation), index::Function) ->
     rolledReinits(IR.mapEquation!((@nospecialize(e::IR.Expression)) ->
                                     rolledExpression(e, groups, memberOf, names, index), deepcopy(eq)),

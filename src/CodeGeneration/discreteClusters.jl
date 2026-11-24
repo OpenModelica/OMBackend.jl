@@ -618,7 +618,7 @@ function _clusterCallback(c::DiscreteCluster)
      iteration does it), and an initialize function that leaves the modified
      flag alone. The event iteration sets the buffers. =#
   return DiffEqBase.VectorContinuousCallback(condition, ClusterCrossings(c), length(c.rel);
-                                             initialize = (cb, u, t, integrator) -> nothing,
+                                             initialize = (_, _, _, _) -> nothing,
                                              initializealg = ModelingToolkit.SciMLBase.NoInit(),
                                              rootfind = ModelingToolkit.SciMLBase.RightRootFind,
                                              save_positions = (true, false))

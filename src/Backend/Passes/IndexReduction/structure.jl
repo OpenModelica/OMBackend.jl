@@ -144,7 +144,7 @@ function discreteTargets(partition::IR.Partition)::Set{Symbol}
   local visit(s::Union{IR.IF_STATEMENT, IR.WHEN_STATEMENT}) =
     (foreach(b -> foreach(visit, b.body), s.branches); s isa IR.IF_STATEMENT && foreach(visit, s.elseBody))
   local visit(s::Union{IR.FOR_STATEMENT, IR.WHILE_STATEMENT}) = foreach(visit, s.body)
-  local visit(s::IR.Statement) = nothing
+  local visit(::IR.Statement) = nothing
   for eq in partition.equations
     eq isa IR.WHEN_EQUATION || continue
     for b in eq.branches

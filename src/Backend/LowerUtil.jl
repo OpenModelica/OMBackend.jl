@@ -107,7 +107,7 @@ end
 recordSize(ty::IR.T_RECORD)::Int = length(ty.fields)
 recordSize(ty::IR.T_ARRAY)::Int =
   recordSize(ty.elementType) * prod(something(IR.dimensionSize(d), 1) for d in ty.dimensions; init = 1)
-recordSize(ty::IR.ModelicaType)::Int = 1
+recordSize(::IR.ModelicaType)::Int = 1
 
 """
     whenBranch(condition, body; dropInitialDisjuncts = true)
@@ -263,7 +263,7 @@ function assignedCrefs(statements::Vector{IR.Statement})::Vector{IR.ComponentRef
   local visit(s::Union{IR.IF_STATEMENT, IR.WHEN_STATEMENT}) =
     (foreach(b -> foreach(visit, b.body), s.branches); s isa IR.IF_STATEMENT && foreach(visit, s.elseBody))
   local visit(s::Union{IR.FOR_STATEMENT, IR.WHILE_STATEMENT}) = foreach(visit, s.body)
-  local visit(s::IR.Statement) = nothing
+  local visit(::IR.Statement) = nothing
   foreach(visit, statements)
   return out
 end

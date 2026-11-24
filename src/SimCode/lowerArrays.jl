@@ -230,9 +230,9 @@ constantOf(x::Bool)::Exp = BCONST(x)
 constantOf(x::Integer)::Exp = ICONST(Int(x))
 constantOf(x::Real)::Exp = RCONST(Float64(x))
 "The type of a value's constant (`constantOf`)."
-typeOfConstant(x::Bool)::SType = TYPE_BOOL()
-typeOfConstant(x::Integer)::SType = TYPE_INTEGER()
-typeOfConstant(x::Real)::SType = TYPE_REAL()
+typeOfConstant(::Bool)::SType = TYPE_BOOL()
+typeOfConstant(::Integer)::SType = TYPE_INTEGER()
+typeOfConstant(::Real)::SType = TYPE_REAL()
 
 """
     arraySystemNames(variables) -> Names

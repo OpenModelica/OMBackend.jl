@@ -1765,7 +1765,7 @@ function _splitClosureList!(body::Expr, reads::Vector{Symbol}, parts::Vector{Exp
   end
   return body
 end
-_splitClosureList!(@nospecialize(body), reads::Vector{Symbol}, parts::Vector{Expr}, name::Symbol) = body
+_splitClosureList!(@nospecialize(body), ::Vector{Symbol}, ::Vector{Expr}, ::Symbol) = body
 
 """
 The names `e` reads (its symbols but quoted code, keyword names, macro names), into `out`; an over-approximation
@@ -1811,7 +1811,7 @@ end
 """
    Creates equations from the residual equations in unsorted order
 """
-createResidualEquationsMTK(stateVariables::Vector, algebraicVariables::Vector, equations::AbstractVector{SC.RESIDUAL_EQUATION},
+createResidualEquationsMTK(::Vector, ::Vector, equations::AbstractVector{SC.RESIDUAL_EQUATION},
                            simCode::SC.SIM_CODE)::Vector{Expr} =
   Expr[:(0 ~ $(expToJuliaExpMTK(eq.exp, simCode))) for eq in equations]
 

@@ -285,7 +285,7 @@ struct IfCondToggle <: Function
   value::Float64
 end
 
-function (a::IfCondToggle)(modified::NamedTuple{N}, observed, ctx, integrator) where {N}
+function (a::IfCondToggle)(modified::NamedTuple{N}, _, _, _) where {N}
   return NamedTuple{N}(ntuple(j -> N[j] === a.name ? a.value : Float64(modified[j]), Val(length(N))))
 end
 
@@ -326,8 +326,8 @@ See the following issue: https://github.com/SciML/ModelingToolkit.jl/issues/1523
 The forth part of the tuple contains a vector of symbolic variables.
 One for each conditional variable created.
 """
-function createIfEquation(stateVariables::Vector,
-                          algebraicVariables::Vector,
+function createIfEquation(::Vector,
+                          ::Vector,
                           ifEq::SC.IF_EQUATION,
                           identifier::Int,
                           simCode::SC.SIM_CODE,

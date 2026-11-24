@@ -364,7 +364,7 @@ function _knownSubscript(x::IR, d::Matrix{Int}, col::Int)::Union{Nothing, Int}
 end
 
 "Whether `x` calls a function (`:fcall`, also in a relation's or an event-generating function's operand)."
-_callsFunction(x::IR)::Bool = false
+_callsFunction(::IR)::Bool = false
 _callsFunction(x::Op)::Bool = x.op == :fcall || any(_callsFunction, x.args)
 _callsFunction(x::Rel)::Bool = _callsFunction(x.lhs) || _callsFunction(x.rhs)
 _callsFunction(x::EvFn)::Bool = _callsFunction(x.arg)
@@ -375,8 +375,8 @@ _callsFunction(x::EvFn)::Bool = _callsFunction(x.arg)
 Whether the algorithm statement `st` asserts (`SAssert`) or, where a function has an assert (`functionAsserts`), calls
 a function (`_callsFunction`), at any depth.
 """
-_checks(st::Stmt, functionAsserts::Bool)::Bool = false
-_checks(st::SAssert, functionAsserts::Bool)::Bool = true
+_checks(::Stmt, ::Bool)::Bool = false
+_checks(::SAssert, ::Bool)::Bool = true
 _checks(st::SAssign, functionAsserts::Bool)::Bool = functionAsserts && _callsFunction(st.value)
 _checks(st::SCall, functionAsserts::Bool)::Bool = functionAsserts && _callsFunction(st.call)
 _checks(st::Union{SIf, SWhen}, functionAsserts::Bool)::Bool =

@@ -61,7 +61,7 @@ function mapRoots!(g::G, eq::Union{IR.SCALAR_EQUATION, IR.ARRAY_EQUATION, IR.REC
   eq.rhs = g(eq.rhs)
   return eq
 end
-mapRoots!(g::G, eq::IR.ALGORITHM) where {G} = eq
+mapRoots!(::G, eq::IR.ALGORITHM) where {G} = eq
 function mapRoots!(g::G, eq::IR.IF_EQUATION)::IR.Equation where {G}
   eq.branches = IR.EquationBranch[IR.EquationBranch(g(b.condition), b.equations) for b in eq.branches]
   for b in eq.branches
@@ -104,7 +104,7 @@ mapRoots(g::G, s::IR.TERMINATE) where {G} = IR.TERMINATE(g(s.message), s.source)
 mapRoots(g::G, s::IR.REINIT) where {G} = IR.REINIT(s.state, g(s.value), s.source)
 mapRoots(g::G, s::IR.NORETCALL) where {G} = IR.NORETCALL(g(s.call), s.source)
 mapRoots(g::G, s::IR.RECOMPILATION) where {G} = IR.RECOMPILATION(s.component, g(s.newValue))
-mapRoots(g::G, s::Union{IR.RETURN, IR.BREAK, IR.AGENTIC_RECOMPILATION}) where {G} = s
+mapRoots(::G, s::Union{IR.RETURN, IR.BREAK, IR.AGENTIC_RECOMPILATION}) where {G} = s
 
 "The continuous-time partitions and the structural modes' systems, each with its variables."
 partitionsWithVariables(model::IR.Model) =
@@ -369,7 +369,7 @@ addForIterators!(names::Set{Symbol}, eq::IR.FOR_EQUATION) =
 addForIterators!(names::Set{Symbol}, eq::IR.IF_EQUATION) =
   (foreach(b -> foreach(e -> addForIterators!(names, e), b.equations), eq.branches);
    foreach(e -> addForIterators!(names, e), eq.elseEquations))
-addForIterators!(names::Set{Symbol}, eq::IR.Equation) = nothing
+addForIterators!(::Set{Symbol}, ::IR.Equation) = nothing
 
 function runtimeIndexChoice(e::IR.Expression, iterators::Set{Symbol})::IR.Expression
   e isa IR.CREF || return e

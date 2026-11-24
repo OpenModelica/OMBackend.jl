@@ -500,7 +500,7 @@ end
 Modelica: smooth(p, expr) guarantees expr is p-times continuously differentiable.
 At code generation level this is a no-op; the hint is for symbolic analysis only.
 """
-modelica_smooth(p, expr) = expr
+modelica_smooth(_, expr) = expr
 
 """
     modelica_noEvent(expr)
@@ -521,7 +521,7 @@ isPeriodic branch). Without this stub the per-model module raises
 UndefVarError("sample") whenever sample() leaks into a non-when expression
 (e.g. inside SignalPWM blocks used by DC-DC choppers).
 """
-modelica_sample(start, period) = false
+modelica_sample(_, _) = false
 
 """
     modelica_edge(b)
@@ -533,7 +533,7 @@ is handled by the when-clause callback infrastructure. Without this stub
 the per-model module raises UndefVarError("edge") whenever edge() leaks
 into a residual or other non-when expression (e.g. switches with arc).
 """
-modelica_edge(b) = false
+modelica_edge(_) = false
 
 """
     modelica_change(v)
@@ -542,7 +542,7 @@ Modelica: change(v) is `v <> pre(v)`, true at the instant v changes value.
 In continuous expression context v == pre(v), so this returns false.
 Discrete change-event firing is handled by when-clause callbacks.
 """
-modelica_change(v) = false
+modelica_change(_) = false
 
 """
     modelica_delay(expr, delayTime[, delayMax])
@@ -552,8 +552,8 @@ does not currently build DDE history terms for generated Modelica functions, so
 the algorithmic builtin must at least resolve to the current expression instead
 of leaving a bare `delay` binding inside the generated model module.
 """
-modelica_delay(expr, delayTime) = expr
-modelica_delay(expr, delayTime, delayMax) = expr
+modelica_delay(expr, _) = expr
+modelica_delay(expr, _, _) = expr
 
 """
     modelica_String(r::Real, significantDigits, minimumLength, leftJustified)
@@ -633,7 +633,7 @@ end
 Modelica: homotopy(actual, simplified) for initialization.
 We return the actual expression (lambda=1 case).
 """
-modelica_homotopy(actual, simplified) = actual
+modelica_homotopy(actual, _) = actual
 
 """
 In the equations, with the homotopy parameter λ: the actual expression at

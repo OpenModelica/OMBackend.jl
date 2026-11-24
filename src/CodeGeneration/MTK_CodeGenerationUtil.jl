@@ -1504,7 +1504,7 @@ function evalCausalRHSAtT0(@nospecialize(rhsExpr), valMap::Dict{Symbol, Float64}
   end
 end
 
-_t0ContainsDer(@nospecialize(x)) = false
+_t0ContainsDer(@nospecialize(_x)) = false
 _t0ContainsDer(x::Expr) = (x.head == :call && !isempty(x.args) && x.args[1] in (:der, :D)) || any(_t0ContainsDer, x.args)
 
 """
@@ -2255,7 +2255,7 @@ end
 The variables an event's part reads, added to `out`: an equation's, an expression's, an imperative affect's observed
 and modified expressions; nothing for another part (no affect, a periodic discrete event's time).
 """
-_symbolicReads!(out::Vector{Any}, @nospecialize(x))::Nothing = nothing
+_symbolicReads!(::Vector{Any}, @nospecialize(_x))::Nothing = nothing
 _symbolicReads!(out::Vector{Any}, eq::Symbolics.Equation)::Nothing = (_symbolicReads!(out, eq.lhs); _symbolicReads!(out, eq.rhs))
 _symbolicReads!(out::Vector{Any}, x::Union{Symbolics.Num, SymbolicUtils.BasicSymbolic})::Nothing =
   (append!(out, Symbolics.get_variables(x)); nothing)

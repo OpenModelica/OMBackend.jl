@@ -368,7 +368,7 @@ end
    step (a DiscreteCallback's affect would run after the save, which would
    keep the unprojected step end). It never fires. Not after a continuous
    event: the event iteration solves the algebraic unknowns then. =#
-function (c::AlgebraicStepControl)(u, t, integrator)
+function (c::AlgebraicStepControl)(_, _, integrator)
   (c.active && !_continuousEventFired(integrator)) || return false
   _control!(c, c.work, integrator)
   return false
@@ -419,7 +419,7 @@ struct AlgebraicDomainCheck
   control::AlgebraicStepControl
 end
 
-function (d::AlgebraicDomainCheck)(u, p, t)
+function (d::AlgebraicDomainCheck)(u, _, t)
   local c = d.control
   c.active || return false
   return _outOfDomain(c, c.work, c.model, u, t)
@@ -469,8 +469,8 @@ function withAlgebraicStepControl(callbacks, problem)
   local rows = _algebraicRows(problem.f)
   isempty(rows) && return callbacks
   local c = AlgebraicStepControl(rows)
-  local cb = DiffEqBase.DiscreteCallback(c, integrator -> nothing;
-                                         initialize = (cb, u, t, integrator) -> _startStepControl!(c, integrator),
+  local cb = DiffEqBase.DiscreteCallback(c, _ -> nothing;
+                                         initialize = (_, _, _, integrator) -> _startStepControl!(c, integrator),
                                          save_positions = (false, false),
                                          initializealg = ModelingToolkit.SciMLBase.NoInit())
   return _joinCallbacks(cb, callbacks)

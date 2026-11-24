@@ -350,7 +350,7 @@ function _freeExternalObject!(h::ExternalObjectHandle)::Nothing
   return nothing
 end
 "By its argument names and its code's hash (`id`), not its type (see `_RGF_TAG`)."
-Base.hash(f::RuntimeGeneratedFunctions.RuntimeGeneratedFunction{A, _RGF_TAG, _RGF_TAG, ID}, h::UInt) where {A, ID} =
+Base.hash(::RuntimeGeneratedFunctions.RuntimeGeneratedFunction{A, _RGF_TAG, _RGF_TAG, ID}, h::UInt) where {A, ID} =
   hash(ID, hash(A, hash(:RuntimeGeneratedFunction, h)))
 "By its name and arity, not its type (see `_RGF_TAG`)."
 Base.hash(w::ModelicaFunctionWrapper{N}, h::UInt) where {N} = hash(N, hash(w.name, hash(:ModelicaFunctionWrapper, h)))
@@ -915,8 +915,8 @@ end
 # can be cached and later returned even when makeSymbolicTerm passes
 # `type = Real` explicitly, poisoning subsequent sums and breaking
 # `-(::SymReal, ::SymReal)` in MTK alias_elimination.
-SymbolicUtils._promote_symtype(::Union{RuntimeGeneratedFunctions.RuntimeGeneratedFunction, ModelicaFunctionWrapper, ModelicaFunctionPartial, CallPartial}, args) = Real
-SymbolicUtils._promote_symtype(::typeof(floor), args) = Real
+SymbolicUtils._promote_symtype(::Union{RuntimeGeneratedFunctions.RuntimeGeneratedFunction, ModelicaFunctionWrapper, ModelicaFunctionPartial, CallPartial}, _) = Real
+SymbolicUtils._promote_symtype(::typeof(floor), _) = Real
 
 # Same reason for shape. Scalar-returning extractor RGFs must be reported as
 # scalar (`ShapeVecT()`) rather than the default `Unknown(-1)` so they can be
@@ -924,9 +924,9 @@ SymbolicUtils._promote_symtype(::typeof(floor), args) = Real
 # mismatch in MTK's substitution rebuild path (terminterface.jl `maketerm` for
 # `+`/`-`). Without this, a wrapper whose body returns a Modelica vector can
 # poison a sum with shape `Unknown(2)`.
-SymbolicUtils.promote_shape(::Union{RuntimeGeneratedFunctions.RuntimeGeneratedFunction, ModelicaFunctionWrapper, ModelicaFunctionPartial, CallPartial}, args::SymbolicUtils.ShapeT...) = SymbolicUtils.ShapeVecT()
-SymbolicUtils.promote_shape(::typeof(floor), args::SymbolicUtils.ShapeT...) = SymbolicUtils.ShapeVecT()
-SymbolicUtils.promote_shape(::typeof(floor), arg::SymbolicUtils.Unknown) = SymbolicUtils.ShapeVecT()
+SymbolicUtils.promote_shape(::Union{RuntimeGeneratedFunctions.RuntimeGeneratedFunction, ModelicaFunctionWrapper, ModelicaFunctionPartial, CallPartial}, ::SymbolicUtils.ShapeT...) = SymbolicUtils.ShapeVecT()
+SymbolicUtils.promote_shape(::typeof(floor), ::SymbolicUtils.ShapeT...) = SymbolicUtils.ShapeVecT()
+SymbolicUtils.promote_shape(::typeof(floor), ::SymbolicUtils.Unknown) = SymbolicUtils.ShapeVecT()
 
 """
     makeSymbolicTerm(f, args)
@@ -1478,7 +1478,7 @@ function (c::ConstTableLookupFn)(rt_idxs...)
   end
   return c.table[resolved...]
 end
-SymbolicUtils.promote_symtype(::ConstTableLookupFn, args...) = Real
+SymbolicUtils.promote_symtype(::ConstTableLookupFn, _...) = Real
 
 """
 A constant table lookup is piecewise constant in its indices (`_primalValue`): its derivative by each
@@ -1494,7 +1494,7 @@ maketerm RE-INFERS shape too, not just symtype; the generic fallback yields
 Unknown, which trips `promote_shape(==, Unknown, scalar)` once the rebuilt term
 lands in a relational during substitute/full_equations. The lookup is scalar.
 """
-SymbolicUtils.promote_shape(::ConstTableLookupFn, szs::SymbolicUtils.ShapeT...) = SymbolicUtils.ShapeVecT()
+SymbolicUtils.promote_shape(::ConstTableLookupFn, ::SymbolicUtils.ShapeT...) = SymbolicUtils.ShapeVecT()
 
 """
 Look up an element of a constant Modelica array using runtime-resolvable
@@ -1523,7 +1523,7 @@ An index of a constant table (constTableLookup): a scalar clamped to `1:n` (_toI
 indices as they are (a function's `X[1:nXi]` of an inlined literal X: the clamp's MethodError of a
 range).
 """
-_tableIndex(v::Union{Colon, AbstractVector{<:Integer}}, n::Int) = v
+_tableIndex(v::Union{Colon, AbstractVector{<:Integer}}, ::Int) = v
 _tableIndex(v::Any, n::Int) = clamp(_toIndex(v), 1, n)
 
 """
@@ -2478,7 +2478,7 @@ function splitInitialValues(reducedSystem,
 end
 
 function splitInitialValues(reducedSystem, finalInitialValues::AbstractVector,
-                            allInitialValues::AbstractVector = Pair[],
+                            ::AbstractVector = Pair[],
                             pars::AbstractDict = Dict{Any, Any}())
   local massMatrix = ModelingToolkit.calculate_massmatrix(reducedSystem)
   local reducedUnks = unknowns(reducedSystem)
@@ -3110,7 +3110,7 @@ end
   One example is running tearing twice broke the system
 """
 function structural_simplify(sys::ModelingToolkit.AbstractSystem,
-                             io = nothing;
+                             _ = nothing;
                              simplify = false,
                              allow_parameter = true,
                              kwargs...)

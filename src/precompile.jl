@@ -97,10 +97,10 @@ function _precompileWarmupDirectRHS(eventful::Bool)::Nothing
 end
 
 "The condition of `_precompileWarmupDirectRHS`'s callback: it crosses zero in the solve."
-_precompileCBCondition(u::Vector{Float64}, t::Float64, integrator)::Float64 = u[1] - 0.5
+_precompileCBCondition(u::Vector{Float64}, ::Float64, _)::Float64 = u[1] - 0.5
 
 "The affect of `_precompileWarmupDirectRHS`'s callback."
-_precompileCBAffect!(integrator)::Nothing = nothing
+_precompileCBAffect!(_)::Nothing = nothing
 
 """
     _precompileSolveAsModels(prob, buildCallbacks)

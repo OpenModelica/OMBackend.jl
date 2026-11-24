@@ -1187,8 +1187,8 @@ function SII.observed(sys::ArraySystem, x)
     #= the binding read in the latest world too: the module is newer than the caller =#
     return (u, p, t) -> (Base.@invokelatest model.algebraics(u, p, t))[i]
   end
-  kind == :param && return (u, p, t) -> p.values[i]
-  return (u, p, t) -> begin
+  kind == :param && return (_, p, _) -> p.values[i]
+  return (_, p, t) -> begin
     local times = first.(p.dlog)
     isempty(times) ? NaN : p.dlog[_dlogIndex(times, t, p.tend[1])][2][i]
   end

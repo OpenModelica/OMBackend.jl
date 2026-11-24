@@ -1623,7 +1623,7 @@ function recordElementEquations(eq::IR.ARRAY_EQUATION, variables::IR.VariableSet
   return out
 end
 
-rolledEquation(eq::IR.Equation, ::IR.VariableSet, used::Int = 0)::IR.Equation = eq
+rolledEquation(eq::IR.Equation, ::IR.VariableSet, ::Int = 0)::IR.Equation = eq
 
 """
 The array equations in the body of a for-equation rolled likewise (`for \$i1 loop {a[\$i1], b[\$i1]} = c[\$i1].w`,
