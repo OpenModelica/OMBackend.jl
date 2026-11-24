@@ -1672,50 +1672,121 @@ function _unknownLabel(g::Gen, id::Int)::String
 end
 
 """
-    _loopFamilyCode(g, f, template, blocks, el, matchRow, a0, relBases, bases) -> Tuple{Vector{Any}, Expr, Expr}
+    AlgorithmTables(outs, dOuts, relBases, condBases)
+
+The algorithms of an array model for their code (`_algorithmCode`): per algorithm and instance the algebraic
+positions (`outs`) and the discrete buffer positions (`dOuts`) it assigns, per algorithm the offsets of its relations
+and of its when-conditions.
+"""
+struct AlgorithmTables
+  outs::Vector{Vector{Vector{Int}}}
+  dOuts::Vector{Vector{Vector{Int}}}
+  relBases::Vector{Int}
+  condBases::Vector{Int}
+end
+
+"""
+    _familyUnknownPositions(template) -> Vector{Int}
+
+The positions of a loop family's template (`LoopBlocks.families`) whose unknowns its Newton solve iterates: its
+equations'. An algorithm's outputs are computed from them (`_loopFamilyCode`).
+"""
+_familyUnknownPositions(template::Vector{Tuple{Int, Int}})::Vector{Int} =
+  Int[j for (j, (ci, _)) in enumerate(template) if ci > 0]
+
+"""
+    _familyAlgorithmOrder(template, block, el) -> Vector{Int}
+
+The algorithm positions of a loop family's template in the order they run (`_loopFamilyCode`): each after those whose
+outputs it reads, by one of the family's blocks `block` (its members are alike). NotSupported for algorithms that read
+each other's outputs.
+"""
+function _familyAlgorithmOrder(template::Vector{Tuple{Int, Int}}, block::Vector{Int}, el::InstanceTable)::Vector{Int}
+  local positions::Vector{Int} = Int[j for (j, (ci, _)) in enumerate(template) if ci < 0]
+  local owner::Dict{Int, Int} = Dict{Int, Int}()   #= an algorithm's output => its position =#
+  for j::Int in positions, u::Int in el.outs[block[j]]
+    owner[u] = j
+  end
+  local order::Vector{Int} = Int[]
+  local placed::Set{Int} = Set{Int}()
+  while length(order) < length(positions)
+    local before::Int = length(order)
+    for j::Int in positions
+      j in placed && continue
+      local r::Int = block[j]
+      local ready::Bool = all(i::Int -> !haskey(owner, el.uid[i]) || owner[el.uid[i]] in placed, el.uptr[r]:(el.uptr[r + 1] - 1))
+      ready || continue
+      push!(order, j)
+      push!(placed, j)
+    end
+    length(order) == before && ns("algorithms in an algebraic loop that read each other's outputs")
+  end
+  return order
+end
+
+"""
+    _loopFamilyCode(g, f, template, blocks, el, matchRow, a0, relBases, algTables, bases) -> Tuple{Vector{Any}, Expr, Expr}
 
 The solve of the loop family `f`: its tables (each member's instance columns and unknowns, the first guess per
 unknown: the start values; a run keeps its last solutions as the next guesses in its parameters, `p.loops`; per member
 its unknowns' offset in the initial system, -1 for none), the call of `loopFamilySolve!` that solves the members it is
 called for (without them: the last argument, appended where it is called) and the body of its residuals (lhs - rhs, by
-the template's classes at the member's columns; `_loopResidualFunction`). Not a discrete unknown.
+the template's classes at the member's columns; `_loopResidualFunction`). The unknowns are the equations'
+(`_familyUnknownPositions`); the template's algorithms run first, from them (`_familyAlgorithmOrder`, `algTables`):
+an array of MSL Spice3 DIODEs, each `(cc, m_dCap) = diodeNoBypassCode(..., {pin, n.v})` in the loop of its inner
+node, is one solve for all, not a torn block per element. Not a discrete unknown.
 """
 function _loopFamilyCode(g::Gen, f::Int, template::Vector{Tuple{Int, Int}}, blocks::Vector{Vector{Int}}, el::InstanceTable,
-                         matchRow::Vector{Int}, a0::Vector{Float64}, relBases::Vector{Int},
+                         matchRow::Vector{Int}, a0::Vector{Float64}, relBases::Vector{Int}, algTables::AlgorithmTables,
                          bases::Vector{Int})::Tuple{Vector{Any}, Expr, Expr}
-  local k::Int = length(template); local M::Int = length(blocks)
+  local unknownPositions::Vector{Int} = _familyUnknownPositions(template)
+  local nPos::Int = length(template)
+  local k::Int = length(unknownPositions); local M::Int = length(blocks)
   local nS::Int = g.nStates
-  local cols::Matrix{Int} = Matrix{Int}(undef, k, M); local ids::Matrix{Int} = Matrix{Int}(undef, k, M)
+  local cols::Matrix{Int} = Matrix{Int}(undef, nPos, M); local ids::Matrix{Int} = Matrix{Int}(undef, k, M)
   local guess::Matrix{Float64} = Matrix{Float64}(undef, k, M)
-  for (m, b) in enumerate(blocks), j in 1:k
-    local r::Int = b[j]
-    local u::Int = matchRow[r]
-    u <= nS + g.nAlg || ns("a discrete unknown in an algebraic loop: " * first(g.classes[template[j][1]].text, 120))
-    cols[j, m] = el.col[r]; ids[j, m] = u
-    guess[j, m] = u <= nS ? 0.0 : a0[u - nS]
+  for (m, b) in enumerate(blocks)
+    for j in 1:nPos
+      cols[j, m] = el.col[b[j]]
+    end
+    for (i, j) in enumerate(unknownPositions)
+      local u::Int = matchRow[b[j]]
+      u <= nS + g.nAlg || ns("a discrete unknown in an algebraic loop: " * first(g.classes[template[j][1]].text, 120))
+      ids[i, m] = u
+      guess[i, m] = u <= nS ? 0.0 : a0[u - nS]
+    end
   end
   local (C::Symbol, I::Symbol, G::Symbol) = (Symbol("LOOP_COLS_", f), Symbol("LOOP_IDS_", f), Symbol("LOOP_GUESS_", f))
   local B::Symbol = Symbol("LOOP_INITIAL_", f)
-  local hasRelations::Bool = any(((ci, _),) -> g.classes[ci].nrel > 0, template)
+  local hasRelations::Bool = any(((ci, _),) -> (ci > 0 ? g.classes[ci].nrel : g.algs[-ci].nrel) > 0, template)
   #= the residuals once, in their own function (`LOOPRES_<f>!`, `_loopResidualFunction`), called where the solve
-     evaluates them: inlined at each of those places they were compiled five times =#
+     evaluates them: inlined at each of those places they were compiled five times. The algorithms first, from the
+     iterates =#
   local parts::Vector{Any} = Any[]
-  for (j, (ci, _)) in enumerate(template)
+  for j in _familyAlgorithmOrder(template, blocks[1], el)
+    local ai::Int = -template[j][1]
+    local alg::AlgClass = g.algs[ai]
+    local algSets::Vector{Any} = Any[:(_col = $C[$j, _m]); Any[:($(Symbol("s", q)) = $(alg.domain)[$q, _col]) for q in 1:alg.nslots]]
+    push!(parts, Expr(:let, Expr(:block, algSets...), _algorithmCode(g, ai, algTables, a0)))
+  end
+  for (i, j) in enumerate(unknownPositions)
+    local ci::Int = template[j][1]
     local c::EqClass = g.classes[ci]
     g.relBase = relBases[ci]; g.relCount = c.nrel
     local sets::Vector{Any} = Any[:(_col = $C[$j, _m]); Any[:($(Symbol("s", q)) = $(c.domain)[$q, _col]) for q in 1:c.nslots]]
-    push!(parts, Expr(:let, Expr(:block, sets...), :(_rv[$j] = $(jl(g, c.lhs)) - $(jl(g, c.rhs)))))
+    push!(parts, Expr(:let, Expr(:block, sets...), :(_rv[$i] = $(jl(g, c.lhs)) - $(jl(g, c.rhs)))))
   end
   local residualBody::Expr = Expr(:block, parts...)
-  #= affine in its unknowns (`_affineIn`, by the unknowns' variables): solved by one Jacobian =#
+  #= affine in its unknowns (`_affineIn`, by the unknowns' variables): solved by one Jacobian; not with an algorithm
+     (a function's call) =#
   local reads::Set{Tuple{String, Bool}} = _unknownVariables(g, ids)
   local readsUnknown::Function = (r::Ref) -> (r.name, r.der) in reads
-  local linear::Bool = all(((ci, _),) -> _affineIn(g.classes[ci].lhs, readsUnknown)[1] &&
+  local linear::Bool = all(((ci, _),) -> ci > 0 && _affineIn(g.classes[ci].lhs, readsUnknown)[1] &&
                                          _affineIn(g.classes[ci].rhs, readsUnknown)[1], template)
   _OMBACKEND.envSwitch("OMBACKEND_ARRAY_TRACE") &&
     println("[arraycode] loop family ", f, ": ", k, " unknowns, ", M, " members, ", linear ? "linear" : "nonlinear",
             " (", join(String[_unknownLabel(g, u) for u in view(ids, :, 1)], ", "), ")",
-            join(String["\n[arraycode]   " * first(g.classes[ci].text, 1200) for (ci, _) in template]))
+            join(String["\n[arraycode]   " * first(ci > 0 ? g.classes[ci].text : g.algs[-ci].text, 1200) for (ci, _) in template]))
   local call::Expr = :($(loopFamilySolve!)(LOOPRES!, $f, $I, $G, $B, $nS, $linear, $hasRelations, du, a, u, p, t, z, mode,
                                            fire))
   return (Any[:(const $C = $cols), :(const $I = $ids), :(const $G = $guess), :(const $B = $bases)], call, residualBody)
@@ -1948,6 +2019,23 @@ function jl(g::Gen, x::IR)
     return Expr(:call, x.op, args...)
   end
   error("IR")
+end
+
+"""
+    _algorithmCode(g, ai, tables, a0) -> Expr
+
+The code of the `ai`-th algorithm at its instance `_col`: the variables it assigns start from their start values
+(`a0`) or pre values, then its statements (`_stmtCode`). Scheduled alone, or in an algebraic loop's residuals, run
+from the loop's iterates (a torn block's, `_tearBlock`; a family's, `_loopFamilyCode`).
+"""
+function _algorithmCode(g::Gen, ai::Int, tables::AlgorithmTables, a0::Vector{Float64})::Expr
+  local alg::AlgClass = g.algs[ai]
+  g.relBase = tables.relBases[ai]; g.relCount = alg.nrel
+  local stmts::Vector{Any} = Any[
+    :(for _o in $(tables.outs[ai])[_col]; a[_o] = $(a0)[_o]; end),
+    :(for _o in $(tables.dOuts[ai])[_col]; p.d[_o] = p.dpre[_o]; end)]
+  append!(stmts, _stmtCode(g, alg.body, tables.condBases[ai], alg.nwhen))
+  return Expr(:block, stmts...)
 end
 
 """
@@ -2262,6 +2350,7 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
       u <= g.nStates + g.nAlg ? push!(algOuts[ai][el.col[r]], u - g.nStates) : push!(algDOuts[ai][el.col[r]], discOf[u])
     end
   end
+  local algTables::AlgorithmTables = AlgorithmTables(algOuts, algDOuts, algRelBases, algCondBases)
   #= the sample() calls of the classes (sample-defined Booleans): their ticks' flags after the when-equations', per
      instance =#
   local classSampleBases::Vector{Int} = zeros(Int, length(g.classes))
@@ -2313,12 +2402,14 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
   local guessTargets::Dict{Int, Vector{Any}} = Dict{Int, Vector{Any}}()
   local loopFamily!::Function = function (f::Int, template::Vector{Tuple{Int, Int}}, blocks::Vector{Vector{Int}},
                                           bases::Vector{Int})
-    for (m::Int, b::Vector{Int}) in enumerate(blocks), j::Int in eachindex(b)
+    local unknownPositions::Vector{Int} = _familyUnknownPositions(template)
+    for (m::Int, b::Vector{Int}) in enumerate(blocks), (i::Int, j::Int) in enumerate(unknownPositions)
       local unknown::Int = matchRow[b[j]]
-      unknown > g.nStates && push!(get!(() -> Any[], guessTargets, unknown - g.nStates), :(p.loops[$f][$j, $m]))
-      bases[m] >= 0 && (initPlaces[bases[m] + j] = (f, j, m))
+      unknown > g.nStates && push!(get!(() -> Any[], guessTargets, unknown - g.nStates), :(p.loops[$f][$i, $m]))
+      bases[m] >= 0 && (initPlaces[bases[m] + i] = (f, i, m))
     end
-    local (defs::Vector{Any}, code::Expr, residualBody::Expr) = _loopFamilyCode(g, f, template, blocks, el, matchRow, a0, relBases, bases)
+    local (defs::Vector{Any}, code::Expr, residualBody::Expr) =
+      _loopFamilyCode(g, f, template, blocks, el, matchRow, a0, relBases, algTables, bases)
     append!(loopDefs, defs)
     push!(loopBodies, code)
     loopResiduals[f] = residualBody
@@ -2360,7 +2451,9 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
        iteration variables =#
     local reads::Set{Tuple{String, Bool}} = _unknownVariables(g, Int[matchRow[r] for r in rs])
     local readsUnknown::Function = (r::Ref) -> (r.name, r.der) in reads
-    local linear::Bool = all(((key, _),) -> _affineIn(last(solutions[key]::Tuple{Ref, IR}), readsUnknown)[1], torn.batches) &&
+    #= an algorithm (a function's call): not affine =#
+    local linear::Bool = all(((key, _),) -> key[1] > 0 && _affineIn(last(solutions[key]::Tuple{Ref, IR}), readsUnknown)[1],
+                             torn.batches) &&
                          all(i::Int -> _affineIn(g.classes[el.class[rs[i]]].lhs, readsUnknown)[1] &&
                                        _affineIn(g.classes[el.class[rs[i]]].rhs, readsUnknown)[1], torn.residuals)
     push!(blockLinear, linear)
@@ -2377,8 +2470,14 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
         a[_id - $(g.nStates)] = y[_j]
       end
     end)]
-    #= the explicitly solved instances given the iteration variables, then the residuals =#
+    #= the explicitly solved instances and the algorithms given the iteration variables, then the residuals =#
     for ((ci, p), batch) in torn.batches
+      if ci < 0
+        local alg::AlgClass = g.algs[-ci]
+        local code::Expr = _algorithmCode(g, -ci, algTables, a0)
+        push!(parts, alg.nslots == 0 ? _oneColumn(code) : _loopCode(alg.nslots, alg.domain, Int[el.col[rs[i]] for i in batch], code))
+        continue
+      end
       local c::EqClass = g.classes[ci]
       local (target::Ref, value::IR) = solutions[(ci, p)]::Tuple{Ref, IR}
       g.relBase = relBases[ci]; g.relCount = c.nrel
@@ -2428,14 +2527,9 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
     if ci < 0
       #= an algorithm: assigned variables start from their start (continuous) or pre
          (discrete) values, then the statements =#
-      local ai = -ci
-      local alg = g.algs[ai]
-      g.relBase = algRelBases[ai]; g.relCount = alg.nrel
-      local stmts = Any[
-        :(for _o in $(algOuts[ai])[_col]; a[_o] = $(a0)[_o]; end),
-        :(for _o in $(algDOuts[ai])[_col]; p.d[_o] = p.dpre[_o]; end)]
-      append!(stmts, _stmtCode(g, alg.body, algCondBases[ai], alg.nwhen))
-      emit!(alg.nslots, alg.domain, batch, Expr(:block, stmts...))
+      local ai::Int = -ci
+      local alg::AlgClass = g.algs[ai]
+      emit!(alg.nslots, alg.domain, batch, _algorithmCode(g, ai, algTables, a0))
       continue
     end
     local c = g.classes[ci]

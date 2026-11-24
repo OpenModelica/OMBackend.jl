@@ -760,6 +760,118 @@ function _hoistExtractorCallsInBlock!(block::Expr)::Expr
 end
 
 """
+The central differences of the whole result of a Modelica function (`whole`) by its arguments `idx` in turn: for
+each, the results at x + h and x - h (the error of an evaluation there as its value) and h, with _centralPartial's
+step for a first partial. Every element extractor of one call reads its partials from them (_hoistCallPartials!).
+"""
+struct WholePartials{K, W <: ExtractorWhole} <: Function
+  whole::W
+  idx::NTuple{K, Int}
+end
+
+function (w::WholePartials{K})(args::Tuple)::Vector{Tuple{Any, Any, Float64}} where {K}
+  local rel::Float64 = eps(Float64)^(1 / 3)
+  local out::Vector{Tuple{Any, Any, Float64}} = Vector{Tuple{Any, Any, Float64}}(undef, K)
+  for k::Int in 1:K
+    local i::Int = w.idx[k]
+    local x::Float64 = Float64(args[i])
+    local h::Float64 = rel * max(1.0, abs(x))
+    out[k] = (_wholeAt(w.whole, Base.setindex(args, x + h, i)), _wholeAt(w.whole, Base.setindex(args, x - h, i)), h)
+  end
+  return out
+end
+
+"The whole result of `whole` at `args`, or the error of the evaluation there (_RHS_STEP_ERRORS)."
+function _wholeAt(whole::ExtractorWhole, args::Tuple)::Any
+  try
+    return whole(args)
+  catch err
+    err isa _RHS_STEP_ERRORS || rethrow()
+    return err
+  end
+end
+
+"""
+The partial of the element extractor `pick(result, indices...)` from an entry `g` of WholePartials: central, or
+one-sided from the result at `args` where the evaluation at one side failed, as _centralPartial.
+"""
+function _pickPartial(g::Tuple{Any, Any, Float64}, whole::ExtractorWhole, args::Tuple, pick::Function, indices::Int...)::Float64
+  local h::Float64 = g[3]
+  local up::Union{Float64, Exception} = g[1] isa Exception ? g[1] : Float64(pick(g[1], indices...))
+  local dn::Union{Float64, Exception} = g[2] isa Exception ? g[2] : Float64(pick(g[2], indices...))
+  (up isa Float64 && dn isa Float64) && return (up - dn) / (2h)
+  local mid::Float64 = Float64(pick(whole(args), indices...))
+  up isa Float64 && return (up - mid) / h
+  dn isa Float64 && return (mid - dn) / h
+  throw(up)
+end
+
+"""
+The generated code's first partials of element extractors (a CallPartial{N, 1} of an EXTRACTOR_INFO function) with
+equal arguments as one WholePartials call before the first, by the arguments they differentiate, each partial read
+from it (_pickPartial). A partial per extractor and argument was two calls of the function with all its arguments:
+MSL Spice3BenchmarkFourBitBinaryAdder's Jacobian had 5146 for 270 calls of the transistor functions (105 and 35
+arguments), 782k Expr nodes; of its nonzeros 1001:2000, 186k nodes compiled in 15.5 s and ran in 7.6 ms, 63k and
+0.73 ms with the partials grouped. In place, in each block of `ex` (build_function's code with CSE), as
+_hoistExtractorCalls!.
+"""
+function _hoistCallPartials!(ex::Expr)::Expr
+  isempty(EXTRACTOR_INFO) && return ex
+  local worklist::Vector{Any} = Any[ex]
+  while !isempty(worklist)
+    local e::Any = pop!(worklist)
+    e isa Expr || continue
+    e.head === :block && _hoistCallPartialsInBlock!(e)
+    append!(worklist, e.args)
+  end
+  return ex
+end
+
+"Whether the statement `st` assigns a first partial of an element extractor (a CallPartial{N, 1} of an EXTRACTOR_INFO function)."
+function _isExtractorPartial(@nospecialize(st))::Bool
+  (st isa Expr && st.head === :(=) && length(st.args) == 2) || return false
+  local call::Any = st.args[2]
+  (call isa Expr && call.head === :call && !isempty(call.args)) || return false
+  local p::Any = call.args[1]
+  return p isa CallPartial && length(p.idx) == 1 && haskey(EXTRACTOR_INFO, p.f)
+end
+
+"`_hoistCallPartials!` in the statements of one block."
+function _hoistCallPartialsInBlock!(block::Expr)::Expr
+  local needed::Dict{Tuple{ExtractorWhole, Vector{Any}}, Vector{Int}} = Dict{Tuple{ExtractorWhole, Vector{Any}}, Vector{Int}}()
+  for st::Any in block.args
+    _isExtractorPartial(st) || continue
+    local call::Expr = st.args[2]
+    local p::CallPartial = call.args[1]
+    local is::Vector{Int} = get!(needed, (EXTRACTOR_INFO[p.f][1], call.args[2:end]), Int[])
+    p.idx[1] in is || push!(is, p.idx[1])
+  end
+  isempty(needed) && return block
+  local groups::Dict{Tuple{ExtractorWhole, Vector{Any}}, Tuple{Symbol, Symbol}} = Dict{Tuple{ExtractorWhole, Vector{Any}}, Tuple{Symbol, Symbol}}()
+  local statements::Vector{Any} = Any[]
+  for st::Any in block.args
+    if _isExtractorPartial(st)
+      local call::Expr = st.args[2]
+      local p::CallPartial = call.args[1]
+      local (whole::ExtractorWhole, pick::Symbol, indices::Tuple{Vararg{Int}}) = EXTRACTOR_INFO[p.f]
+      local key::Tuple{ExtractorWhole, Vector{Any}} = (whole, call.args[2:end])
+      local is::Vector{Int} = needed[key]
+      if !haskey(groups, key)
+        groups[key] = (gensym(:args), gensym(:partials))
+        push!(statements, :($(groups[key][1]) = $(Expr(:tuple, key[2]...))))
+        push!(statements, :($(groups[key][2]) = $(WholePartials{length(is), typeof(whole)}(whole, Tuple(is)))($(groups[key][1]))))
+      end
+      local (argsVar::Symbol, partialsVar::Symbol) = groups[key]
+      st = Expr(:(=), st.args[1], Expr(:call, GlobalRef(@__MODULE__, :_pickPartial), :($partialsVar[$(findfirst(==(p.idx[1]), is))]),
+                                       whole, argsVar, GlobalRef(@__MODULE__, pick), indices...))
+    end
+    push!(statements, st)
+  end
+  block.args = statements
+  return block
+end
+
+"""
 Get or create a per-element extractor function for an array-returning Modelica function.
 The extractor calls the implementation directly via MODELICA_FUNCTION_IMPLS and extracts
 a single element by index. This avoids creating getindex(Term{Real}(...), i) symbolic

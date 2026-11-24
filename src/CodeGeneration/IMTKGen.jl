@@ -220,7 +220,7 @@ end
 "The hash of a build (`_buildAndCache`'s reuse check): the model code, the build's start time and the flags read at build time."
 function _buildHash(OMB::Module, modelCode::Expr)::UInt64
   return hash((modelCode, IMTK_BUILD_START[], OMB.DIRECT_RHS_GENERATION[], OMB.DIRECT_JAC_GENERATION[],
-               OMB.DIRECT_JAC_TREE_NODE_LIMIT[], OMB.DIRECT_RHS_TYPE_ERASE[]))
+               OMB.DIRECT_JAC_TREE_NODE_LIMIT[], OMB.DIRECT_JAC_FUNCTION_NODE_LIMIT[], OMB.DIRECT_RHS_TYPE_ERASE[]))
 end
 
 """
