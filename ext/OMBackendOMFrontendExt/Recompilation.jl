@@ -182,7 +182,6 @@ function setElementInSCodeProgram!(activeModeName, inIdent::String, newValue::T,
   local elements::Vector{SCode.Element} = listArray(SCodeUtil.getClassElements(activeClass))
   local i = 1
   local indexOfElementToReplace = 0
-  local modifiedClass = activeClass
   for element in elements
     if SCodeUtil.elementNameEqual(element, elementToReplace)
       indexOfElementToReplace = i

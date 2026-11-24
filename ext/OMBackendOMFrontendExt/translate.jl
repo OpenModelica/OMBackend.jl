@@ -152,7 +152,7 @@ function _translateArraysKept(fm::F.FLAT_MODEL;
   delete!(BACKEND_SCALARIZED_MODELS, name)
   local options::TranslateOptions = (; functionList, mode, warnMissingStartValues, eliminateNonDynamic, observedFilter,
                                      checkSimCode)
-  local result::Union{Nothing, Tuple{String, Expr}} = nothing
+  local result::Union{Nothing, Tuple{String, Expr}}
   local reduced::Union{Nothing, OMJLIR.Model} =
     @BACKEND_PERFLOG "[backendAPI] reducedArrayModel" reducedArrayModel(fm; functionList)
   if reduced !== nothing
@@ -189,7 +189,7 @@ function _translateKept(fm::F.FLAT_MODEL, model::OMJLIR.Model, path::String, sub
                         observedFilter::Union{Nothing, Vector{String}, Vector{Regex}},
                         checkSimCode::Bool)::Union{Nothing, Tuple{String, Expr}}
   local name::String = canonicalName(fm.name)
-  local reason::String = ""
+  local reason::String
   try
     local result::Tuple{String, Expr} =
       _translateScalar(fm, model; functionList, mode, warnMissingStartValues, eliminateNonDynamic, observedFilter,
