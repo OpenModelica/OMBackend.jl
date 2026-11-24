@@ -364,10 +364,12 @@ function _projectStepEnd!(w::AlgebraicWork, rows::Vector{Int}, F, integrator)
   return nothing
 end
 
-#= The condition of the callback: the work, before the integrator saves the
-   step (a DiscreteCallback's affect would run after the save, which would
-   keep the unprojected step end). It never fires. Not after a continuous
-   event: the event iteration solves the algebraic unknowns then. =#
+"""
+The condition of the callback: the work, before the integrator saves the
+step (a DiscreteCallback's affect would run after the save, which would
+keep the unprojected step end). It never fires. Not after a continuous
+event: the event iteration solves the algebraic unknowns then.
+"""
 function (c::AlgebraicStepControl)(_, _, integrator)
   (c.active && !_continuousEventFired(integrator)) || return false
   _control!(c, c.work, integrator)

@@ -631,7 +631,7 @@ end
 
 _callsDer(@nospecialize(ex)) = ex isa Expr && ((ex.head === :call && ex.args[1] === :der) || any(_callsDer, ex.args))
 
-#= The value of a `begin #= line =# x end` the algorithm lowering wraps expressions in. =#
+"The value of a `begin #= line =# x end` the algorithm lowering wraps expressions in."
 function _blockValue(@nospecialize(ex))
   (ex isa Expr && ex.head === :block) || return ex
   local body = filter(a -> !(a isa LineNumberNode), ex.args)

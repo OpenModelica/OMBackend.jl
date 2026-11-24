@@ -2895,9 +2895,6 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
     #= discrete variables equations compute (unknowns kept in the discrete buffer, set by the event iteration) =#
     const N_DISCRETE_UNKNOWNS = $(length(g.discUnknown))
 
-    #= The parameter values with `overrides` (Modelica names of parameters or of their
-       elements => values) applied; parameters whose bindings read a changed one are
-       computed again. =#
     #= The parameter values (PARAMETER_VALUES) with `overrides` (Modelica names of parameters or of their elements => values),
        in the rules' dependency order:
        - one overridden whole takes the given value; an element override is set after its parameter's rule, when that
