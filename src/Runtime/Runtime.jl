@@ -257,6 +257,10 @@ function _rememberMode!(key::RecompiledModeKey, mode::RecompiledMode)::Nothing
   return nothing
 end
 
+"""
+The problem of a model with structural modes that are all compiled in advance (its submodels): the active mode's
+problem, the callbacks that switch modes and the variables the modes share.
+"""
 mutable struct OM_ProblemStructural{T0 <: String, T1, T2, T3}
   "The name of the active mode"
   activeModeName::T0
@@ -274,6 +278,10 @@ mutable struct OM_ProblemStructural{T0 <: String, T1, T2, T3}
   callbackConditions
 end
 
+"""
+The problem of a model whose structural changes recompile it (a frontend model is kept): the active mode's problem
+and the callbacks that detect a structural change.
+"""
 mutable struct OM_ProblemRecompilation{T0 <: String, T1, T2, T3}
   "The name of the active mode"
   activeModeName::T0

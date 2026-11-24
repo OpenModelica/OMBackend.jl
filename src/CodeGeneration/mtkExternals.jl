@@ -1437,27 +1437,15 @@ function hasSymbolicArgs(args...)
 end
 
 """
-Look up an element of a constant Modelica array using runtime-resolvable
-subscripts. Used for `Table[in1, in2]` patterns where the table is constant
-but indices are runtime CREFs (Modelica.Electrical.Digital gates, lookup
-tables, etc.).
-
-When called with numeric args, returns `table[Int(round(i)), Int(round(j))]`
-directly. When called with at least one symbolic arg, wraps the lookup in an
-opaque Symbolics term so MTK structural-simplify treats it as a black box
-(rather than refusing to use a Num as an array index, or constructing an
-unwieldy ifelse chain).
-
-Vararg subscripts to support both vectors and N-dimensional arrays.
+Named functor for the symbolic-argument table lookup. Must be a NAMED type, not
+an anonymous closure: MTK's `substitute` / `alias_elimination` rebuild the term
+via `maketerm`, which RE-INFERS the symtype from `promote_symtype(op, ...)`,
+ignoring the explicit `type = Real` set in `makeSymbolicTerm`. An anonymous
+closure has no `promote_symtype` method, so the rebuilt term defaults to symtype
+`Any`; arithmetic on it then trips the SymReal/`Any` subtraction guard in
+`find_eq_solvables!` (`-(::SymReal, ::SymReal)` throws when a symtype is
+non-numeric). Declaring the result `Real` keeps the rebuilt term numeric.
 """
-#= Named functor for the symbolic-argument table lookup. Must be a NAMED type, not
-   an anonymous closure: MTK's `substitute` / `alias_elimination` rebuild the term
-   via `maketerm`, which RE-INFERS the symtype from `promote_symtype(op, ...)`,
-   ignoring the explicit `type = Real` set in `makeSymbolicTerm`. An anonymous
-   closure has no `promote_symtype` method, so the rebuilt term defaults to symtype
-   `Any`; arithmetic on it then trips the SymReal/`Any` subtraction guard in
-   `find_eq_solvables!` (`-(::SymReal, ::SymReal)` throws when a symtype is
-   non-numeric). Declaring the result `Real` keeps the rebuilt term numeric. =#
 struct ConstTableLookupFn{A <: AbstractArray}
   table::A
 end
@@ -1508,6 +1496,20 @@ lands in a relational during substitute/full_equations. The lookup is scalar.
 """
 SymbolicUtils.promote_shape(::ConstTableLookupFn, szs::SymbolicUtils.ShapeT...) = SymbolicUtils.ShapeVecT()
 
+"""
+Look up an element of a constant Modelica array using runtime-resolvable
+subscripts. Used for `Table[in1, in2]` patterns where the table is constant
+but indices are runtime CREFs (Modelica.Electrical.Digital gates, lookup
+tables, etc.).
+
+When called with numeric args, returns `table[Int(round(i)), Int(round(j))]`
+directly. When called with at least one symbolic arg, wraps the lookup in an
+opaque Symbolics term so MTK structural-simplify treats it as a black box
+(rather than refusing to use a Num as an array index, or constructing an
+unwieldy ifelse chain).
+
+Vararg subscripts to support both vectors and N-dimensional arrays.
+"""
 function constTableLookup(table::AbstractArray, idxs...)
   if hasSymbolicArgs(idxs...)
     return makeSymbolicTerm(ConstTableLookupFn(table), Any[idxs...])
@@ -1976,19 +1978,6 @@ function wrapWithInvokelatest(expr::Expr)
 end
 
 wrapWithInvokelatest(x) = x  #= For non-Expr types, return as-is =#
-
-
-"""
-  Structurally simplify algebraic equations in a system and compute the
-  topological sort of the observed equations. When `simplify=true`, the `simplify`
-  function will be applied during the tearing process. It also takes kwargs
-  `allow_symbolic=false` and `allow_parameter=true` which limits the coefficient
-  types during tearing.
-
-  The optional argument `io` may take a tuple `(inputs, outputs)`.
-  This will convert all `inputs` to parameters and allow them to be unconnected, i.e.,
-  simplification will allow models where `n_states = n_equations - n_inputs`.
-  """
 
 """
   Filter out equations that contain no symbolic variables (e.g. `0 ~ 0.0`, `0 ~ 255.0`).

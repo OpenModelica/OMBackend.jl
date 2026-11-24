@@ -187,46 +187,11 @@ function _ifConditionIsPureTimeEvent(condition::SC.Exp, simCode::SC.SIM_CODE)::B
 end
 
 """
-This function creates symbolic if equations for use in MTK.
-The function returns a tuple, where the first part of the tuple represent the conditions and the affect of the if-equation on the form:
-  continuous_events = [
-    <Condition> => <affect>
-    <Condition> => <affect>
-    ....
-  ]
-Each condition generates one variable with zero dynamics the variable being true or not depending on the branch.
-  Example:
-  if <condition> then
-    <equations>
-  elseif <condition> then
-    <equations>
-  else
-    <equations>
-  end if;
-Would result in:
-continuous_events = [
-    <condition> => [ifCond1 ~ true, ifCond2 ~ false]
-    <condition> => [ifCond1 ~ false, ifCond2 ~ true]
-]
-An if equation with a single condition would only generate one condition:
-continuous_events = [
-    <condition> => [ifCond1 ~ true]
-]
-
-The second value in the return tuple represent the if-equations itself:
-<lhs> = IfElse.ifelse(<condition>, <value>, IfElse.ifelse(<condition>, <value>, <value>))
-  lhs can be one or several variables. (TODO, fix the case for several variables in this kind of branch)
-
-The third part of the tuple contains a set of zero dynamic equations (One for each if equation condition variable)
-See the following issue: https://github.com/SciML/ModelingToolkit.jl/issues/1523
-
-The forth part of the tuple contains a vector of symbolic variables.
-One for each conditional variable created.
+True when a branch condition references a variable that is itself an
+if-equation relay target (key of the shared relay-t0 map): exactly the
+chained staged-trajectory case where a boundary crossing must re-evaluate
+sibling conditions live instead of applying static toggles.
 """
-#= True when a branch condition references a variable that is itself an
-   if-equation relay target (key of the shared relay-t0 map): exactly the
-   chained staged-trajectory case where a boundary crossing must re-evaluate
-   sibling conditions live instead of applying static toggles. =#
 function _conditionReferencesRelayTarget(@nospecialize(condition::SC.Exp), rT0::AbstractDict{Symbol, Float64})::Bool
   isempty(rT0) && return false
   local refs::OrderedSet{String} = OrderedSet{String}()
@@ -324,6 +289,43 @@ function (a::IfCondToggle)(modified::NamedTuple{N}, observed, ctx, integrator) w
   return NamedTuple{N}(ntuple(j -> N[j] === a.name ? a.value : Float64(modified[j]), Val(length(N))))
 end
 
+"""
+This function creates symbolic if equations for use in MTK.
+The function returns a tuple, where the first part of the tuple represent the conditions and the affect of the if-equation on the form:
+  continuous_events = [
+    <Condition> => <affect>
+    <Condition> => <affect>
+    ....
+  ]
+Each condition generates one variable with zero dynamics the variable being true or not depending on the branch.
+  Example:
+  if <condition> then
+    <equations>
+  elseif <condition> then
+    <equations>
+  else
+    <equations>
+  end if;
+Would result in:
+continuous_events = [
+    <condition> => [ifCond1 ~ true, ifCond2 ~ false]
+    <condition> => [ifCond1 ~ false, ifCond2 ~ true]
+]
+An if equation with a single condition would only generate one condition:
+continuous_events = [
+    <condition> => [ifCond1 ~ true]
+]
+
+The second value in the return tuple represent the if-equations itself:
+<lhs> = IfElse.ifelse(<condition>, <value>, IfElse.ifelse(<condition>, <value>, <value>))
+  lhs can be one or several variables. (TODO, fix the case for several variables in this kind of branch)
+
+The third part of the tuple contains a set of zero dynamic equations (One for each if equation condition variable)
+See the following issue: https://github.com/SciML/ModelingToolkit.jl/issues/1523
+
+The forth part of the tuple contains a vector of symbolic variables.
+One for each conditional variable created.
+"""
 function createIfEquation(stateVariables::Vector,
                           algebraicVariables::Vector,
                           ifEq::SC.IF_EQUATION,
