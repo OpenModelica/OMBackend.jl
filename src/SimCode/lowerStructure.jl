@@ -194,7 +194,7 @@ The names of the references in `e`, each once, in the reverse order of their fir
 """
 function allCrefNames(@nospecialize(e::Exp))::Vector{String}
   local out = String[]
-  foreachExp(x -> x isa Union{EXP_CREF, DER, PRE} && push!(out, crefName(x.cref)), e)
+  foreachExp(x -> x isa CrefExp && push!(out, crefName(x.cref)), e)
   return reverse(unique(out))
 end
 

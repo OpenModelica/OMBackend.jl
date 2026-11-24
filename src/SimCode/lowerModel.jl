@@ -94,9 +94,9 @@ every mode has, then the top level's states, algebraic and discrete variables by
 """
 function sharedModeVariables(model::IR.Model)::Vector{String}
   local inMode = v::IR.Variable -> length(v.cref.parts) > 1 ? join((String(p.name) for p in v.cref.parts[2:end]), ".") : String(v.cref.parts[1].name)
-  local perMode = [String[inMode(v) for v in mode.variables if v.kind isa Union{IR.STATE, IR.ALGEBRAIC, IR.ALGEBRAIC_DER}] for mode in model.modes]
+  local perMode = [String[inMode(v) for v in mode.variables if v.kind isa IR.StateOrAlgebraic] for mode in model.modes]
   local common = isempty(perMode) ? String[] : intersect(perMode...)
-  return vcat(common, String[inMode(v) for v in model.variables if v.kind isa Union{IR.STATE, IR.ALGEBRAIC, IR.ALGEBRAIC_DER, IR.DISCRETE}])
+  return vcat(common, String[inMode(v) for v in model.variables if v.kind isa Union{IR.StateOrAlgebraic, IR.DISCRETE}])
 end
 
 #= ==================================================================================== =#

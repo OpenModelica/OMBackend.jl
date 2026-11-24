@@ -102,7 +102,7 @@ Whether `v` is an array state or algebraic variable of the model's own: not a me
 reduction rolled (`IR.isRolled` on a part of its reference).
 """
 isOwnArray(v::SIMVAR)::Bool =
-  isArray(v) && v.irKind isa Union{IR.STATE, IR.ALGEBRAIC, IR.ALGEBRAIC_DER} && v.ref !== nothing &&
+  isArray(v) && v.irKind isa IR.StateOrAlgebraic && v.ref !== nothing &&
   !any((p::IR.CrefPart) -> IR.isRolled(p.ty), v.ref.parts)
 
 "An unknown: a state, a state derivative, an algebraic or a discrete variable, a scalar or an array (not a parameter or a constant)."
@@ -313,7 +313,7 @@ typeOf(::ENUM_LITERAL)::SType = TYPE_ENUM(())
 typeOf(::DER)::SType = TYPE_REAL()
 typeOf(::Union{WILD, WHOLE_DIMENSION})::SType = TYPE_UNKNOWN()
 typeOf(e::Union{EXP_CREF, PRE, CALL, CAST, RSUB, TSUB, RECORD, ARRAY_EXP, RANGE, REDUCTION, PARTEVALFUNCTION})::SType = e.ty
-typeOf(::Union{RELATION, LBINARY, LUNARY})::SType = TYPE_BOOL()
+typeOf(::LogicalExp)::SType = TYPE_BOOL()
 typeOf(e::UNARY)::SType = typeOf(e.exp)
 typeOf(e::IFEXP)::SType = typeOf(e.thenExp)
 typeOf(e::TUPLE)::SType = TYPE_TUPLE(SType[typeOf(x) for x in e.elements])

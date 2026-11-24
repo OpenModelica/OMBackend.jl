@@ -91,7 +91,7 @@ isFalse(e::Union{Nothing, IR.Expression})::Bool = e isa IR.BOOLEAN && !e.value
 
 "A discrete-time type: Integer, Boolean or an enumeration, or an array of them."
 isDiscreteType(ty::IR.ModelicaType)::Bool =
-  IR.elementType(ty) isa Union{IR.T_INTEGER, IR.T_BOOLEAN, IR.T_ENUMERATION}
+  IR.elementType(ty) isa IR.DiscreteType
 
 "A continuous type: Real, or an array of Real."
 isRealType(ty::IR.ModelicaType)::Bool = IR.elementType(ty) isa IR.T_REAL

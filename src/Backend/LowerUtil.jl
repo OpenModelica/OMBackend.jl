@@ -58,7 +58,7 @@ const SCALAR_OPS = Dict{IR.Op, IR.Op}(
   IR.POW_EW => IR.POW, IR.POW_SCALAR_ARRAY => IR.POW, IR.POW_ARRAY_SCALAR => IR.POW)
 
 "A type of a scalar value (not an array, a record or an unknown type)."
-isScalarType(ty::IR.ModelicaType)::Bool = ty isa Union{IR.T_REAL, IR.T_INTEGER, IR.T_BOOLEAN, IR.T_ENUMERATION}
+isScalarType(ty::IR.ModelicaType)::Bool = ty isa IR.ScalarType
 
 """
     lowerAssignment(lhs, rhs, source)
@@ -353,7 +353,7 @@ function inlineDerivative(f::IR.ModelicaFunction, byName::Dict{Symbol, IR.Modeli
     return nothing
   local out = only(f.outputs)
   out.ty isa IR.T_REAL || return nothing
-  all(v -> v.ty isa Union{IR.T_REAL, IR.T_INTEGER, IR.T_BOOLEAN}, f.inputs) || return nothing
+  all(v -> v.ty isa IR.NumberType, f.inputs) || return nothing
   local stmt = only(f.body)
   (stmt isa IR.ASSIGNMENT && stmt.lhs isa IR.CREF && stmt.lhs.cref.name === out.name && stmt.rhs isa IR.CALL &&
    !stmt.rhs.attributes.builtin) || return nothing
@@ -374,7 +374,7 @@ function inlineDerivative(f::IR.ModelicaFunction, byName::Dict{Symbol, IR.Modeli
   local derArgs = IR.Expression[]
   for (i, a) in enumerate(call.arguments)
     local ty = g.inputs[i].ty
-    (i in gd.excludedInputs || ty isa Union{IR.T_INTEGER, IR.T_BOOLEAN, IR.T_ENUMERATION, IR.T_STRING}) && continue
+    (i in gd.excludedInputs || ty isa Union{IR.DiscreteType, IR.T_STRING}) && continue
     ty isa IR.T_REAL || return nothing
     local d = a isa IR.CREF ? get(derOf, a.cref.name, nothing) : a isa Union{IR.REAL, IR.INTEGER} ? IR.REAL(0.0) : nothing
     d === nothing && return nothing

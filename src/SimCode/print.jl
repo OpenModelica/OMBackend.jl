@@ -81,7 +81,7 @@ function _printJoined(io::IO, xs::AbstractVector, sep::String = ", ")
   end
 end
 
-Base.show(io::IO, e::Union{ICONST, RCONST, BCONST}) = print(io, e.value)
+Base.show(io::IO, e::NumberLiteral) = print(io, e.value)
 Base.show(io::IO, e::SCONST) = print(io, repr(e.value))
 Base.show(io::IO, e::ENUM_LITERAL) = print(io, e.name)
 Base.show(io::IO, e::EXP_CREF) = print(io, crefName(e.cref))

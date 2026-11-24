@@ -213,6 +213,15 @@ struct T_ENUMERATION <: ModelicaType
   literals::Vector{Symbol}
 end
 
+"Real, Integer or Boolean: a type of Julia `Number` values."
+const NumberType = Union{T_REAL, T_INTEGER, T_BOOLEAN}
+
+"A discrete-time scalar type: Integer, Boolean or an enumeration."
+const DiscreteType = Union{T_INTEGER, T_BOOLEAN, T_ENUMERATION}
+
+"A scalar type other than String and Clock: Real, Integer, Boolean or an enumeration."
+const ScalarType = Union{T_REAL, T_INTEGER, T_BOOLEAN, T_ENUMERATION}
+
 "An array type: its element type and its dimensions, outermost first."
 struct T_ARRAY <: ModelicaType
   elementType::ModelicaType
@@ -1036,6 +1045,12 @@ every pass that asks for an algebraic variable.
 struct ALGEBRAIC_DER <: VariableKind
   state::Symbol
 end
+
+"A state or an algebraic variable (`ALGEBRAIC_DER` included): a continuous variable other than a state derivative."
+const StateOrAlgebraic = Union{STATE, ALGEBRAIC, ALGEBRAIC_DER}
+
+"A continuous-time variable of the continuous system: a state, a state derivative or an algebraic variable."
+const ContinuousKind = Union{STATE, STATE_DER, ALGEBRAIC, ALGEBRAIC_DER}
 
 "A state derivative that index reduction made algebraic: the derivative of `dummyState`."
 struct DUMMY_DER <: VariableKind

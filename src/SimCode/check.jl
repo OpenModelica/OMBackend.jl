@@ -122,7 +122,7 @@ a model with structural modes, if- or when-equations (they give residuals of the
 function checkBalanced(simCode::SIM_CODE)::Vector{CheckViolation}
   (hasSubModels(simCode) || !isempty(simCode.ifEquations) || !isempty(simCode.whenEquations)) && return CheckViolation[]
   local read = OrderedSet{String}()
-  foreach(eq -> foreachExp(e -> e isa Union{EXP_CREF, DER, PRE} && push!(read, crefName(e.cref)), eq.exp), simCode.residualEquations)
+  foreach(eq -> foreachExp(e -> e isa CrefExp && push!(read, crefName(e.cref)), eq.exp), simCode.residualEquations)
   local eliminated = OrderedSet(simCode.eliminatedVariables)
   local nUnknown = 0
   local nDiscrete = 0
@@ -199,7 +199,7 @@ function checkReferenceResolution(simCode::SIM_CODE)::Vector{CheckViolation}
     foreachExp(e -> (e isa ASUB && e.exp isa EXP_CREF) && push!(subscripted, e.exp), eq.exp)
     local missing = OrderedSet{String}()
     foreachExp(eq.exp) do e
-      e isa Union{EXP_CREF, DER, PRE} || return
+      e isa CrefExp || return
       local nm = crefName(e.cref)
       (nm in known || nm in bound) && return
       (e isa EXP_CREF && e in subscripted && e.cref.ref !== nothing && arrayBase(e.cref.ref) in bases) && return
@@ -236,7 +236,7 @@ function checkReferences(simCode::SIM_CODE)::Vector{CheckViolation}
   local statementRefs::Function = (place::Tuple{Symbol, Int}, s::Statement) ->
     foreach(c::SimCref -> missing(place, c), statementTargets!(SimCref[], s))
   foreachEquationExp(simCode; statement = statementRefs) do place::Tuple{Symbol, Int}, @nospecialize(e::Exp)
-    foreachExp((@nospecialize(x::Exp)) -> (x isa Union{EXP_CREF, DER, PRE} && missing(place, x.cref); nothing), e)
+    foreachExp((@nospecialize(x::Exp)) -> (x isa CrefExp && missing(place, x.cref); nothing), e)
   end
   return out
 end

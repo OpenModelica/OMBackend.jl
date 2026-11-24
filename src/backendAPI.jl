@@ -423,7 +423,7 @@ The target code of a model another frontend lowered to OMJLIR and through its pa
 function translate(model::OMJLIR.Model;
                    mode::OMBackend.BackendMode = DEFAULT_BACKEND_MODE[],
                    warnMissingStartValues::Union{Nothing, Bool} = nothing,
-                   eliminateNonDynamic::Union{Nothing, Bool, SimCode.EliminationOptions} = nothing,
+                   eliminateNonDynamic::SimCode.EliminationSetting = nothing,
                    observedFilter::Union{Nothing, Vector{String}, Vector{Regex}} = nothing,
                    checkSimCode::Bool = true,
                    BackendMode::Union{Nothing, OMBackend.BackendMode} = nothing)
@@ -446,7 +446,7 @@ end
 
 "The target code of the OMJLIR model `model` for the backend mode `mode`."
 function generateTargetCode(model::OMJLIR.Model; mode::BackendMode,
-                            eliminateNonDynamic::Union{Nothing, Bool, SimCode.EliminationOptions},
+                            eliminateNonDynamic::SimCode.EliminationSetting,
                             observedFilter::Union{Nothing, Vector{String}, Vector{Regex}}, checkSimCode::Bool)
   local simCode = mtkSimCode(model; eliminateNonDynamic, observedFilter)
   _checkSimCodeBeforeCodegen(simCode, checkSimCode)
@@ -716,7 +716,7 @@ the SimCode passes (SimCode.simulationCode), renamed to the generated code's ide
 (SimCode.codeView). A translate's, and that of a model recompiled during its simulation
 (Runtime.translateToSimCode).
 """
-mtkSimCode(model::OMJLIR.Model; eliminateNonDynamic::Union{Nothing, Bool, SimCode.EliminationOptions} = nothing,
+mtkSimCode(model::OMJLIR.Model; eliminateNonDynamic::SimCode.EliminationSetting = nothing,
            observedFilter::Union{Nothing, Vector{String}, Vector{Regex}} = nothing)::SimCode.SIM_CODE =
   SimCode.codeView(SimCode.simulationCode(model; eliminateNonDynamic,
                                           observedFilter = observedFilter === nothing ? nothing : _observedFilterStrings(observedFilter)))

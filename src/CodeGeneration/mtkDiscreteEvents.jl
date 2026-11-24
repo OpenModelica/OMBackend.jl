@@ -247,7 +247,7 @@ function integralDiscreteNames(discreteSyms::AbstractVector, simCode::SC.SIM_COD
   local out = String[]
   for s in discreteSyms
     local entry = get(simCode.stringToSimVarHT, string(s), nothing)
-    (entry !== nothing && last(entry).elementType isa Union{SC.TYPE_INTEGER, SC.TYPE_BOOL, SC.TYPE_ENUM}) &&
+    (entry !== nothing && last(entry).elementType isa SC.DiscreteSType) &&
       push!(out, string(s))
   end
   return out
@@ -440,7 +440,7 @@ end
 
 "Whether the array expression `e` holds only literals (nested arrays of them too)."
 _isLiteralArray(e::SC.ARRAY_EXP)::Bool =
-  all(x -> x isa Union{SC.ICONST, SC.RCONST, SC.BCONST, SC.SCONST} || (x isa SC.ARRAY_EXP && _isLiteralArray(x)), e.elements)
+  all(x -> x isa SC.ValueLiteral || (x isa SC.ARRAY_EXP && _isLiteralArray(x)), e.elements)
 
 """
 A call in an affect body: the event operators edge() and change() Boolean, initial() its
@@ -1260,7 +1260,7 @@ _effectArgExpr(a::SC.Exp, obsAcc::Dict{Symbol, Symbol}, simCode::SC.SIM_CODE) =
   _isBooleanExp(a) ? _affectBool(a, obsAcc, simCode) : _affectValue(a, obsAcc, simCode)
 
 _isBooleanExp(e::SC.Exp)::Bool =
-  e isa Union{SC.BCONST, SC.RELATION, SC.LBINARY, SC.LUNARY} || (e isa Union{SC.EXP_CREF, SC.CALL} && e.ty isa SC.TYPE_BOOL)
+  e isa Union{SC.LogicalExp, SC.BCONST} || (e isa Union{SC.EXP_CREF, SC.CALL} && e.ty isa SC.TYPE_BOOL)
 
 """
 An assert's message: string literals, `+` concatenation and String(x) of variables;
@@ -1770,7 +1770,7 @@ function _writtenArrays(statements::Vector{SC.Statement})::Vector{SC.IR.Componen
   local out::Vector{SC.IR.ComponentRef} = SC.IR.ComponentRef[]
   for s in statements
     if s isa SC.ASSIGN
-      SC.foreachExp(x::SC.Exp -> (x isa Union{SC.EXP_CREF, SC.DER, SC.PRE} && _writtenArray!(out, x.cref); nothing), s.left)
+      SC.foreachExp(x::SC.Exp -> (x isa SC.CrefExp && _writtenArray!(out, x.cref); nothing), s.left)
     elseif s isa SC.REINIT
       _writtenArray!(out, s.stateVar)
     end
@@ -1791,7 +1791,7 @@ target is assigned field by field). A reference without an IR reference (`time`)
 """
 function _readsWritten(call::SC.CALL, written::Vector{SC.IR.ComponentRef})::Bool
   return SC.anyExp(call) do x::SC.Exp
-    (x isa Union{SC.EXP_CREF, SC.DER, SC.PRE} && x.cref.ref !== nothing) || return false
+    (x isa SC.CrefExp && x.cref.ref !== nothing) || return false
     local array::SC.IR.ComponentRef = SC.IR.upToFirstSubscripted(x.cref.ref)
     return any(w::SC.IR.ComponentRef -> SC.IR.crefsOverlap(w, array), written)
   end

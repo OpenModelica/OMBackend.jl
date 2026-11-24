@@ -118,7 +118,7 @@ The C type of a Modelica scalar type.
 """
 function _cScalarType(t::SimCode.SType)
   t isa SimCode.TYPE_REAL && return :Cdouble
-  t isa Union{SimCode.TYPE_INTEGER, SimCode.TYPE_BOOL, SimCode.TYPE_ENUM} && return :Cint
+  t isa SimCode.DiscreteSType && return :Cint
   t isa SimCode.TYPE_STRING && return :Cstring
   #= an external object (its constructor's result, the other functions' argument): the
      C pointer (Buildings' weeklyScheduleInit, initArray, fileWriterInit) =#

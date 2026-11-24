@@ -106,7 +106,7 @@ state vector, and `!active` threw a MethodError (`when not active`, the StateGra
 """
 function _boolOperandMTK(e::SC.Exp, simCode::SC.SIM_CODE, cachedChange::Bool)
   local x = expToJuliaBoolMTK(e, simCode; cachedChange)
-  local isBool = e isa Union{SC.RELATION, SC.LBINARY, SC.LUNARY, SC.BCONST} ||
+  local isBool = e isa Union{SC.LogicalExp, SC.BCONST} ||
                  (e isa SC.CALL && e.kind === SC.CALL_BUILTIN && e.name in (:change, :edge, :initial, :terminal))
   return isBool ? x : :($x != 0)
 end
@@ -232,7 +232,7 @@ end
 A literal: a constant, its negation, an array of them.
 """
 function _isLiteralExp(e::SC.Exp)::Bool
-  e isa Union{SC.ICONST, SC.RCONST, SC.SCONST, SC.BCONST, SC.ENUM_LITERAL} && return true
+  e isa SC.ScalarLiteral && return true
   e isa SC.UNARY && return _isLiteralExp(e.exp)
   e isa SC.ARRAY_EXP && return all(_isLiteralExp, e.elements)
   return false
@@ -339,7 +339,7 @@ model's functions with its records' fields as arguments, of a built-in by its im
 """
 function expToJuliaExpMTK end
 
-expToJuliaExpMTK(e::Union{SC.BCONST, SC.ICONST, SC.RCONST, SC.SCONST}, ::SC.SIM_CODE)::Expr = quote $(e.value) end
+expToJuliaExpMTK(e::SC.ValueLiteral, ::SC.SIM_CODE)::Expr = quote $(e.value) end
 expToJuliaExpMTK(::SC.WILD, ::SC.SIM_CODE)::Expr = quote _ end
 "An enumeration literal is its index."
 expToJuliaExpMTK(e::SC.ENUM_LITERAL, ::SC.SIM_CODE)::Expr = quote $(e.index) end
@@ -877,7 +877,7 @@ end
 An expression of literals only (no variable, no call).
 """
 function _isConstantExp(e::SC.Exp)::Bool
-  e isa Union{SC.RCONST, SC.ICONST, SC.BCONST, SC.SCONST, SC.ENUM_LITERAL} && return true
+  e isa SC.ScalarLiteral && return true
   e isa SC.UNARY && return _isConstantExp(e.exp)
   e isa SC.BINARY && return _isConstantExp(e.exp1) && _isConstantExp(e.exp2)
   e isa SC.ARRAY_EXP && return all(_isConstantExp, e.elements)
@@ -1007,7 +1007,7 @@ elements', of a literal the literal, else the expression of the references' pre 
 """
 function _preExpr(arg::SC.Exp, simCode::SC.SIM_CODE)::Expr
   arg isa SC.ARRAY_EXP && return Expr(:vect, (_preExpr(x, simCode) for x in arg.elements)...)
-  arg isa Union{SC.RCONST, SC.ICONST, SC.BCONST} && return quote $(arg.value) end
+  arg isa SC.NumberLiteral && return quote $(arg.value) end
   local pre = SC.mapExp(x -> (x isa SC.EXP_CREF && x.cref.sym !== :time) ? SC.PRE(x.cref, x.ty) : x, arg)
   return expToJuliaExpMTK(pre, simCode)
 end

@@ -409,7 +409,7 @@ function createArrayParameterPrelude(simCode::SC.SIM_CODE)::Vector{Expr}
        BearingFriction's ExternalCombiTable1D(table = tau_pos) with RobotR3's tau_pos = [0, Rv0
        / unitTorque; ...]: the table was undefined). =#
     local b = SC.isScalarParameter(simVar) ? simVar.varKind.bindExp : nothing
-    local val = b === nothing ? nothing : b isa Union{SC.RCONST, SC.ICONST, SC.BCONST} ? b.value : SC.valueAtBuildStart(b, simCode)
+    local val = b === nothing ? nothing : b isa SC.NumberLiteral ? b.value : SC.valueAtBuildStart(b, simCode)
     val === nothing && continue
     push!(get!(scalarGroups, baseName, Tuple{Vector{Int}, Any, Int}[]),
           (indices, val, length(indices)))

@@ -187,7 +187,7 @@ be linear is not.
 function occursLinearly(@nospecialize(e::Exp), name::String)::Tuple{Bool, Bool}
   local n = scalarReferenceName(e)
   n === nothing || return (n == name, true)
-  e isa Union{ICONST, RCONST, BCONST, SCONST, ENUM_LITERAL, WILD} && return (false, true)
+  e isa Union{ScalarLiteral, WILD} && return (false, true)
   e isa Union{UNARY, CAST} && return occursLinearly(e.exp, name)
   if e isa BINARY
     local ((o1, l1), (o2, l2)) = (occursLinearly(e.exp1, name), occursLinearly(e.exp2, name))

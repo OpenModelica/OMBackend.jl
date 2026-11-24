@@ -1012,7 +1012,7 @@ function generateInitialAlgorithmFunction(simCode::SC.SIM_CODE)::Expr
     if haskey(ht, name)
       local sv = last(ht[name])
       if name in selfRead && !(sv.varKind isa Union{SC.PARAMETER, SC.DATA_STRUCTURE, SC.STRING}) &&
-         sv.attributes.start isa Union{Nothing, SC.RCONST, SC.ICONST, SC.BCONST}
+         sv.attributes.start isa Union{Nothing, SC.NumberLiteral}
         #= a target an arm reads itself reads its pre() value, at the initialization its start (MLS 11.1.2): the
            problem holds the early pass's results already (`when {initial(), sample(...)} then n := n + 1` gave 2);
            a start that is no literal, the problem's value as before. Another arm's target read here is the

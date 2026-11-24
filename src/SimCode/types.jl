@@ -126,6 +126,9 @@ struct TYPE_ENUM <: SType
   names::Tuple{Vararg{String}}
 end
 
+"A discrete scalar type: Integer, Boolean or an enumeration."
+const DiscreteSType = Union{TYPE_INTEGER, TYPE_BOOL, TYPE_ENUM}
+
 "An array of `elementType` with dimensions `dims` (`-1` for one of unknown size)."
 struct TYPE_ARRAY <: SType
   elementType::SType
@@ -236,6 +239,15 @@ struct ENUM_LITERAL <: Exp
   index::Int
 end
 
+"A Boolean, Integer or Real literal: its `value` a Julia `Number`."
+const NumberLiteral = Union{BCONST, ICONST, RCONST}
+
+"A literal with a `value`: Boolean, Integer, Real or String."
+const ValueLiteral = Union{BCONST, ICONST, RCONST, SCONST}
+
+"A literal of a scalar type: Boolean, Integer, Real, String or an enumeration literal."
+const ScalarLiteral = Union{BCONST, ICONST, RCONST, SCONST, ENUM_LITERAL}
+
 "A reference to a variable, of type `ty`."
 struct EXP_CREF <: Exp
   cref::SimCref
@@ -252,6 +264,9 @@ struct PRE <: Exp
   cref::SimCref
   ty::SType
 end
+
+"A read of the variable `cref`: its value, its derivative (`der`) or its value before the event (`pre`)."
+const CrefExp = Union{EXP_CREF, DER, PRE}
 
 "The discarded output in a tuple assignment: `(a, _) = f(x)`."
 struct WILD <: Exp end
@@ -297,6 +312,9 @@ struct RELATION <: Exp
   exp2::Exp
   index::Int
 end
+
+"A Boolean operation: a relation, `and`/`or` or `not`."
+const LogicalExp = Union{RELATION, LBINARY, LUNARY}
 
 "`if cond then thenExp else elseExp`."
 struct IFEXP <: Exp
@@ -916,6 +934,9 @@ end
 EliminationOptions(; reachability::Bool = true, patterns::Vector{Regex} = Regex[],
                    keepPatterns::Vector{Regex} = Regex[]) =
   EliminationOptions(reachability, patterns, keepPatterns)
+
+"The `eliminateNonDynamic` setting: `true` for `EliminationOptions()`, the options, or `nothing` or `false` for none."
+const EliminationSetting = Union{Nothing, Bool, EliminationOptions}
 
 "An eliminated alias: `eliminatedName = representativeName`, or its negation (`negated`)."
 struct AliasEntry

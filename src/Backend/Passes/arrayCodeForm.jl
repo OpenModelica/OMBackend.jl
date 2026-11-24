@@ -375,7 +375,7 @@ function readsContinuous(eq::IR.Equation, variables::IR.VariableSet)::Bool
     (found[] || !(x isa IR.CREF)) && return nothing
     local name::Symbol = IR.hasSubscripts(x.cref) ? IndexReduction.unsubscriptedName(x.cref) : x.cref.name
     local v::Union{Nothing, IR.Variable} = get(variables, name, nothing)
-    (v !== nothing && v.kind isa Union{IR.STATE, IR.STATE_DER, IR.ALGEBRAIC, IR.ALGEBRAIC_DER} &&
+    (v !== nothing && v.kind isa IR.ContinuousKind &&
      IR.elementType(v.ty) isa IR.T_REAL) && (found[] = true)
     return nothing
   end

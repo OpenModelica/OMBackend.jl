@@ -352,7 +352,7 @@ end
 pure time-threshold chain.
 """
 function _isConstChangeArg(a::SC.Exp, simCode::SC.SIM_CODE)::Bool
-  a isa Union{SC.RCONST, SC.ICONST, SC.BCONST} && return true
+  a isa SC.NumberLiteral && return true
   a isa SC.EXP_CREF || return false
   local entry = get(simCode.stringToSimVarHT, SC.crefName(a.cref), nothing)
   return entry !== nothing && SC.isScalarParameter(last(entry))
@@ -1458,7 +1458,7 @@ derivative `dx[i]`, a data structure or a String by its module-level name, `time
 """
 function expToJuliaExp end
 
-expToJuliaExp(e::Union{SC.BCONST, SC.ICONST, SC.RCONST, SC.SCONST}, ::SC.SIM_CODE;
+expToJuliaExp(e::SC.ValueLiteral, ::SC.SIM_CODE;
               varPrefix::String = "x", varSuffix::String = "")::Expr = quote $(e.value) end
 
 function expToJuliaExp(e::SC.EXP_CREF, simCode::SC.SIM_CODE; varPrefix::String = "x", varSuffix::String = "")::Expr

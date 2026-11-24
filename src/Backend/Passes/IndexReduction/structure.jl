@@ -179,7 +179,7 @@ state derivative or an algebraic variable, not a when-equation's target.
 function isContinuousVariable(v::IR.Variable, discretes::Set{Symbol})::Bool
   v.ty isa IR.T_REAL || return false
   v.name in discretes && return false
-  return v.kind isa Union{IR.STATE, IR.STATE_DER, IR.ALGEBRAIC, IR.ALGEBRAIC_DER}
+  return v.kind isa IR.ContinuousKind
 end
 
 "The built-in calls whose arguments are not read at the current time as continuous variables."
@@ -462,7 +462,7 @@ flow; AST_BatchPlant TwoTanks failed where the levels meet). A record or array v
 elements are picked from the literal).
 """
 function withoutEvents(e::IR.Expression, ty::IR.ModelicaType)::IR.Expression
-  ty isa Union{IR.T_REAL, IR.T_INTEGER, IR.T_BOOLEAN} || return e
+  ty isa IR.NumberType || return e
   (IR.isBuiltinCall(e, :noEvent) || !IR.anyExp((@nospecialize(x::IR.Expression)) -> x isa IR.RELATION, e)) && return e
   return builtinCall(:noEvent, IR.Expression[e], ty)
 end

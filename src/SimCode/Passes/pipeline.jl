@@ -99,7 +99,7 @@ the alias observations filtered (`observedFilter`, else the user-visible names: 
 initial values propagated.
 """
 function simulationCode(model::IR.Model; observedFilter::Union{Nothing, Vector{String}} = nothing,
-                        eliminateNonDynamic::Union{Nothing, Bool, EliminationOptions} = nothing)::SIM_CODE
+                        eliminateNonDynamic::EliminationSetting = nothing)::SIM_CODE
   local simCode = runSimCodePass("flattenRecordCallSites", fromOMJLIR(model), flattenRecordCallSites)
   observedFilter === nothing || (simCode = update(simCode; observedFilter))
   simCode = runPasses(simCode, FIRST_PASSES)

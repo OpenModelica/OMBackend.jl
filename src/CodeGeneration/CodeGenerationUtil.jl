@@ -104,7 +104,7 @@ expression of them) its zero-crossing function, a Boolean value (a parameter, a 
 1 - 2b, -1 where true.
 """
 function _zeroCrossingOperand(e::SC.Exp)::SC.Exp
-  (e isa Union{SC.RELATION, SC.LBINARY, SC.LUNARY} || SC.isBuiltin(e, :change)) && return transformToZeroCrossingCondition(e)
+  (e isa SC.LogicalExp || SC.isBuiltin(e, :change)) && return transformToZeroCrossingCondition(e)
   return realBinary(SC.RCONST(1.0), SC.OP_SUB, realBinary(SC.RCONST(2.0), SC.OP_MUL, e))
 end
 
@@ -322,7 +322,7 @@ otherwise (a record constructor's NamedTuple).
   relation, an if-expression, a parameter: MSL Blocks' RSFlipFlop pre_u_start = not Qini).
 """
 function evalConstant(c::SC.Exp, simCode::SC.SIM_CODE)
-  c isa Union{SC.BCONST, SC.ICONST, SC.RCONST, SC.SCONST} && return c.value
+  c isa SC.ValueLiteral && return c.value
   c isa Union{SC.BINARY, SC.LBINARY, SC.UNARY, SC.CALL, SC.LUNARY, SC.RELATION, SC.IFEXP, SC.EXP_CREF} &&
     return OMBackend.CodeGeneration.evalExpression(c, simCode)
   OMBackend.unsupported("not a constant", c)
@@ -330,7 +330,7 @@ end
 
 "The value of a literal."
 function evalConstant(c::SC.Exp)
-  c isa Union{SC.BCONST, SC.ICONST, SC.RCONST, SC.SCONST} && return c.value
+  c isa SC.ValueLiteral && return c.value
   OMBackend.unsupported("not a constant", c)
 end
 
@@ -797,7 +797,7 @@ function relayFixedStarts(algebraicVariables::Vector{String}, aliases::Dict{Symb
   return out
 end
 
-_isLiteralBind(exp::SC.Exp)::Bool = exp isa Union{SC.RCONST, SC.ICONST, SC.BCONST, SC.SCONST, SC.ENUM_LITERAL}
+_isLiteralBind(exp::SC.Exp)::Bool = exp isa SC.ScalarLiteral
 
 #= ==================================================================================== =#
 #= The functions the model calls                                                        =#

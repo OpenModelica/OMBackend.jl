@@ -289,7 +289,7 @@ function substituteAliases!(model::IR.Model, partition::IR.Partition)::AliasUndo
   local discretes = discreteTargets(partition)
   local isCandidate = name::Symbol -> begin
     local v = get(variables, name, nothing)
-    v !== nothing && v.ty isa IR.T_REAL && v.kind isa Union{IR.STATE, IR.ALGEBRAIC, IR.ALGEBRAIC_DER} && !(name in discretes) &&
+    v !== nothing && v.ty isa IR.T_REAL && v.kind isa IR.StateOrAlgebraic && !(name in discretes) &&
       v.direction !== IR.INPUT
   end
   local isConstant = (e::IR.Expression) -> begin

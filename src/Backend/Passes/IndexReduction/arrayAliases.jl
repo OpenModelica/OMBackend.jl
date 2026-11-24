@@ -68,7 +68,7 @@ function arrayAliasPairs(view::Scalarized, blocked::Set{Symbol})::Dict{Tuple{Sym
   local discretes::Set{Symbol} = discreteTargets(partition)
   local isCandidate = (name::Symbol) -> begin
     local v::Union{Nothing, IR.Variable} = get(variables, name, nothing)
-    v !== nothing && v.ty isa IR.T_REAL && v.kind isa Union{IR.STATE, IR.ALGEBRAIC, IR.ALGEBRAIC_DER} &&
+    v !== nothing && v.ty isa IR.T_REAL && v.kind isa IR.StateOrAlgebraic &&
       !(name in discretes) && v.direction !== IR.INPUT
   end
   local noConstant = (::IR.Expression) -> false

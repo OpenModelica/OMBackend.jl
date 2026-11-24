@@ -898,7 +898,7 @@ function scalarVariables(variables::IR.VariableSet, E::Elements)::IR.VariableSet
     local element = IR.elementType(v.ty)
     #= external objects (a table of each of an array of components: the array code makes one per element,
        `_objectElementRead`); clocks: variables of the scalar passes only (the array form has no element of them) =#
-    element isa Union{IR.T_REAL, IR.T_INTEGER, IR.T_BOOLEAN, IR.T_ENUMERATION, IR.T_STRING} ||
+    element isa Union{IR.ScalarType, IR.T_STRING} ||
       element isa IR.T_EXTERNAL_OBJECT || (E.passesFollow && element isa IR.T_CLOCK) ||
       throw(NotHandled("the array $(v.name) of $(element) elements"))
     local (binding, start, fixed, nominal, low, high) =
@@ -1784,7 +1784,7 @@ readsContinuousArray(e::IR.Expression, variables::IR.VariableSet)::Bool =
   IR.anyExp(x -> x isa IR.CREF && isContinuousArray(get(variables, unsubscriptedName(x.cref), nothing)), e)
 
 isContinuousArray(::Nothing)::Bool = false
-isContinuousArray(v::IR.Variable)::Bool = v.ty isa IR.T_ARRAY && v.kind isa Union{IR.STATE, IR.STATE_DER, IR.ALGEBRAIC, IR.ALGEBRAIC_DER}
+isContinuousArray(v::IR.Variable)::Bool = v.ty isa IR.T_ARRAY && v.kind isa IR.ContinuousKind
 
 """
     elementAt(e, subscripts, element, variables) -> Expression

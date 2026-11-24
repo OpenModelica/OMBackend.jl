@@ -280,7 +280,7 @@ function startValues(variables::IR.VariableSet)::Dict{Symbol, IR.Expression}
   local out = Dict{Symbol, IR.Expression}()
   for v in variables
     v.attributes.start === nothing && continue
-    IR.elementType(v.ty) isa Union{IR.T_BOOLEAN, IR.T_INTEGER, IR.T_REAL, IR.T_ENUMERATION} || continue
+    IR.elementType(v.ty) isa IR.ScalarType || continue
     out[v.name] = v.attributes.start
   end
   return out

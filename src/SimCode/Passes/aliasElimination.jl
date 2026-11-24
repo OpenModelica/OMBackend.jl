@@ -434,7 +434,7 @@ function mergeAliasAttributes(rep::SimVarAttributes, @nospecialize(repType::STyp
                             orElse(rep.quantity, e.quantity), orElse(rep.stateSelect, e.stateSelect),
                             rep.isProtected || e.isProtected)
   end
-  t isa Union{TYPE_INTEGER, TYPE_BOOL, TYPE_ENUM} || return rep
+  t isa DiscreteSType || return rep
   (negated && t isa TYPE_ENUM) && return rep
   local hasRep = attributesGiven(repType, rep)
   local base = hasRep ? rep : e
