@@ -597,7 +597,7 @@ end
   The index here is the index assigned by the code generator earlier in the lowering
   of the hybrid DAE.
 """
-function createParameterArray(parameters::Vector, parameterAssignments::Vector, simCode::SC.SIM_CODE)
+function createParameterArray(parameters::Vector, simCode::SC.SIM_CODE)
   local paramArray = Union{Float64, Symbol}[]
   local hT = simCode.stringToSimVarHT
   for param in parameters

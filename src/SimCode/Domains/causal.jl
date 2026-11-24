@@ -187,10 +187,10 @@ function causalSchedule!(g::Gen; keepsArrays::Bool, full::Bool, fixedMask::Vecto
      `OMBackend._arrayStartFailure`) =#
   local hasArrays::Bool = keepsArrays && any(c::EqClass -> size(c.domain, 2) > 1, g.classes)
   local large::BitVector = _largeBlocks(g, loops, matchRow, el)
-  local deps::Union{Nothing, Vector{Vector{Int}}} = _stateDeps(el, matchRow, batches, producer, loops, g.nStates)
+  local deps::Union{Nothing, Vector{Vector{Int}}} = _stateDeps(el, matchRow, batches, producer, loops)
   local pattern::Union{Nothing, Tuple{Vector{Int}, Vector{Int}}} = _jacobianPattern(el, matchRow, deps, g.nStates)
   local initial::InitialMatching =
-    _initialMatching(g, deps, producer, fixedMask, _freeParameterDeps(g, el, matchRow, batches, producer, loops))
+    _initialMatching(g, deps, producer, fixedMask, _freeParameterDeps(g, el, batches, producer, loops))
   #= initial algorithms that run after the initial system: what they assign, which initial equations may not read =#
   local initAlgOuts::Set{String} = _initAlgAssigned(g, .!_parameterAlgorithms(g))
   for c in g.initClasses, r in accesses!(accesses!(Ref[], c.lhs), c.rhs)

@@ -398,7 +398,7 @@ function _affectValue(@nospecialize(e::SC.Exp), obsAcc::Dict{Symbol, Symbol}, si
     return _isBoolDiscreteName(nm, simCode) ? :($(rd) > 0.5) : rd
   end
   e isa SC.DER && throw(_UnsupportedInAffect(e))
-  e isa SC.CALL && return _affectCall(e, obsAcc, simCode, rec, recb, initVal)
+  e isa SC.CALL && return _affectCall(e, rec, recb, initVal)
   e isa SC.CAST && return rec(e.exp)
   e isa Union{SC.RELATION, SC.BINARY} && return :($(opKindToJuliaOperator(e.op))($(rec(e.exp1)), $(rec(e.exp2))))
   e isa SC.UNARY && return :($(opKindToJuliaOperator(e.op))($(rec(e.exp))))
@@ -451,8 +451,7 @@ numeric functions as Julia's; noEvent() and smooth() semantic no-ops; String Mod
 name (an external one: CombiTimeTable's getNextTimeEvent), its arguments read like the
 others.
 """
-function _affectCall(e::SC.CALL, obsAcc::Dict{Symbol, Symbol}, simCode::SC.SIM_CODE, rec::R, recb::B,
-                     initVal::Union{Bool, Symbol}) where {R, B}
+function _affectCall(e::SC.CALL, rec::R, recb::B, initVal::Union{Bool, Symbol}) where {R, B}
   _isDelayCall(e) && throw(_UnsupportedInAffect(e))
   e.kind === SC.CALL_BUILTIN || return Expr(:call, e.name, map(rec, e.args)...)
   local name = e.name

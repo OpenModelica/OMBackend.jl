@@ -1821,7 +1821,7 @@ function _schedule(el::InstanceTable, matchRow::Vector{Int}, nU::Int, settled::B
     end
   end
   done == N && return (batches, pos, producer, LoopBlocks(Vector{Int}[], zeros(Int, N), Vector{Tuple{Int, Int}}[]))
-  return _scheduleWithLoops(el, matchRow, nU, producer, pos, settled)
+  return _scheduleWithLoops(el, matchRow, producer, pos, settled)
 end
 
 """
@@ -2338,7 +2338,7 @@ continuous variables through relations only, an ideal diode's `off = s < 0`) is 
 loop read its last value (it does not change between events; at an event the sweeps repeat until it stays, as
 OpenModelica's mixed systems), its own instance comes after the loop, which is of the continuous unknowns.
 """
-function _scheduleWithLoops(el::InstanceTable, matchRow::Vector{Int}, nU::Int, producer::Vector{Int}, pos::Vector{Int},
+function _scheduleWithLoops(el::InstanceTable, matchRow::Vector{Int}, producer::Vector{Int}, pos::Vector{Int},
                             settled::BitVector)
   local N::Int = length(el.class)
   local cuts::Set{Tuple{Int, Int}} = Set{Tuple{Int, Int}}()
@@ -2428,15 +2428,15 @@ function _scheduleWithLoops(el::InstanceTable, matchRow::Vector{Int}, nU::Int, p
 end
 
 """
-    _freeParameterDeps(g, el, matchRow, batches, producer, loops) -> Vector{Set{Tuple{String, Int}}}
+    _freeParameterDeps(g, el, batches, producer, loops) -> Vector{Set{Tuple{String, Int}}}
 
 The elements (name, column-major index) of the parameters with fixed = false that every equation instance reads,
 directly or through the unknowns it reads (in schedule order, as `_stateDeps`; a loop block's instances all of the
 block's): the initialization's unknowns an initial equation of an algebraic variable can determine (MSL
 InitSpringConstant: `rev.a = 0` fixes the spring's c through the equations). Empty sets for a model without them.
 """
-function _freeParameterDeps(g::Gen, el::InstanceTable, matchRow::Vector{Int},
-                            batches::Vector{Tuple{Tuple{Int, Int}, Vector{Int}}}, producer::Vector{Int},
+function _freeParameterDeps(g::Gen, el::InstanceTable, batches::Vector{Tuple{Tuple{Int, Int}, Vector{Int}}},
+                            producer::Vector{Int},
                             loops::LoopBlocks)::Vector{Set{Tuple{String, Int}}}
   local N::Int = length(el.class)
   local deps::Vector{Set{Tuple{String, Int}}} = [Set{Tuple{String, Int}}() for _ in 1:N]
@@ -2492,7 +2492,7 @@ The states every equation instance depends on, through the algebraic unknowns it
 (in schedule order; not through a discrete unknown a loop was cut at, which comes after its readers); nothing when
 that would be large.
 """
-function _stateDeps(el::InstanceTable, matchRow, batches, producer, loops::LoopBlocks, nStates::Int)
+function _stateDeps(el::InstanceTable, matchRow, batches, producer, loops::LoopBlocks)
   local N = length(el.class)
   local deps = Vector{Vector{Int}}(undef, N)
   local total = 0

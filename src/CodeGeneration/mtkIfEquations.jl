@@ -54,7 +54,7 @@
    t = 1e5). Each callback substitutes every other condition, n(n - 1) in all. =#
 const _TIME_EVENT_AHEAD = 1.0e-10
 
-function _buildTimeEventRefreshCallbacks(allPT::Vector, simCode::SC.SIM_CODE)
+function _buildTimeEventRefreshCallbacks(allPT::Vector)
   local n = length(allPT)
   local cbs = Expr[]
   for k in 1:n
@@ -118,7 +118,7 @@ function createIfEquations(stateVariables::Vector, algebraicVariables::Vector, s
      pure-time conditions are known. =#
   local allPT = collect(Iterators.flatten(c.pureTimeEvents for c in ifEquations))
   if !isempty(allPT)
-    local refreshCbs = _buildTimeEventRefreshCallbacks(allPT, simCode)
+    local refreshCbs = _buildTimeEventRefreshCallbacks(allPT)
     push!(ifEquations, IfEquationComponent(refreshCbs, Expr[], Symbol[],
                                            Tuple{String, Bool}[], Tuple{Symbol, Any, Any, Float64}[],
                                            Expr[]))

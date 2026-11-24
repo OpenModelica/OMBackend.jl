@@ -598,7 +598,7 @@ function partitionClocks!(model::IR.Model)::IR.Model
   for node in clocked
     clockOf[node] = canonical(ctx, clockOf[node])
   end
-  partitioned!(model, clockVars, isClockEq, scans, representative, sub, clocked, clockOf, ctx.bases)
+  partitioned!(model, clockVars, isClockEq, representative, sub, clocked, clockOf, ctx.bases)
   return model
 end
 
@@ -611,7 +611,7 @@ function withoutClocks!(model::IR.Model, clockVars::Set{Symbol}, isClockEq::Abst
 end
 
 "The continuous system and the clocked partitions, in the order of their first equations."
-function partitioned!(model::IR.Model, clockVars::Set{Symbol}, isClockEq::AbstractVector{Bool}, scans::Vector{EquationScan},
+function partitioned!(model::IR.Model, clockVars::Set{Symbol}, isClockEq::AbstractVector{Bool},
                       representative::Vector{Union{Nothing, Symbol}}, sub::UnionFind, clocked::Set{Symbol},
                       clockOf::Dict{Symbol, ResolvedClock}, bases::Vector{IR.ClockKind})::Nothing
   local system = model.continuous[1]

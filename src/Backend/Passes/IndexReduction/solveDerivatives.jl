@@ -340,7 +340,7 @@ substitutable(ref::IR.CREF, value::IR.Expression)::IR.Expression =
   expressionLargerThan(value, SUBSTITUTED_VALUE_NODE_LIMIT) ? ref : value
 
 """
-    solveThroughSolved!(solved, equationOf, edges, partition, unknowns, functions, variables, start)
+    solveThroughSolved!(solved, equationOf, edges, partition, unknowns, functions, start)
 
 Two derivative unknowns whose solved values read each other (a cycle `resolvedValues` would leave the solver's)
 solved by substitution: the one whose equation, the other's value put in, reads neither the other nor another
@@ -356,8 +356,7 @@ the unknowns whose values were put into its equation (their values as matched, `
 """
 function solveThroughSolved!(solved::Dict{Symbol, IR.Expression}, equationOf::Dict{Symbol, Int},
                              edges::Dict{Symbol, Vector{DerivativeEdge}}, partition::IR.Partition, unknowns::Set{Symbol},
-                             functions::Dict{Symbol, IR.ModelicaFunction}, variables::IR.VariableSet,
-                             start::StartValues)::Dict{Symbol, Set{Symbol}}
+                             functions::Dict{Symbol, IR.ModelicaFunction}, start::StartValues)::Dict{Symbol, Set{Symbol}}
   local through::Dict{Symbol, Set{Symbol}} = Dict{Symbol, Set{Symbol}}()
   local readsOf = v -> (local r = Set{Symbol}(); IR.foreachExp(x -> (x isa IR.CREF && x.cref.name in unknowns && push!(r, x.cref.name); nothing), v); r)
   #= `d` from equation `i` with the values of `others` put in: its value, or nothing =#
@@ -522,7 +521,7 @@ function derivativeSolution(model::IR.Model, partition::IR.Partition;
     equationOf[d] = e.equation
   end
   local through::Dict{Symbol, Set{Symbol}} =
-    solveThroughSolved!(solved, equationOf, edges, partition, unknowns, functions, model.variables, start)
+    solveThroughSolved!(solved, equationOf, edges, partition, unknowns, functions, start)
   isempty(solved) && return nothing
   local resolved = resolvedValues(solved)
   isempty(resolved) && return nothing

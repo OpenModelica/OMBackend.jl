@@ -196,7 +196,7 @@ function replaceBody!(eq::IR.FOR_EQUATION, path::Vector{Int}, new::IR.Equation):
 end
 
 """
-    solvedTemplate(body, iterators, rows, view, E, model, functions, parameters) -> SolvedTemplate
+    solvedTemplate(body, iterators, rows, view, E, model, functions) -> SolvedTemplate
 
 The body equation `body` solved in array form for the derivative its iterations `rows` (element view row => the
 derivative solved from it) are solved for: the reference in the body that is each row's derivative at its iteration
@@ -206,8 +206,8 @@ where it reads only parameters too: `literalCoefficients = false`; the literal i
 rows solve for references the body does not have alike.
 """
 function solvedTemplate(body::IR.SCALAR_EQUATION, iterators::Vector{Symbol}, rows::Vector{Pair{Int, Symbol}},
-                        view::Scalarized, E::Elements, model::IR.Model, functions::Dict{Symbol, IR.ModelicaFunction},
-                        parameters::StartValues)::SolvedTemplate
+                        view::Scalarized, E::Elements, model::IR.Model,
+                        functions::Dict{Symbol, IR.ModelicaFunction})::SolvedTemplate
   local canonical::IR.SCALAR_EQUATION = IR.SCALAR_EQUATION(canonicalReferences(body.lhs, E, model.variables), canonicalReferences(body.rhs, E, model.variables),
                                        body.ty, body.source, body.attributes)
   local valuesAt::Function = (r::Int) -> Dict{Symbol, Int}(zip(iterators, view.origins[r].iteration))
@@ -483,7 +483,6 @@ function arrayTemplates(model::IR.Model, view::Scalarized,
                      "$(length(splitEquations)) for-equations: slicing)", sort!(collect(splitArrays)), sort!(collect(splitEquations))))
   end
   local functions::Dict{Symbol, IR.ModelicaFunction} = Dict{Symbol, IR.ModelicaFunction}(f.name => f for f in model.functions)
-  local parameters::StartValues = StartValues(model.variables, model.functions; parametersOnly = true)
   local templates::Dict{Symbol, SolvedTemplate} = Dict{Symbol, SolvedTemplate}()
   local partners::Dict{Symbol, Set{Symbol}} = throughPartners(solution, E, bodyOf)
   for (target, key) in bodyOf
@@ -492,7 +491,7 @@ function arrayTemplates(model::IR.Model, view::Scalarized,
     local (body::IR.SCALAR_EQUATION, iterators::Vector{Symbol}) = templateBody(partition, key)
     #= a body its iterations solve for different references, or not in array form: unrolled (slicing) =#
     try
-      templates[target] = solvedTemplate(body, iterators, rows, view, E, model, functions, parameters)
+      templates[target] = solvedTemplate(body, iterators, rows, view, E, model, functions)
     catch err
       (err isa NotHandled && !isempty(iterators)) || rethrow()
       push!(splitEquations, key[1])
@@ -509,7 +508,7 @@ function arrayTemplates(model::IR.Model, view::Scalarized,
     local (body::IR.SCALAR_EQUATION, iterators::Vector{Symbol}) = templateBody(partition, key)
     local substituted::IR.SCALAR_EQUATION = withTemplateValues(body, others, E, templates)
     try
-      templates[target] = solvedTemplate(substituted, iterators, solvedRows[key], view, E, model, functions, parameters)
+      templates[target] = solvedTemplate(substituted, iterators, solvedRows[key], view, E, model, functions)
     catch err
       (err isa NotHandled && !isempty(iterators)) || rethrow()
       push!(splitEquations, key[1])

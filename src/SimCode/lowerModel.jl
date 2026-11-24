@@ -75,7 +75,7 @@ function lowerStructuralModes(model::IR.Model)::SIM_CODE
     push!(subModels, lowerSystem(model, variables, system; name = mode.name, functions))
   end
   local simCode = lowerSystem(model, model.variables, top; functions)
-  local names = systemNames(IR.Variable[v for v in model.variables if !(v.kind isa IR.STATE_DER)], model.name)
+  local names = systemNames(IR.Variable[v for v in model.variables if !(v.kind isa IR.STATE_DER)])
   local transitions = StructuralTransition[EXPLICIT_STRUCTURAL_TRANSITION(t.from, t.to, simExp(names, t.condition))
                                            for t in model.transitions]
   local topVariables = String[simName(names, v.cref) for v in model.variables if !(v.kind isa IR.STATE_DER)]
@@ -112,7 +112,7 @@ structural mode's), with the functions `functions` (the model's).
 function lowerSystem(model::IR.Model, variables::IR.VariableSet, partition::IR.Partition; name::String = model.name,
                      functions::Vector{ModelicaFunction} = simFunctions(model.functions))::SIM_CODE
   local vars = IR.Variable[v for v in variables if !(v.kind isa IR.STATE_DER)]
-  local names = systemNames(vars, model.name)
+  local names = systemNames(vars)
   local simVars = SIMVAR[SIMVAR(simName(names, v.cref), nothing, simVarKind(v, names), simVarAttributes(v, names),
                                 simType(IR.elementType(v.ty)), arrayDimensions(v), simKind(v.kind, variables, names), v.origin,
                                 v.cref) for v in vars]
@@ -231,13 +231,13 @@ function derivativeReferences(vars::Vector{IR.Variable}, variables::IR.VariableS
 end
 
 """
-    systemNames(vars, modelName)
+    systemNames(vars)
 
 The keys of the variables `vars` (`Names`: their references' flat names) and the keys known as
 variables: theirs, the states' derivatives' (their IR derivative variables'), `time`, `pi`, `e`;
 those of the variables that are not arrays.
 """
-function systemNames(vars::Vector{IR.Variable}, modelName::String)::Names
+function systemNames(vars::Vector{IR.Variable})::Names
   local stateOf = Dict{Symbol, IR.ComponentRef}()
   for v in vars
     (v.kind isa IR.STATE && v.kind.derivative !== nothing) && (stateOf[v.kind.derivative] = v.cref)

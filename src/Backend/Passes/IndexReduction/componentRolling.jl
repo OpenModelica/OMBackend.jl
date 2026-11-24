@@ -235,7 +235,7 @@ function rollGroup!(model::IR.Model, g::ComponentGroup)::Bool
     push!(newVariables, rolledVariable(byKey[key], g, groups, memberOf, names, crefOf))
   end
   for (j, auxs) in enumerate(auxiliaries)
-    push!(newVariables, rolledAuxiliary(auxs, j, g, model.variables, names))
+    push!(newVariables, rolledAuxiliary(auxs, j, model.variables, names))
   end
   #= the equations =#
   local rewrite::Function = (e::IR.Expression, index::Function) -> rolledExpression(e, groups, memberOf, names, index)
@@ -522,12 +522,12 @@ function rolledName(name::Symbol, crefOf::Dict{Symbol, IR.ComponentRef}, memberO
 end
 
 """
-    rolledAuxiliary(auxs, j, g, variables, names) -> IR.Variable
+    rolledAuxiliary(auxs, j, variables, names) -> IR.Variable
 
 The auxiliaries `auxs` (one per instance, of role `j`) as an array of one part of type `T_COMPONENTS` (an element
 named as its auxiliary), recorded in `names`.
 """
-function rolledAuxiliary(auxs::Vector{Symbol}, j::Int, g::ComponentGroup, variables::IR.VariableSet, names::RolledNames)::IR.Variable
+function rolledAuxiliary(auxs::Vector{Symbol}, j::Int, variables::IR.VariableSet, names::RolledNames)::IR.Variable
   local first::IR.Variable = variables[auxs[1]]
   isempty(IR.dimensions(first.ty)) || throw(NotHandled("the auxiliary array $(first.name)"))
   all(x::Symbol -> typeof(variables[x].kind) == typeof(first.kind) && variables[x].ty == first.ty, auxs) ||

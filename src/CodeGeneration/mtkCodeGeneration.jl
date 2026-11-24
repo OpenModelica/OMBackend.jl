@@ -54,7 +54,7 @@ const IFELSE_HEAD             = :ifelse
 const CONST_TABLE_LOOKUP_HEAD = :constTableLookup
 
 """
-    evalGeneratedFunctions!(modelName, functions, simCode)
+    evalGeneratedFunctions!(modelName, functions)
 
 For `ODE_MODE_MTK_MODEL_GENERATION`: `eval` each generated Modelica
 function body in OMBackend. Each binds the function's name to its wrapper
@@ -71,7 +71,7 @@ equation expressions.
 On function-eval failure, the offending generated source is dumped to
 `/tmp/om_bad_function.jl` and the error rethrown.
 """
-function evalGeneratedFunctions!(modelName::String, functions::Vector{Expr}, simCode::SC.SIM_CODE)
+function evalGeneratedFunctions!(modelName::String, functions::Vector{Expr})
   #= Under another package's precompile (OMJL's workload), eval'ing the model's generated Modelica
      functions into the already-closed `CodeGeneration` module is rejected by Julia ("breaks incremental
      compilation"). Skip the eval + registration here: the codegen that PRODUCED `functions`
@@ -1086,7 +1086,7 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SC.SIM_CODE, modelName::String, 
 
   #= Eval the generated Modelica functions and their @register_symbolic
      calls into OMBackend so subsequent codegen sees the bindings. =#
-  evalGeneratedFunctions!(modelName, functions, simCode)
+  evalGeneratedFunctions!(modelName, functions)
 
   #= Bucket each simvar by varKind (state / algebraic / discrete
      / parameter / array / occ / data-structure / state-derivative) and
@@ -1124,7 +1124,7 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SC.SIM_CODE, modelName::String, 
                                      getStartConditionsMTK(discreteVariables, simCode))
   local PARAMETER_EQUATIONS = createParameterEquationsMTK(parameters, simCode)
   local PARAMETER_ASSIGNMENTS = createParameterAssignmentsMTK(parameters, simCode)
-  local PARAMETER_RAW_ARRAY = createParameterArray(parameters, PARAMETER_ASSIGNMENTS, simCode)
+  local PARAMETER_RAW_ARRAY = createParameterArray(parameters, simCode)
   local ARRAY_PARAMETERS = createArrayParametersMTK(arrayParameters, simCode)
   #= Legacy callback generation is deferred until after relay elimination so
      the callbacks read the surviving relay representatives (see below). =#

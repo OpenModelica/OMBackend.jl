@@ -233,7 +233,7 @@ function createEquations(equations::Vector{SC.WHEN_EQUATION}, simCode::SC.SIM_CO
   local calls = Expr[]
   for (i, eq) in enumerate(equations)
     local firstIndex::Int = COUNT_CALLBACKS() + 1
-    local code::Expr = eqToJulia(eq, simCode, i)
+    local code::Expr = eqToJulia(eq, simCode)
     local cbs::Vector{Symbol} = Symbol[Symbol("cb", k) for k in firstIndex:COUNT_CALLBACKS()]
     local name::Symbol = Symbol("_", modelName, "_whenCallbacks", i)
     push!(functions, :(function $(name)(p, reals, reducedSystem)
@@ -880,7 +880,7 @@ _containsSampleCall(@nospecialize(e::SC.Exp))::Bool = _containsCallTo(e, :sample
 _containsCallTo(@nospecialize(e::SC.Exp), name::Symbol)::Bool = SC.anyExp(x -> SC.isBuiltin(x, name), e)
 
 """
-    eqToJulia(eq, simCode, arrayIdx)
+    eqToJulia(eq, simCode)
 
 The callback of a when-equation: by its condition, a PresetTimeCallback (a table/time when), a
 PeriodicCallback (a sample() clock, alone or and-ed with a guard, or-ed with others; a Pulse's
@@ -888,7 +888,7 @@ PeriodicCallback (a sample() clock, alone or and-ed with a guard, or-ed with oth
 8.5), a ContinuousCallback (a continuous condition), else a discrete callback of the event
 iteration; an elsewhen arm a callback of its own.
 """
-function eqToJulia(eq::SC.WHEN_EQUATION, simCode::SC.SIM_CODE, arrayIdx::Int)::Expr
+function eqToJulia(eq::SC.WHEN_EQUATION, simCode::SC.SIM_CODE)::Expr
   local wEq = eq.whenEquation
   local condition = wEq.condition
   local cond = transformToZeroCrossingCondition(condition)
@@ -1117,7 +1117,7 @@ function _continuousWhen(eq::SC.WHEN_EQUATION, cond::SC.Exp, simCode::SC.SIM_COD
     $(Symbol("cb$(callbacks)")) = ContinuousCallback($(Symbol("condition$(callbacks)")),
                                                      $(Symbol("affect$(callbacks)!")),
                                                      rootfind = ModelingToolkit.SciMLBase.RightRootFind, save_positions=(true, true))
-    $(wEq.elsewhenPart === nothing ? nothing : eqToJulia(_elsewhenInner(wEq.elsewhenPart), simCode, 0))
+    $(wEq.elsewhenPart === nothing ? nothing : eqToJulia(_elsewhenInner(wEq.elsewhenPart), simCode))
   end
 end
 
@@ -1181,7 +1181,7 @@ function _periodicWhen(eq::SC.WHEN_EQUATION, sampleCalls::Vector{SC.CALL}, sampl
       Expr(:call, :CallbackSet, [:(PeriodicCallback($(Symbol("affect$(callbacks)!")), $(c[1]);
                                                       phase = $(c[2]), initial_affect = $(c[3]), final_affect = true,
                                                       save_positions = (true, true))) for c in clocks]...))
-    $(wEq.elsewhenPart === nothing ? nothing : eqToJulia(_elsewhenInner(wEq.elsewhenPart), simCode, 4))
+    $(wEq.elsewhenPart === nothing ? nothing : eqToJulia(_elsewhenInner(wEq.elsewhenPart), simCode))
   end
 end
 
@@ -1437,7 +1437,7 @@ function _discreteWhen(eq::SC.WHEN_EQUATION, @nospecialize(condition::SC.Exp), @
     $(if ewThr !== nothing
         _emitElsewhenThresholdTimeWhen(ewArm, simCode, ewRefSym, ewThr)
       elseif wEq.elsewhenPart !== nothing
-        eqToJulia(ewArm, simCode, 4)
+        eqToJulia(ewArm, simCode)
       end)
   end
 end

@@ -323,7 +323,6 @@ function solve(omProblem::OM_ProblemStructural, tspan, alg; kwargs...)
   local problem = omProblem.problem
   local oldSystem = problem
   local structuralCallbacks = omProblem.structuralCallbacks
-  local commonVariableSet = omProblem.commonVariables
   local activeModeName = omProblem.activeModeName
   #= Create integrator =#
   integrator = init(problem, alg; solverVerbosity(kwargs)..., kwargs...)
@@ -343,7 +342,6 @@ function solve(omProblem::OM_ProblemStructural, tspan, alg; kwargs...)
         indicesOfCommonVariables = getIndicesOfCommonVariables(getSyms(newSystem)
                                                                ,getSyms(oldSystem)
                                                                ,omProblem.topVariables
-                                                               ,commonVariableSet
                                                                ;destinationPrefix = cb.name
                                                                ,srcPrefix = activeModeName)
 
@@ -1041,7 +1039,6 @@ end
 function getIndicesOfCommonVariables(syms1::Vector{Symbol} # New system
                                      ,syms2::Vector{Symbol} # old system
                                      ,topVariables::Vector{Symbol}
-                                     ,inCommonVariables::Vector{String}
                                      ;destinationPrefix::String = ""
                                      ,srcPrefix::String = "")
   #= The common variables have the name without the prefix of the destination system =#

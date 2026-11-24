@@ -245,8 +245,8 @@ function splitInner!(model::IR.Model, bases::Set{Symbol})::Nothing
   empty!(model.variables)
   foreach(v::IR.Variable -> push!(model.variables, v), out)
   local partition::IR.Partition = model.continuous[1]
-  partition.equations = IR.Equation[slicedEquation(eq, family, model.variables) for eq in partition.equations]
-  partition.initialEquations = IR.Equation[slicedEquation(eq, family, model.variables) for eq in partition.initialEquations]
+  partition.equations = IR.Equation[slicedEquation(eq, family) for eq in partition.equations]
+  partition.initialEquations = IR.Equation[slicedEquation(eq, family) for eq in partition.initialEquations]
   local unknowns::Vector{Symbol} = Symbol[]
   for u in partition.unknowns
     haskey(family, u) ? append!(unknowns, Symbol[sliceOf(u, t) for t in rowMajor(family[u])]) : push!(unknowns, u)
@@ -336,13 +336,12 @@ function slicedKind(kind::IR.VariableKind, family::Dict{Symbol, Vector{Int}}, t:
 end
 
 """
-    slicedEquation(eq, family, variables) -> IR.Equation
+    slicedEquation(eq, family) -> IR.Equation
 
 An equation reading the split arrays `family` by their slices (`slicedReference`); its for-equations whose iterators
 subscript an inner dimension unrolled first (`unrollIterators`).
 """
-function slicedEquation(@nospecialize(eq::IR.Equation), family::Dict{Symbol, Vector{Int}},
-                        variables::IR.VariableSet)::IR.Equation
+function slicedEquation(@nospecialize(eq::IR.Equation), family::Dict{Symbol, Vector{Int}})::IR.Equation
   local iterators::Set{Symbol} = Set{Symbol}()
   local reads::Bool = false
   IR.foreachExp(eq) do x::IR.Expression

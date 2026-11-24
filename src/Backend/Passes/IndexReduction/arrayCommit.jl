@@ -916,12 +916,12 @@ function differentiatedArrayEquations(partition::IR.Partition, view::Scalarized,
 end
 
 """
-    stateSets(model, p, E, variables, viewVariables) -> Tuple{Vector{IR.Variable}, Vector{IR.Equation}, Int}
+    stateSets(p, E, variables, viewVariables) -> Tuple{Vector{IR.Variable}, Vector{IR.Equation}, Int}
 
 The plan's dynamic state sets: of scalars as `commit!` makes them (`dynamicSetParts`), of the elements of arrays by
 family (`setFamilies`, `familyParts`); their variables, equations and number.
 """
-function stateSets(model::IR.Model, p::Plan, E::Elements, variables::IR.VariableSet,
+function stateSets(p::Plan, E::Elements, variables::IR.VariableSet,
                    viewVariables::IR.VariableSet)::Tuple{Vector{IR.Variable}, Vector{IR.Equation}, Int}
   local newVariables = IR.Variable[]
   local equations = IR.Equation[]
@@ -976,7 +976,7 @@ function arrayCommit(model::IR.Model, partition::IR.Partition, view::Scalarized,
   local kinds = arrayKinds(plannedKinds(s, p.dummies), E, variables)
   local equations = differentiatedArrayEquations(expandedPartition, view, p, E, variables, derivatives, model.functions)
   append!(equations, linkEquations)
-  local (setVariables, setEquations, sets) = stateSets(model, p, E, variables, view.model.variables)
+  local (setVariables, setEquations, sets) = stateSets(p, E, variables, view.model.variables)
   append!(equations, setEquations)
   return ArrayCommit(vcat(added, links, setVariables), kinds, equations, sets, expanded)
 end
