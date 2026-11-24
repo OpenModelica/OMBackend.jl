@@ -54,7 +54,7 @@ const IFELSE_HEAD             = :ifelse
 const CONST_TABLE_LOOKUP_HEAD = :constTableLookup
 
 """
-    evalGeneratedFunctions!(modelName, functions, simCode)
+    evalGeneratedFunctions!(modelName, functions)
 
 For `ODE_MODE_MTK_MODEL_GENERATION`: `eval` each generated Modelica
 function body in OMBackend. Each binds the function's name to its wrapper
@@ -71,7 +71,7 @@ equation expressions.
 On function-eval failure, the offending generated source is dumped to
 `/tmp/om_bad_function.jl` and the error rethrown.
 """
-function evalGeneratedFunctions!(modelName::String, functions::Vector{Expr}, simCode::SC.SIM_CODE)
+function evalGeneratedFunctions!(modelName::String, functions::Vector{Expr})
   #= Under another package's precompile (OMJL's workload), eval'ing the model's generated Modelica
      functions into the already-closed `CodeGeneration` module is rejected by Julia ("breaks incremental
      compilation"). Skip the eval + registration here: the codegen that PRODUCED `functions`
@@ -146,7 +146,7 @@ function classifyVariables(simCode::SC.SIM_CODE)::ClassifiedVariables
   local dataStructureVariables = String[]
   local statePriorityPairs     = Tuple{Symbol, Int}[]
   local whenTargets = SC.whenAssignedNames(simCode)
-  for (varName, (idx, var)) in simCode.stringToSimVarHT
+  for (varName, (_, var)) in simCode.stringToSimVarHT
     local varType = var.varKind
     if varType isa SC.INPUT
       unsupported("INPUT variable", varName)
@@ -339,7 +339,6 @@ constructor in favor of the direct-RHS path.
 emitDirectRHSProblem() = :(
   problem = OMBackend.CodeGeneration.buildDirectRHSProblem(
     reducedSystem, finalInitialValues, pars, tspan, callbacks;
-    allInitialValues = initialValues,
     liftedDiscretes = (@isdefined(LIFTED_DISCRETES) ? LIFTED_DISCRETES : String[]),
     freeParameters = (@isdefined(FREE_PARAMETERS) ? FREE_PARAMETERS : String[]),
     assignedParameters = (@isdefined(ASSIGNED_PARAMETERS) ? ASSIGNED_PARAMETERS : String[]),
@@ -738,13 +737,12 @@ function ODE_MODE_MTK(simCode::SC.SIM_CODE)
   #=If our model name is separated by . replace it with __ =#
   local MODEL_NAME = simCode.name
   #= Generate code for algorithmic Modelica =#
-  (functions, functionNames) = AlgorithmicCodeGeneration.generateFunctions(simCode.functions)
+  (functions, _) = AlgorithmicCodeGeneration.generateFunctions(simCode.functions)
   if !SC.hasStructuralTransitions(simCode) && !SC.hasSubModels(simCode)
     #= Generate using the standard name =#
     return ODE_MODE_MTK_PROGRAM_GENERATION(simCode, simCode.name, functions)
   end
   #= Handle structural submodels =#
-  local activeModelSimCode = getActiveModel(simCode)
   local activeModelName = simCode.activeModel
   local structuralModes = Expr[]
   for mode in simCode.subModels
@@ -1087,7 +1085,7 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SC.SIM_CODE, modelName::String, 
 
   #= Eval the generated Modelica functions and their @register_symbolic
      calls into OMBackend so subsequent codegen sees the bindings. =#
-  evalGeneratedFunctions!(modelName, functions, simCode)
+  evalGeneratedFunctions!(modelName, functions)
 
   #= Bucket each simvar by varKind (state / algebraic / discrete
      / parameter / array / occ / data-structure / state-derivative) and
@@ -1098,8 +1096,6 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SC.SIM_CODE, modelName::String, 
   local discreteVariables      = vars.discreteVariables
   local parameters             = vars.parameters
   local arrayParameters        = vars.arrayParameters
-  local stateDerivatives       = vars.stateDerivatives
-  local dataStructureVariables = vars.dataStructureVariables
   local statePriorityPairs     = vars.statePriorityPairs
 
 
@@ -1110,9 +1106,9 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SC.SIM_CODE, modelName::String, 
   #= Create equations for variables not in a loop + parameters and stuff=#
   #= homotopy() as the blend in the continuous equations (HOMOTOPY_BLEND). =#
   local usesHomotopy = _usesHomotopy(simCode)
-  local EQUATIONS = Base.ScopedValues.with(HOMOTOPY_BLEND => usesHomotopy) do
-    createResidualEquationsMTK(stateVariables, algebraicVariables, simCode.residualEquations, simCode)
-  end
+  #= `@with`, not `with(...) do`: a closure would box simCode and algebraicVariables, which are reassigned below =#
+  local EQUATIONS = Base.ScopedValues.@with(HOMOTOPY_BLEND => usesHomotopy,
+    createResidualEquationsMTK(stateVariables, algebraicVariables, simCode.residualEquations, simCode))
   @BACKEND_LOGGING writeEqsToFile(EQUATIONS, OMBackend.logPath("backend/codeGen", "equationFirstStageCodeGen.log"))
   #=
   If missing from variable map error is thrown check the start condition.
@@ -1127,7 +1123,7 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SC.SIM_CODE, modelName::String, 
                                      getStartConditionsMTK(discreteVariables, simCode))
   local PARAMETER_EQUATIONS = createParameterEquationsMTK(parameters, simCode)
   local PARAMETER_ASSIGNMENTS = createParameterAssignmentsMTK(parameters, simCode)
-  local PARAMETER_RAW_ARRAY = createParameterArray(parameters, PARAMETER_ASSIGNMENTS, simCode)
+  local PARAMETER_RAW_ARRAY = createParameterArray(parameters, simCode)
   local ARRAY_PARAMETERS = createArrayParametersMTK(arrayParameters, simCode)
   #= Legacy callback generation is deferred until after relay elimination so
      the callbacks read the surviving relay representatives (see below). =#
@@ -1141,7 +1137,6 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SC.SIM_CODE, modelName::String, 
                                    MTK_CodeGenerationUtil.buildT0TrustedDerivedPairs(simCode)]
   #= Symbolic names =#
   local algebraicVariablesSym = Symbol[:($(Symbol(v))) for v in algebraicVariables]
-  local dataStructureVariablesSym = Symbol[Symbol(v) for v in dataStructureVariables]
   local stateVariablesSym = Symbol[:($(Symbol(v))) for v in stateVariables]
   local parVariablesSym = Symbol[Symbol(p) for p in parameters]
   #= Discrete-dummy demotion. Each discrete variable starts with a
@@ -1262,10 +1257,10 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SC.SIM_CODE, modelName::String, 
      form relays: the state keeps its name, unless introduceDerivatives or index reduction made it (a second-order
      chain's `\$DER.x`, a state set's variables); `der.x` of lowerHigherOrderDerivatives (`der_x` in the code) is a state of the model =#
   local _keepDiscretes = union(_condDiscretes, whenAssignedDiscreteSyms(simCode))
-  local _relayKeep = simCode.indexReduced ?
+  local _relayKeep = simCode.indexReduced ? let simVars = simCode.stringToSimVarHT
     union(_keepDiscretes, OrderedSet{Symbol}(Symbol(s) for s in stateVariables
-                                             if !(last(simCode.stringToSimVarHT[s]).irOrigin in
-                                                  (:introduceDerivatives, :indexReduction)))) : _keepDiscretes
+                                             if !(last(simVars[s]).irOrigin in (:introduceDerivatives, :indexReduction))))
+  end : _keepDiscretes
   #= Not a representative: a discrete the demotion made algebraic. Of a pure alias of two discretes it demoted one;
      kept as the relay's representative it had no equation left and its held partner was substituted away (MSL
      ControlledTanks' radio buttons: `pre(shut.reset[2]) = false` then read no variable of the system). =#
@@ -1487,9 +1482,8 @@ function ODE_MODE_MTK_MODEL_GENERATION(simCode::SC.SIM_CODE, modelName::String, 
          freshly-eval'd Symbolics bindings. =#
       local _algResults = $(earlyInitialAlgorithm ? :(Base.invokelatest(__runInitialAlgorithmEarly!)) : :(Dict{Symbol, Float64}()))
       function _buildInitialConstraintEqs()
-        local _eqs = Symbolics.Equation[$([_substSyms(e, _ifEqRelay_aliases) for e in Base.ScopedValues.with(HOMOTOPY_BLEND => usesHomotopy) do
-                                             generateInitialEquationsAsConstraints(simCode.initialEquations, simCode)
-                                           end]...),
+        local _eqs = Symbolics.Equation[$([_substSyms(e, _ifEqRelay_aliases) for e in Base.ScopedValues.@with(HOMOTOPY_BLEND => usesHomotopy,
+                                             generateInitialEquationsAsConstraints(simCode.initialEquations, simCode))]...),
                                         $([_substSyms(e, _ifEqRelay_aliases) for e in getFixedStartConstraintsMTK(vcat(stateVariables, algebraicVariables, discreteVariables, _relayFixedStarts), simCode)]...)]
         $(emitInitAlgConstraintAppends(simCode)...)
         return _eqs
@@ -1769,7 +1763,7 @@ function _splitClosureList!(body::Expr, reads::Vector{Symbol}, parts::Vector{Exp
   end
   return body
 end
-_splitClosureList!(@nospecialize(body), reads::Vector{Symbol}, parts::Vector{Expr}, name::Symbol) = body
+_splitClosureList!(@nospecialize(body), ::Vector{Symbol}, ::Vector{Expr}, ::Symbol) = body
 
 """
 The names `e` reads (its symbols but quoted code, keyword names, macro names), into `out`; an over-approximation
@@ -1815,7 +1809,7 @@ end
 """
    Creates equations from the residual equations in unsorted order
 """
-createResidualEquationsMTK(stateVariables::Vector, algebraicVariables::Vector, equations::AbstractVector{SC.RESIDUAL_EQUATION},
+createResidualEquationsMTK(::Vector, ::Vector, equations::AbstractVector{SC.RESIDUAL_EQUATION},
                            simCode::SC.SIM_CODE)::Vector{Expr} =
   Expr[:(0 ~ $(expToJuliaExpMTK(eq.exp, simCode))) for eq in equations]
 

@@ -118,7 +118,7 @@ function freeDependentParameters!(model::IR.Model)::IR.Model
   local initial::Vector{IR.Equation} = model.continuous[1].initialEquations
   for v::IR.Variable in model.variables
     (v.kind isa IR.PARAMETER && v.binding !== nothing &&
-     v.ty isa Union{IR.T_REAL, IR.T_INTEGER, IR.T_BOOLEAN}) || continue
+     v.ty isa IR.NumberType) || continue
     local fixed::Union{Nothing, IR.Expression} = v.attributes.fixed
     (fixed === nothing || (fixed isa IR.BOOLEAN && fixed.value)) || continue
     IndexReduction.readsFreeParameter(v.binding, model.variables, Set{Symbol}([v.name])) || continue
@@ -184,11 +184,15 @@ function equationKey(eq::IR.Equation, h::UInt = zero(UInt))::UInt
     if x isa IR.Equation
       h = equationKey(x, h)
     elseif x isa Vector{IR.Equation}
-      foreach((@nospecialize(e::IR.Equation)) -> (h = equationKey(e, h)), x)
+      for e::IR.Equation in x
+        h = equationKey(e, h)
+      end
     elseif x isa Vector{IR.EquationBranch}
-      for b in x
+      for b::IR.EquationBranch in x
         h = hash(b.condition, h)
-        foreach(e -> (h = equationKey(e, h)), b.equations)
+        for e::IR.Equation in b.equations
+          h = equationKey(e, h)
+        end
       end
     elseif x isa IR.EquationAttributes
       h = hash((x.kind, x.differentiated, x.derivativeLink), h)
@@ -255,7 +259,7 @@ end
 function addBindingEquations!(variables::IR.VariableSet, partition::IR.Partition)::Nothing
   for v in variables
     v.binding === nothing && continue
-    local continuous = v.kind isa Union{IR.STATE, IR.ALGEBRAIC, IR.ALGEBRAIC_DER}
+    local continuous = v.kind isa IR.StateOrAlgebraic
     local discrete = continuous || v.kind isa IR.DISCRETE
     local lhs = IR.CREF(v.cref, v.ty)
     if continuous && v.ty isa IR.T_REAL
@@ -270,9 +274,9 @@ function addBindingEquations!(variables::IR.VariableSet, partition::IR.Partition
         IR.WhenBranch(IR.Expression[invertCondition(b.condition)], false, false,
                       IR.Statement[IR.ASSIGNMENT(lhs, b.elseExp, IR.NO_SOURCE)])]
       push!(partition.equations, IR.WHEN_EQUATION(branches, IR.REGULAR_WHEN, IR.NO_SOURCE, IR.DEFAULT_ATTRIBUTES))
-    elseif discrete && v.ty isa Union{IR.T_BOOLEAN, IR.T_INTEGER, IR.T_ENUMERATION}
+    elseif discrete && v.ty isa IR.DiscreteType
       push!(partition.equations, IR.SCALAR_EQUATION(lhs, v.binding, v.ty, IR.NO_SOURCE, IR.DEFAULT_ATTRIBUTES))
-    elseif discrete && v.ty isa IR.T_ARRAY && v.ty.elementType isa Union{IR.T_BOOLEAN, IR.T_INTEGER, IR.T_ENUMERATION}
+    elseif discrete && v.ty isa IR.T_ARRAY && v.ty.elementType isa IR.DiscreteType
       append!(partition.equations, IndexReduction.discreteBindingEquations(v, variables))
     elseif v.kind isa IR.DISCRETE && v.ty isa IR.T_REAL
       unsupported("a discrete Real variable with a declaration binding", v.name)

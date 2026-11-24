@@ -183,7 +183,6 @@ of the Complex variables read whole (the code generators read a Complex referenc
 parts): what the passes that eliminate variables by their defining equation keep.
 """
 function eventAndComplexNames(simCode::SIM_CODE)::OrderedSet{String}
-  local ht = simCode.stringToSimVarHT
   local names = ifEquationNames!(OrderedSet{String}(), simCode.ifEquations)
   foreach(w -> whenCrefNames!(names, w.whenEquation), simCode.whenEquations)
   complexFieldNames!(names, simCode.residualEquations, simCode)

@@ -228,7 +228,7 @@ evaluated (a cycle does not evaluate).
 tryEvalScalar(e::Exp, simCode::SIM_CODE) = tryEvalScalar(e, simCode, OrderedSet{String}())
 
 function tryEvalScalar(@nospecialize(e::Exp), simCode::SIM_CODE, seen::OrderedSet{String})
-  e isa Union{BCONST, SCONST, ICONST, RCONST} && return e.value
+  e isa ValueLiteral && return e.value
   e isa ENUM_LITERAL && return e.index
   if e isa EXP_CREF
     return withParameterBinding(b -> tryEvalScalar(b, simCode, seen), e, simCode, seen)
@@ -240,7 +240,7 @@ function tryEvalScalar(@nospecialize(e::Exp), simCode::SIM_CODE, seen::OrderedSe
     return v isa Number && isinteger(v) ? Int(v) : nothing
   elseif e isa CAST
     return tryEvalScalar(e.exp, simCode, seen)
-  elseif e isa Union{RELATION, LBINARY, LUNARY}
+  elseif e isa LogicalExp
     #= a Boolean bound to a comparison (Buildings' Movers: haveVMax = abs(...) < eps) =#
     return tryEvalCondition(e, simCode, seen)
   elseif e isa IFEXP

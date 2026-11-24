@@ -70,7 +70,7 @@ function booleanizeWhenConditions!(variables::IR.VariableSet, partition::IR.Part
   local known = knownNames(variables)
   local count = Ref(0)
   local define = e -> begin
-    local name = :_
+    local name::Symbol
     while true
       count[] += 1
       name = Symbol("__whenCondition", count[])
@@ -82,18 +82,11 @@ function booleanizeWhenConditions!(variables::IR.VariableSet, partition::IR.Part
     push!(partition.equations, IR.SCALAR_EQUATION(lhs, e, IR.T_BOOLEAN(), IR.NO_SOURCE, IR.DEFAULT_ATTRIBUTES))
     return lhs
   end
-  local rewrite
-  rewrite = e -> begin
-    e isa IR.LBINARY && return IR.LBINARY(rewrite(e.exp1), e.op, rewrite(e.exp2))
-    e isa IR.LUNARY && return IR.LUNARY(e.op, rewrite(e.exp))
-    (e isa IR.RELATION && hasContinuousOperand(e, known) && !callsAnyOf(e, (:pre, :edge, :change))) && return define(e)
-    return e
-  end
   local rewriteBranch = b -> begin
     if isVectorCondition(b)
       return IR.WhenBranch(IR.Expression[isTriggerAtom(t) ? t : define(t) for t in b.triggers], b.atInitial, b.atTerminal, b.body)
     end
-    return isCompoundCondition(b) ? IR.WhenBranch(IR.Expression[rewrite(b.triggers[1])], false, false, b.body) : b
+    return isCompoundCondition(b) ? IR.WhenBranch(IR.Expression[booleanizedCondition(b.triggers[1], known, define)], false, false, b.body) : b
   end
   for eq in partition.equations
     eq isa IR.WHEN_EQUATION || continue
@@ -101,6 +94,17 @@ function booleanizeWhenConditions!(variables::IR.VariableSet, partition::IR.Part
     eq.branches = IR.WhenBranch[rewriteBranch(b) for b in eq.branches]
   end
   return nothing
+end
+
+"""
+The compound when-condition `e` (`booleanizeWhenConditions!`) with each relation of a continuous operand outside pre(),
+edge() and change() replaced by the Boolean `define` defines for it; through and, or, not.
+"""
+function booleanizedCondition(e::IR.Expression, known::Set{Symbol}, define::Function)::IR.Expression
+  e isa IR.LBINARY && return IR.LBINARY(booleanizedCondition(e.exp1, known, define), e.op, booleanizedCondition(e.exp2, known, define))
+  e isa IR.LUNARY && return IR.LUNARY(e.op, booleanizedCondition(e.exp, known, define))
+  (e isa IR.RELATION && hasContinuousOperand(e, known) && !callsAnyOf(e, (:pre, :edge, :change))) && return define(e)
+  return e
 end
 
 "A when-branch whose condition is a vector `{c1, c2, ...}` (`initial()` and `terminal()` count)."
@@ -243,13 +247,20 @@ end
 (Buildings' plotters: `sampleTrigger = active and sample(t0, samplePeriod)`).
 """
 function isSampleTrigger(@nospecialize(e::IR.Expression))::Bool
-  local conjuncts = IR.Expression[]
-  local collect!
-  collect! = (@nospecialize(x::IR.Expression)) ->
-               (x isa IR.LBINARY && x.op === IR.AND) ? (collect!(x.exp1); collect!(x.exp2)) : push!(conjuncts, x)
-  collect!(e)
+  local conjuncts::Vector{IR.Expression} = andOperands!(IR.Expression[], e)
   local isSample = x -> IR.isBuiltinCall(x, :sample)
   return count(isSample, conjuncts) == 1 && !any(c -> !isSample(c) && callsAnyOf(c, (:sample,)), conjuncts)
+end
+
+"The operands of the conjunction `e` (`a and b and c`: a, b, c; another expression: itself), pushed onto `out`."
+function andOperands!(out::Vector{IR.Expression}, @nospecialize(e::IR.Expression))::Vector{IR.Expression}
+  if e isa IR.LBINARY && e.op === IR.AND
+    andOperands!(out, e.exp1)
+    andOperands!(out, e.exp2)
+  else
+    push!(out, e)
+  end
+  return out
 end
 
 "Per name, how many equations other than when-equations mention it."
@@ -269,7 +280,7 @@ function startValues(variables::IR.VariableSet)::Dict{Symbol, IR.Expression}
   local out = Dict{Symbol, IR.Expression}()
   for v in variables
     v.attributes.start === nothing && continue
-    IR.elementType(v.ty) isa Union{IR.T_BOOLEAN, IR.T_INTEGER, IR.T_REAL, IR.T_ENUMERATION} || continue
+    IR.elementType(v.ty) isa IR.ScalarType || continue
     out[v.name] = v.attributes.start
   end
   return out
@@ -416,26 +427,30 @@ end
 
 "The names of `restrict` referenced anywhere in `e` (`pre()` included), in order."
 function namesReferenced(@nospecialize(e::IR.Expression), restrict::Set{Symbol})::Vector{Symbol}
-  local out = Symbol[]
-  local visit
-  visit = (@nospecialize(x::IR.Expression)) -> begin
-    foreach(visit, IR.children(x))
-    x isa IR.CREF && x.cref.name in restrict && !(x.cref.name in out) && push!(out, x.cref.name)
+  return namesReferenced!(Symbol[], e, restrict)
+end
+
+"`namesReferenced` onto `out`: the subexpressions' names first."
+function namesReferenced!(out::Vector{Symbol}, @nospecialize(x::IR.Expression), restrict::Set{Symbol})::Vector{Symbol}
+  for c::IR.Expression in IR.children(x)
+    namesReferenced!(out, c, restrict)
   end
-  visit(e)
+  x isa IR.CREF && x.cref.name in restrict && !(x.cref.name in out) && push!(out, x.cref.name)
   return out
 end
 
 "The names of `restrict` referenced outside any `pre()`: the topological order's edges."
 function namesReferencedOutsidePre(@nospecialize(e::IR.Expression), restrict::Set{Symbol})::Vector{Symbol}
-  local out = Symbol[]
-  local visit
-  visit = (@nospecialize(x::IR.Expression)) -> begin
-    IR.isBuiltinCall(x, :pre) && return
-    x isa IR.CREF && x.cref.name in restrict && !(x.cref.name in out) && push!(out, x.cref.name)
-    foreach(visit, IR.children(x))
+  return namesReferencedOutsidePre!(Symbol[], e, restrict)
+end
+
+"`namesReferencedOutsidePre` onto `out`: a reference before its subexpressions' names."
+function namesReferencedOutsidePre!(out::Vector{Symbol}, @nospecialize(x::IR.Expression), restrict::Set{Symbol})::Vector{Symbol}
+  IR.isBuiltinCall(x, :pre) && return out
+  x isa IR.CREF && x.cref.name in restrict && !(x.cref.name in out) && push!(out, x.cref.name)
+  for c::IR.Expression in IR.children(x)
+    namesReferencedOutsidePre!(out, c, restrict)
   end
-  visit(e)
   return out
 end
 
@@ -505,16 +520,22 @@ end
 
 "The variables a body reads through `pre()`, `edge()` or `change()`, once each."
 function preReads(body::Vector{Tuple{IR.CREF, IR.Expression, IR.Source}})::Vector{IR.CREF}
-  local found = IR.CREF[]
-  local visit
-  visit = (@nospecialize(x::IR.Expression)) -> begin
-    foreach(visit, IR.children(x))
-    if isBuiltinCallOf(x, (:pre, :edge, :change)) && x.arguments[1] isa IR.CREF
-      local a = x.arguments[1]
-      any(f -> f.cref.name === a.cref.name, found) || push!(found, a)
-    end
+  local found::Vector{IR.CREF} = IR.CREF[]
+  for b in body
+    preReads!(found, b[2])
   end
-  foreach(b -> visit(b[2]), body)
+  return found
+end
+
+"The references `x` reads by pre(), edge() or change() onto `found`, each once by name: the subexpressions' first."
+function preReads!(found::Vector{IR.CREF}, @nospecialize(x::IR.Expression))::Vector{IR.CREF}
+  for c::IR.Expression in IR.children(x)
+    preReads!(found, c)
+  end
+  if isBuiltinCallOf(x, (:pre, :edge, :change)) && x.arguments[1] isa IR.CREF
+    local a::IR.CREF = x.arguments[1]
+    any(f -> f.cref.name === a.cref.name, found) || push!(found, a)
+  end
   return found
 end
 
@@ -540,19 +561,23 @@ end
 function refsOutsidePreIndex(equations::AbstractVector{IR.Equation}, canon::F)::Dict{Symbol, Vector{Set{Symbol}}} where {F}
   local index = Dict{Symbol, Vector{Set{Symbol}}}()
   for eq in equations
-    local refs = Set{Symbol}()
-    local visit
-    visit = (@nospecialize(x::IR.Expression)) -> begin
-      IR.isBuiltinCall(x, :pre) && return
-      x isa IR.CREF && push!(refs, canon(x.cref.name))
-      foreach(visit, IR.children(x))
-    end
-    IR.foreachRootExp(visit, eq)
+    local refs::Set{Symbol} = Set{Symbol}()
+    IR.foreachRootExp((@nospecialize(x::IR.Expression)) -> canonicalRefsOutsidePre!(refs, x, canon), eq)
     for r in refs
       push!(get!(index, r, Set{Symbol}[]), refs)
     end
   end
   return index
+end
+
+"The names `x` reads outside pre(), each mapped by `canon`, into `refs` (`refsOutsidePreIndex`)."
+function canonicalRefsOutsidePre!(refs::Set{Symbol}, @nospecialize(x::IR.Expression), canon::F)::Nothing where {F}
+  IR.isBuiltinCall(x, :pre) && return nothing
+  x isa IR.CREF && push!(refs, canon(x.cref.name))
+  for c::IR.Expression in IR.children(x)
+    canonicalRefsOutsidePre!(refs, c, canon)
+  end
+  return nothing
 end
 
 "`change(c1) or change(c2) or ...` over the relations."

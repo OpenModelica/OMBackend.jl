@@ -134,14 +134,14 @@ function withHeldDiscretes(callbacks, problem, names::Vector{String}, integralNa
   local held::Vector{Int} = Int[k for k in indexin(Symbol.(names), states) if k !== nothing]
   isempty(held) && return callbacks
   local idx::Vector{Int} = Int[k for k in indexin(Symbol.(integralNames), states) if k !== nothing]
-  local drifted = (u, t, integrator) -> any(k -> u[k] != round(u[k]), idx)
+  local drifted = (u, _, _) -> any(k -> u[k] != round(u[k]), idx)
   local round! = function (integrator)
     for k::Int in idx
       integrator.u[k] = round(integrator.u[k])
     end
     return nothing
   end
-  local register! = (c, u, t, integrator) -> holdDiscretes!(integrator, held)
+  local register! = (_, _, _, integrator) -> holdDiscretes!(integrator, held)
   local cb = DiffEqBase.DiscreteCallback(drifted, round!; initialize = register!, save_positions = (false, false),
                                          initializealg = ModelingToolkit.SciMLBase.NoInit())
   return _joinCallbacks(cb, callbacks)

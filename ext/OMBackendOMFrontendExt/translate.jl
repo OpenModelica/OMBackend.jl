@@ -65,7 +65,7 @@ function translate(fm::F.FLAT_MODEL;
                    mode::OMBackend.BackendMode = DEFAULT_BACKEND_MODE[],
                    scalarize::Bool = true,
                    warnMissingStartValues::Union{Nothing, Bool} = nothing,
-                   eliminateNonDynamic::Union{Nothing, Bool, SimCode.EliminationOptions} = nothing,
+                   eliminateNonDynamic::SimCode.EliminationSetting = nothing,
                    observedFilter::Union{Nothing, Vector{String}, Vector{Regex}} = nothing,
                    checkSimCode::Bool = true,
                    BackendMode::Union{Nothing, OMBackend.BackendMode} = nothing,
@@ -85,7 +85,7 @@ function _translateScalar(fm::F.FLAT_MODEL, omjlir::Union{Nothing, OMJLIR.Model}
                           functionList::Union{Nothing, FunctionList},
                           mode::OMBackend.BackendMode,
                           warnMissingStartValues::Union{Nothing, Bool},
-                          eliminateNonDynamic::Union{Nothing, Bool, SimCode.EliminationOptions},
+                          eliminateNonDynamic::SimCode.EliminationSetting,
                           observedFilter::Union{Nothing, Vector{String}, Vector{Regex}},
                           checkSimCode::Bool)::Tuple{String, Expr}
   local previousWarnSetting::Bool = WARN_MISSING_START_VALUES[]
@@ -143,7 +143,7 @@ function _translateArraysKept(fm::F.FLAT_MODEL;
                               functionList::Union{Nothing, FunctionList},
                               mode::OMBackend.BackendMode,
                               warnMissingStartValues::Union{Nothing, Bool},
-                              eliminateNonDynamic::Union{Nothing, Bool, SimCode.EliminationOptions},
+                              eliminateNonDynamic::SimCode.EliminationSetting,
                               observedFilter::Union{Nothing, Vector{String}, Vector{Regex}},
                               checkSimCode::Bool)::Union{Nothing, Tuple{String, Expr}}
   local name::String = canonicalName(fm.name)
@@ -152,7 +152,7 @@ function _translateArraysKept(fm::F.FLAT_MODEL;
   delete!(BACKEND_SCALARIZED_MODELS, name)
   local options::TranslateOptions = (; functionList, mode, warnMissingStartValues, eliminateNonDynamic, observedFilter,
                                      checkSimCode)
-  local result::Union{Nothing, Tuple{String, Expr}} = nothing
+  local result::Union{Nothing, Tuple{String, Expr}}
   local reduced::Union{Nothing, OMJLIR.Model} =
     @BACKEND_PERFLOG "[backendAPI] reducedArrayModel" reducedArrayModel(fm; functionList)
   if reduced !== nothing
@@ -185,11 +185,11 @@ function _translateKept(fm::F.FLAT_MODEL, model::OMJLIR.Model, path::String, sub
                         functionList::Union{Nothing, FunctionList},
                         mode::OMBackend.BackendMode,
                         warnMissingStartValues::Union{Nothing, Bool},
-                        eliminateNonDynamic::Union{Nothing, Bool, SimCode.EliminationOptions},
+                        eliminateNonDynamic::SimCode.EliminationSetting,
                         observedFilter::Union{Nothing, Vector{String}, Vector{Regex}},
                         checkSimCode::Bool)::Union{Nothing, Tuple{String, Expr}}
   local name::String = canonicalName(fm.name)
-  local reason::String = ""
+  local reason::String
   try
     local result::Tuple{String, Expr} =
       _translateScalar(fm, model; functionList, mode, warnMissingStartValues, eliminateNonDynamic, observedFilter,

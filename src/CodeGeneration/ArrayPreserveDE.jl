@@ -1187,8 +1187,8 @@ function SII.observed(sys::ArraySystem, x)
     #= the binding read in the latest world too: the module is newer than the caller =#
     return (u, p, t) -> (Base.@invokelatest model.algebraics(u, p, t))[i]
   end
-  kind == :param && return (u, p, t) -> p.values[i]
-  return (u, p, t) -> begin
+  kind == :param && return (_, p, _) -> p.values[i]
+  return (_, p, t) -> begin
     local times = first.(p.dlog)
     isempty(times) ? NaN : p.dlog[_dlogIndex(times, t, p.tend[1])][2][i]
   end
@@ -2113,24 +2113,48 @@ function _functionDefinitions(mfs::Vector{SimCode.ModelicaFunction})
     ns("the model's functions: " * first(sprint(showerror, err), 160))
   end
   for (mf, ex, nm) in zip(mfs, exprs, names)
-    local impl = nothing
-    local find = function (x)
-      x isa Expr || return
-      #= MODELICA_FUNCTION_IMPLS[:name] = impl (FUNCTION_DERIVATIVE_RULES[:name] = (derivative,
-         inputs) is one too: the rule became the function, "Tuple not callable") =#
-      if x.head == :(=) && x.args[1] isa Expr && x.args[1].head == :ref && x.args[1].args[end] == QuoteNode(Symbol(nm)) &&
-         endswith(string(x.args[1].args[1]), "MODELICA_FUNCTION_IMPLS")
-        impl = x.args[2]
-      else
-        foreach(find, x.args)
-      end
-    end
-    find(ex)
+    local impl = _functionImplOf(ex, nm)
     impl === nothing && ns("the code of function $(nm)")
     push!(defs, :(const $(Symbol(nm)) = $impl))
     outs[nm] = length(mf.outputs)
   end
   return (defs, outs)
+end
+
+"""
+The implementation of the function `nm` in its generated code `x` (`_functionDefinitions`): the right side of the last
+`MODELICA_FUNCTION_IMPLS[:nm] = impl`; `nothing` if there is none.
+"""
+function _functionImplOf(@nospecialize(x), nm::String)
+  x isa Expr || return nothing
+  #= MODELICA_FUNCTION_IMPLS[:name] = impl (FUNCTION_DERIVATIVE_RULES[:name] = (derivative,
+     inputs) is one too: the rule became the function, "Tuple not callable") =#
+  if x.head == :(=) && x.args[1] isa Expr && x.args[1].head == :ref && x.args[1].args[end] == QuoteNode(Symbol(nm)) &&
+     endswith(string(x.args[1].args[1]), "MODELICA_FUNCTION_IMPLS")
+    return x.args[2]
+  end
+  local impl = nothing
+  for a in x.args
+    local found = _functionImplOf(a, nm)
+    found === nothing || (impl = found)
+  end
+  return impl
+end
+
+"The sample() calls of `x` into `samples`, by their number (the call's third argument)."
+function _collectSamples!(samples::Dict{Int, Op}, x::IR)::Nothing
+  if x isa Op
+    x.op == :sample && (samples[x.args[3].v] = x)
+    for a::IR in x.args
+      _collectSamples!(samples, a)
+    end
+  elseif x isa Rel
+    _collectSamples!(samples, x.lhs)
+    _collectSamples!(samples, x.rhs)
+  elseif x isa EvFn
+    _collectSamples!(samples, x.arg)
+  end
+  return nothing
 end
 
 """
@@ -2156,12 +2180,11 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
      parameter computed at the start =#
   local startsAtEachStart::Bool = placeholderStarts ||
     any(r::Tuple{Symbol, Int, IR} -> _readsParameterOf(r[3], g.startComputed), startRules)
-  local (el::InstanceTable, nU::Int, matchRow::Vector{Int}) = (schedule.elements, schedule.nUnknowns, schedule.matchRow)
+  local (el::InstanceTable, matchRow::Vector{Int}) = (schedule.elements, schedule.matchRow)
   local (batches::Vector{Tuple{Tuple{Int, Int}, Vector{Int}}}, pos::Vector{Int}, producer::Vector{Int}, loops::LoopBlocks) =
     (schedule.batches, schedule.pos, schedule.producer, schedule.loops)
-  local (hasArrays::Bool, large::BitVector) = (schedule.hasArrays, schedule.large)
-  local (deps::Union{Nothing, Vector{Vector{Int}}}, pattern::Union{Nothing, Tuple{Vector{Int}, Vector{Int}}}) =
-    (schedule.deps, schedule.pattern)
+  local large::BitVector = schedule.large
+  local pattern::Union{Nothing, Tuple{Vector{Int}, Vector{Int}}} = schedule.pattern
   local solutions::Dict{Tuple{Int, Int}, Union{Nothing, Tuple{Ref, IR}}} = schedule.solutions
   local (needed::BitVector, relNeeded::BitVector, invariant::BitVector) = (schedule.needed, schedule.relNeeded, schedule.invariant)
   local functionAsserts::Bool = _containsErrorCall(functionDefs)
@@ -2450,13 +2473,7 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
     g.sampleBase = length(sampleSchedule); g.sampleCount = w.nsample
     if w.nsample > 0
       local samples = Dict{Int, Op}()
-      local collect! = function (x)
-        x isa Op && x.op == :sample && (samples[x.args[3].v] = x)
-        x isa Op && foreach(collect!, x.args)
-        x isa Rel && (collect!(x.lhs); collect!(x.rhs))
-        x isa EvFn && collect!(x.arg)
-      end
-      collect!(w.cond)
+      _collectSamples!(samples, w.cond)
       for j in 1:size(w.domain, 2), id in 1:w.nsample
         local sx = samples[id]
         (_parametersOnly(g, sx.args[1]) && _parametersOnly(g, sx.args[2])) ||
@@ -2546,14 +2563,8 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
   for (ci, c) in enumerate(g.classes)
     c.nsample > 0 || continue
     local samples::Dict{Int, Op} = Dict{Int, Op}()
-    local collect!::Function = function (x)
-      x isa Op && x.op == :sample && (samples[x.args[3].v] = x)
-      x isa Op && foreach(collect!, x.args)
-      x isa Rel && (collect!(x.lhs); collect!(x.rhs))
-      x isa EvFn && collect!(x.arg)
-      return nothing
-    end
-    collect!(c.lhs); collect!(c.rhs)
+    _collectSamples!(samples, c.lhs)
+    _collectSamples!(samples, c.rhs)
     for j in 1:size(c.domain, 2), id in 1:c.nsample
       local sx::Op = samples[id]
       (_parametersOnly(g, sx.args[1]) && _parametersOnly(g, sx.args[2])) ||
@@ -2680,7 +2691,7 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
     nm in g.structural && ns("parameter $(nm) with fixed = false used structurally")
     haskey(layoutOf, nm) || continue
   end
-  for (sym, deps, _) in rules
+  for (_, deps, _) in rules
     any(d -> d in Symbol[g.paramSyms[f] for f in g.freeParams if haskey(g.paramSyms, f)], deps) &&
       ns("a parameter binding depends on a parameter with fixed = false")
   end
@@ -2884,9 +2895,6 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
     #= discrete variables equations compute (unknowns kept in the discrete buffer, set by the event iteration) =#
     const N_DISCRETE_UNKNOWNS = $(length(g.discUnknown))
 
-    #= The parameter values with `overrides` (Modelica names of parameters or of their
-       elements => values) applied; parameters whose bindings read a changed one are
-       computed again. =#
     #= The parameter values (PARAMETER_VALUES) with `overrides` (Modelica names of parameters or of their elements => values),
        in the rules' dependency order:
        - one overridden whole takes the given value; an element override is set after its parameter's rule, when that
@@ -3658,7 +3666,7 @@ function _literalChanges!(@nospecialize(equations!::Function), @nospecialize(whe
   p.rel .= rel0
   p.d .= d0
   p.hyst[1] = 0.0
-  local changed::Vector{Int} = Int[]
+  local changed::Vector{Int}
   try
     equations!(du, a, u, p, t, NO_CROSSINGS, true, fire)
     whens!(du, a, u, p, t, NO_CROSSINGS, true, fire)

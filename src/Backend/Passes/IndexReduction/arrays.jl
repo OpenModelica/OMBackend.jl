@@ -744,10 +744,9 @@ NotHandled for an array value of other dimensions.
 function elementValue(@nospecialize(a::IR.Expression), v::IR.Variable, E::Elements)::ElementValue
   local sizes = E.sizes[v.name]
   local ty = IR.typeOf(a)
-  local lead::Int = length(sizes)
+  local dims::Vector{Int} = ty isa IR.T_ARRAY ? Int[something(IR.dimensionSize(d), -1) for d in IR.dimensions(ty)] : Int[]
+  local lead::Int = length(sizes) - length(dims)
   if ty isa IR.T_ARRAY
-    local dims = Int[something(IR.dimensionSize(d), -1) for d in IR.dimensions(ty)]
-    lead -= length(dims)
     (lead >= 0 && all(k -> dims[k] == -1 || dims[k] == sizes[lead + k], eachindex(dims))) ||
       throw(NotHandled("an attribute of $(v.name) of dimensions $(dims), the variable's $(sizes)"))
   end
@@ -899,7 +898,7 @@ function scalarVariables(variables::IR.VariableSet, E::Elements)::IR.VariableSet
     local element = IR.elementType(v.ty)
     #= external objects (a table of each of an array of components: the array code makes one per element,
        `_objectElementRead`); clocks: variables of the scalar passes only (the array form has no element of them) =#
-    element isa Union{IR.T_REAL, IR.T_INTEGER, IR.T_BOOLEAN, IR.T_ENUMERATION, IR.T_STRING} ||
+    element isa Union{IR.ScalarType, IR.T_STRING} ||
       element isa IR.T_EXTERNAL_OBJECT || (E.passesFollow && element isa IR.T_CLOCK) ||
       throw(NotHandled("the array $(v.name) of $(element) elements"))
     local (binding, start, fixed, nominal, low, high) =
@@ -1623,7 +1622,7 @@ function recordElementEquations(eq::IR.ARRAY_EQUATION, variables::IR.VariableSet
   return out
 end
 
-rolledEquation(eq::IR.Equation, ::IR.VariableSet, used::Int = 0)::IR.Equation = eq
+rolledEquation(eq::IR.Equation, ::IR.VariableSet, ::Int = 0)::IR.Equation = eq
 
 """
 The array equations in the body of a for-equation rolled likewise (`for \$i1 loop {a[\$i1], b[\$i1]} = c[\$i1].w`,
@@ -1785,7 +1784,7 @@ readsContinuousArray(e::IR.Expression, variables::IR.VariableSet)::Bool =
   IR.anyExp(x -> x isa IR.CREF && isContinuousArray(get(variables, unsubscriptedName(x.cref), nothing)), e)
 
 isContinuousArray(::Nothing)::Bool = false
-isContinuousArray(v::IR.Variable)::Bool = v.ty isa IR.T_ARRAY && v.kind isa Union{IR.STATE, IR.STATE_DER, IR.ALGEBRAIC, IR.ALGEBRAIC_DER}
+isContinuousArray(v::IR.Variable)::Bool = v.ty isa IR.T_ARRAY && v.kind isa IR.ContinuousKind
 
 """
     elementAt(e, subscripts, element, variables) -> Expression

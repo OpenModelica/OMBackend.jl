@@ -289,7 +289,7 @@ function substituteAliases!(model::IR.Model, partition::IR.Partition)::AliasUndo
   local discretes = discreteTargets(partition)
   local isCandidate = name::Symbol -> begin
     local v = get(variables, name, nothing)
-    v !== nothing && v.ty isa IR.T_REAL && v.kind isa Union{IR.STATE, IR.ALGEBRAIC, IR.ALGEBRAIC_DER} && !(name in discretes) &&
+    v !== nothing && v.ty isa IR.T_REAL && v.kind isa IR.StateOrAlgebraic && !(name in discretes) &&
       v.direction !== IR.INPUT
   end
   local isConstant = (e::IR.Expression) -> begin
@@ -371,15 +371,8 @@ function substituteAliases!(model::IR.Model, partition::IR.Partition)::AliasUndo
                          count(n -> !haskey(antiderivative, n), keys(replacements)), changedAttributes)
   isempty(replacements) && return undo
   local substitute = (@nospecialize(e::IR.Expression)) -> (e isa IR.CREF ? get(replacements, e.cref.name, e) : e)
-  local reads = (eq::IR.Equation) -> begin
-    local found = false
-    IR.foreachRootExp(eq) do @nospecialize(e::IR.Expression)
-      found || (found = IR.anyExp((@nospecialize(x::IR.Expression)) ->
-                                    x isa IR.CREF && haskey(replacements, x.cref.name), e))
-      nothing
-    end
-    found
-  end
+  local reads = (eq::IR.Equation) ->
+    IR.anyExp((@nospecialize(x::IR.Expression)) -> x isa IR.CREF && haskey(replacements, x.cref.name), eq)
   local rewrite = (@nospecialize(eq::IR.Equation)) ->
     (eq in definitions || eq isa Union{IR.WHEN_EQUATION, IR.ASSERT_EQUATION} || !reads(eq)) ? eq : IR.mapEquation!(substitute, deepcopy(eq))
   partition.equations = IR.Equation[rewrite(eq) for eq in partition.equations]

@@ -541,7 +541,7 @@ function relationWhenCallback(names::Vector{String}, eval, strict::Bool, body!)
      kept for the same system (they were built again at every solve: one
      generated function per name, per when, as OMSurrogates solves a build
      over and over). =#
-  local initialize = function (c, u, t, integrator)
+  local initialize = function (_, _, _, integrator)
     a.located = false
     local sys = hasproperty(integrator.f, :sys) ? integrator.f.sys : nothing
     if a.sys === sys && a.fns !== nothing
@@ -634,7 +634,7 @@ function whenTrace(tag::String, t::Real, @nospecialize(value))::Nothing
   return nothing
 end
 
-const _NO_WHEN_INITIALIZE = (u, t, integrator) -> nothing
+const _NO_WHEN_INITIALIZE = (_, _, _) -> nothing
 
 """
     discreteWhenCallback(condition, affect!, initialize! = _NO_WHEN_INITIALIZE; reads, writes) -> DiscreteCallback
@@ -667,7 +667,7 @@ end
 struct _WhenInitialize
   when::DiscreteWhenAffect
 end
-function (w::_WhenInitialize)(c, u, t, integrator)::Nothing
+function (w::_WhenInitialize)(_, u, t, integrator)::Nothing
   w.when.initialize!(u, t, integrator)
   SciMLBase.derivative_discontinuity!(integrator, false)
   return nothing
@@ -783,7 +783,7 @@ function _sweep!(e::EventIteration, integrator, firstSweep::Bool)
   local moves::Int = 0
   local evaluatedAt::Vector{Int} = zeros(Int, length(e.clusters))
   local wrote::Vector{Bool} = fill(false, length(e.clusters))
-  for pass in 1:e.limit
+  for _ in 1:e.limit
     local stale::Bool = false       # the algebraic unknowns, for a coupled cluster or a discrete when next
     local whenStale::Bool = false   # the same after a discrete when, for a coupled cluster next
     local fired::Bool = false
@@ -952,7 +952,7 @@ Steps of at most this many ulps of t are degenerate (`_restartStepSize!`).
 """
 const _DEGENERATE_STEP_ULPS = 8
 
-_restartStepSize!(integrator, stall::Base.RefValue{Tuple{Float64, Int}}) = nothing
+_restartStepSize!(_, ::Base.RefValue{Tuple{Float64, Int}}) = nothing
 
 """
     _restartStepSize!(integrator, stall)
@@ -1131,7 +1131,9 @@ function _initialize!(e::EventIteration, integrator)
     start[moved] = before[moved]
     _INSTANT_PRE[integrator].u = start
   end
-  foreach(d -> d.initialize!(start, integrator.t, integrator), e.discreteWhens)
+  for d in e.discreteWhens
+    d.initialize!(start, integrator.t, integrator)
+  end
   #= The initialization solved the discretes with pre() at the start values
      (`mode(start = Unknown, fixed = true)`); the iteration reads pre() from the
      initial values: the friction's `startBackward = pre(mode) == Stuck and sa <
@@ -1338,18 +1340,26 @@ function _sweepOrder(clusters::Vector{DiscreteCluster}, whens::Vector{DiscreteWh
   local group::Vector{Int} = _cycleGroups(before)
   local placed::Vector{Bool} = fill(false, n)
   local order::Vector{Int} = Int[]
-  local place!(g::Int)::Nothing = begin
-    local members::Vector{Int} = Int[k for k in 1:n if group[k] == g && !placed[k]]
-    isempty(members) && return nothing
-    foreach(k -> placed[k] = true, members)
-    for k in members, a in before[k]
-      group[a] == g || placed[a] || place!(group[a])
-    end
-    append!(order, items[members])
-    return nothing
+  for k in 1:n
+    _placeGroup!(order, placed, group, before, items, group[k])
   end
-  foreach(k -> place!(group[k]), 1:n)
   return order
+end
+
+"""
+The items of the group `g` (`group`: each item's) appended to `order` (`_sweepOrder`), after the groups of the items
+they run after (`before`); `placed` marks the items placed.
+"""
+function _placeGroup!(order::Vector{Int}, placed::Vector{Bool}, group::Vector{Int}, before::Vector{Vector{Int}},
+                      items::Vector{Int}, g::Int)::Nothing
+  local members::Vector{Int} = Int[k for k in eachindex(group) if group[k] == g && !placed[k]]
+  isempty(members) && return nothing
+  placed[members] .= true
+  for k in members, a in before[k]
+    group[a] == g || placed[a] || _placeGroup!(order, placed, group, before, items, group[a])
+  end
+  append!(order, items[members])
+  return nothing
 end
 
 """
@@ -1427,11 +1437,11 @@ function withRelationRefresh(callbacks, problem, hSym::Symbol, entries::Vector)
                            Ref((NaN, 0)), Ref((NaN, 0)))
   local pending = Ref(false)
   kept = Any[cb isa DiffEqBase.DiscreteCallback ? _markingPending(cb, pending) : cb for cb in kept]
-  local cb = DiffEqBase.DiscreteCallback((u, t, integrator) -> pending[] || _needsIteration(e, integrator),
+  local cb = DiffEqBase.DiscreteCallback((_, _, integrator) -> pending[] || _needsIteration(e, integrator),
                                          integrator -> (local p = pending[]; pending[] = false; _iterate!(e, integrator, p));
                                          #= A solve that ended in an exception can have left
                                             `pending` set: a spurious iteration in the next. =#
-                                         initialize = (c, u, t, integrator) -> (pending[] = false; _initialize!(e, integrator)),
+                                         initialize = (_, _, _, integrator) -> (pending[] = false; _initialize!(e, integrator)),
                                          #= The state after the iteration, at the event's time
                                             (the when callbacks saved the left limit). The
                                             iteration solves the algebraic variables itself. =#

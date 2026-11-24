@@ -38,7 +38,7 @@ This file contains utility macros used by the backend.
 =#
 
 using Dates
-using DataStructures: OrderedDict, OrderedSet
+using DataStructures: OrderedSet
 
 
 """
@@ -126,8 +126,6 @@ macro BACKEND_PERFLOG(label, expr)
     end
   end
 end
-
-const COMPONENT_SEPARATOR = "_"
 
 """
     canonicalName(name::AbstractString) -> String

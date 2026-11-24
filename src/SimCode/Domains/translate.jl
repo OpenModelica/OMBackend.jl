@@ -72,7 +72,7 @@ _isWarning(level::SC.Exp)::Bool = level isa SC.ENUM_LITERAL && endswith(String(l
 "The values of a constant of the simulation code (`SimCode.constantExp`), row-major."
 function _constantValues(e::SC.Exp)::Vector{Any}
   e isa SC.ARRAY_EXP && return Any[x for el in e.elements for x in _constantValues(el)]
-  e isa Union{SC.RCONST, SC.ICONST, SC.BCONST} && return Any[e.value]
+  e isa SC.NumberLiteral && return Any[e.value]
   ns("a value that is no constant: $(_str(e))")
 end
 
@@ -304,7 +304,7 @@ slot (`ctx`), references as element references, operations, calls (`_callIRx`), 
 `ctx` says none), subscripts and fields; NotSupported for what the array code does not take.
 """
 function toIR(g::Gen, e::SC.Exp, ctx::Ctx)::IR
-  if e isa Union{SC.ICONST, SC.RCONST, SC.BCONST, SC.SCONST}
+  if e isa SC.ValueLiteral
     return Lit(e.value)
   elseif e isa SC.ENUM_LITERAL
     return Lit(e.index)
@@ -724,7 +724,7 @@ end
 "The value of an array literal of literals (a vector, a matrix of rows of equal length); `nothing` for another."
 function _literalArray(e::SC.ARRAY_EXP)::Union{Nothing, Array}
   isempty(e.elements) && return nothing
-  all((x::SC.Exp) -> x isa Union{SC.ICONST, SC.RCONST, SC.BCONST}, e.elements) && return map((x::SC.Exp) -> x.value, e.elements)
+  all((x::SC.Exp) -> x isa SC.NumberLiteral, e.elements) && return map((x::SC.Exp) -> x.value, e.elements)
   all((x::SC.Exp) -> x isa SC.ARRAY_EXP, e.elements) || return nothing
   local rows::Vector{Union{Nothing, Array}} = Union{Nothing, Array}[_literalArray(x) for x in e.elements]
   all((r::Union{Nothing, Array}) -> r !== nothing && ndims(r) == 1 && length(r) == length(rows[1]), rows) || return nothing
@@ -1242,7 +1242,7 @@ function _expType(e::SC.Exp)::SC.SType
   e isa SC.RCONST && return SC.TYPE_REAL()
   e isa SC.SCONST && return SC.TYPE_STRING()
   e isa SC.DER && return SC.TYPE_REAL()
-  e isa Union{SC.RELATION, SC.LBINARY, SC.LUNARY} && return SC.TYPE_BOOL()
+  e isa SC.LogicalExp && return SC.TYPE_BOOL()
   e isa SC.UNARY && return _expType(e.exp)
   if e isa SC.ASUB
     local base::SC.SType = _expType(e.exp)
@@ -1590,8 +1590,8 @@ function _addEquation!(g::Gen, eq::SC.Equation, iterNames::Vector{String}, idom:
        `outPort[i].available = if i == 1 then active else outPort[i - 1].available and not outPort[i - 1].reset`):
        each instance its branch, the class split by the condition (as an if-equation's, `_addIfEquation!`). As one
        class the branch not taken was read at every instance: "subscript 0 out of 1:1" at i = 1 =#
-    local split::Union{Nothing, IteratorIf} = nIter == 0 ? nothing : _iteratorIf(g, eq.rhs, iters)
-    (split === nothing && nIter > 0) && (split = _iteratorIf(g, eq.lhs, iters))
+    local ofRhs::Union{Nothing, IteratorIf} = nIter == 0 ? nothing : _iteratorIf(g, eq.rhs, iters)
+    local split::Union{Nothing, IteratorIf} = (ofRhs === nothing && nIter > 0) ? _iteratorIf(g, eq.lhs, iters) : ofRhs
     if split !== nothing
       local taken::Vector{Int} = Int[j for j in 1:size(idom, 2) if _evalStatic(g, split[2], idom, j) == true]
       local others::Vector{Int} = setdiff(1:size(idom, 2), taken)
@@ -1991,8 +1991,8 @@ A tuple's target that is an array: a variable as a whole (`r`), or an array by i
 generators, "partial subscripts on uniformNoise1|uniformNoise2.state"). Nothing for a scalar or an element.
 """
 function _arrayTarget(g::Gen, e::SC.Exp, ctx::Ctx)::Union{Nothing, ArrayTarget}
-  local name::String = ""
-  local leading::Vector{IR} = IR[]
+  local name::String
+  local leading::Vector{IR}
   if e isa SC.EXP_CREF
     name = String(e.cref.sym)
     leading = IR[Lit(k) for k in e.cref.subs]
@@ -2498,14 +2498,7 @@ end
 function _startReadsAny(sv::SC.SIMVAR, names::Vector{String})::Bool
   local exps::Union{Nothing, Vector{SC.Exp}} = sv.attributes.startExps
   exps === nothing && return false
-  local hit::Bool = false
-  for x in exps
-    SC.foreachExp(x) do y::SC.Exp
-      (y isa SC.EXP_CREF && String(y.cref.sym) in names) && (hit = true)
-      nothing
-    end
-  end
-  return hit
+  return any((x::SC.Exp) -> SC.anyExp((y::SC.Exp) -> y isa SC.EXP_CREF && String(y.cref.sym) in names, x), exps)
 end
 
 "The subscripts of the elements of an array of dimensions `dims`, row-major (one empty tuple for a scalar)."

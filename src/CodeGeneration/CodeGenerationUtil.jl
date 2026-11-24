@@ -47,57 +47,12 @@ using LinearAlgebra
 import ...SimCode
 import ...OMBackend
 import ..AlgorithmicCodeGeneration
-import ...@BACKEND_LOGGING
 
 import Symbolics
-import Symbolics.RuntimeGeneratedFunctions
 import SymbolicUtils
 import OMRuntimeExternalC
 
 const SC = SimCode
-
-"""
-Return string containing the OSMC copyright stuff.
-"""
-function copyrightString()
-
-  strOut = string("#= /*
-* This file is part of OpenModelica.
-*
-* Copyright (c) 1998-2026, Open Source Modelica Consortium (OSMC),
-* c/o Linköpings universitet, Department of Computer and Information Science,
-* SE-58183 Linköping, Sweden.
-*
-* All rights reserved.
-*
-* THIS PROGRAM IS PROVIDED UNDER THE TERMS OF AGPL VERSION 3 LICENSE OR
-* THIS OSMC PUBLIC LICENSE (OSMC-PL) VERSION 1.8.
-* ANY USE, REPRODUCTION OR DISTRIBUTION OF THIS PROGRAM CONSTITUTES
-* RECIPIENT'S ACCEPTANCE OF THE OSMC PUBLIC LICENSE OR THE GNU AGPL
-* VERSION 3, ACCORDING TO RECIPIENTS CHOICE.
-*
-* The OpenModelica software and the OSMC (Open Source Modelica Consortium)
-* Public License (OSMC-PL) are obtained from OSMC, either from the above
-* address, from the URLs:
-* http://www.openmodelica.org or
-* https://github.com/OpenModelica/ or
-* http://www.ida.liu.se/projects/OpenModelica,
-* and in the OpenModelica distribution.
-*
-* GNU AGPL version 3 is obtained from:
-* https://www.gnu.org/licenses/licenses.html#GPL
-*
-* This program is distributed WITHOUT ANY WARRANTY; without
-* even the implied warranty of MERCHANTABILITY or FITNESS
-* FOR A PARTICULAR PURPOSE, EXCEPT AS EXPRESSLY SET FORTH
-* IN THE BY RECIPIENT SELECTED SUBSIDIARY LICENSE CONDITIONS OF OSMC-PL.
-*
-* See the full OSMC Public License conditions for more details.
-*
-=#")
-  return strOut
-end
-
 
 #= ==================================================================================== =#
 #= Zero-crossing functions                                                              =#
@@ -149,7 +104,7 @@ expression of them) its zero-crossing function, a Boolean value (a parameter, a 
 1 - 2b, -1 where true.
 """
 function _zeroCrossingOperand(e::SC.Exp)::SC.Exp
-  (e isa Union{SC.RELATION, SC.LBINARY, SC.LUNARY} || SC.isBuiltin(e, :change)) && return transformToZeroCrossingCondition(e)
+  (e isa SC.LogicalExp || SC.isBuiltin(e, :change)) && return transformToZeroCrossingCondition(e)
   return realBinary(SC.RCONST(1.0), SC.OP_SUB, realBinary(SC.RCONST(2.0), SC.OP_MUL, e))
 end
 
@@ -244,20 +199,6 @@ function builtinCallToJulia(e::SC.CALL, lower::F)::Expr where {F}
     return quote $(qualified)($(args...)) end
   end
   return quote $(e.name)($(args...)) end
-end
-
-"""
-  Get the name of the active model.
-  The default is the original model.
-"""
-function getActiveModel(simCode)
-  local activeModelName = simCode.activeModel
-  for sm in simCode.subModels
-    if sm.name == activeModelName
-      return sm
-    end
-  end
-  return activeModelName
 end
 
 "Whether `name` names a function of the model."
@@ -381,7 +322,7 @@ otherwise (a record constructor's NamedTuple).
   relation, an if-expression, a parameter: MSL Blocks' RSFlipFlop pre_u_start = not Qini).
 """
 function evalConstant(c::SC.Exp, simCode::SC.SIM_CODE)
-  c isa Union{SC.BCONST, SC.ICONST, SC.RCONST, SC.SCONST} && return c.value
+  c isa SC.ValueLiteral && return c.value
   c isa Union{SC.BINARY, SC.LBINARY, SC.UNARY, SC.CALL, SC.LUNARY, SC.RELATION, SC.IFEXP, SC.EXP_CREF} &&
     return OMBackend.CodeGeneration.evalExpression(c, simCode)
   OMBackend.unsupported("not a constant", c)
@@ -389,7 +330,7 @@ end
 
 "The value of a literal."
 function evalConstant(c::SC.Exp)
-  c isa Union{SC.BCONST, SC.ICONST, SC.RCONST, SC.SCONST} && return c.value
+  c isa SC.ValueLiteral && return c.value
   OMBackend.unsupported("not a constant", c)
 end
 
@@ -554,7 +495,7 @@ function writeEqsToFile(elems::Vector{Expr}, filename)
       eqStr = replace(eqStr, "Differential" => "der")
       println(buffer, eqStr)
     end
-  catch e
+  catch
     @error string("Failed writing the model to the file:",  filename)
     rethrow()
   end
@@ -641,22 +582,6 @@ function replaceVars(expr::Expr; kwargs...)
        map((x) -> replaceVars(x; kwargs...), expr.args)...)
 end
 replaceVars(x; kwargs...) = x
-
-
-"""
-  Utility function to check if a given expression contains a specific datatype.
-"""
-function exprContainsDatatype(ex, datatype)
-  if ex isa Symbol
-    return false
-  elseif ex isa datatype
-    return true
-  elseif ex isa Expr
-    return any(arg -> exprContainsDatatype(arg, datatype), ex.args)
-  else
-    return false
-  end
-end
 
 """
     flattenRecordCallArg(arg, simCode)
@@ -856,7 +781,7 @@ function relayFixedStarts(algebraicVariables::Vector{String}, aliases::Dict{Symb
   return out
 end
 
-_isLiteralBind(exp::SC.Exp)::Bool = exp isa Union{SC.RCONST, SC.ICONST, SC.BCONST, SC.SCONST, SC.ENUM_LITERAL}
+_isLiteralBind(exp::SC.Exp)::Bool = exp isa SC.ScalarLiteral
 
 #= ==================================================================================== =#
 #= The functions the model calls                                                        =#

@@ -716,15 +716,16 @@ function builtinValue(e::IR.CALL, run::Interpretation)::Union{Nothing, FlatValue
     return fromArray(arrays[1] * permutedims(arrays[2]))
   end
   if n === :symmetric && length(args) == 1 && arrays[1] !== nothing && ndims(arrays[1]) == 2 && size(arrays[1], 1) == size(arrays[1], 2)
-    local A = arrays[1]
-    return fromArray(Float64[i <= j ? A[i, j] : A[j, i] for i in axes(A, 1), j in axes(A, 2)])
+    #= own names (S, M): `if` opens no scope, and one `A` assigned in three branches was boxed by these closures =#
+    local S = arrays[1]
+    return fromArray(Float64[i <= j ? S[i, j] : S[j, i] for i in axes(S, 1), j in axes(S, 2)])
   end
   if n === :matrix && length(args) == 1
     scalars[1] === nothing || return fromArray(fill(scalars[1], 1, 1))
-    local A = arrays[1]
-    A === nothing && return nothing
-    ndims(A) == 1 && return fromArray(reshape(A, :, 1))
-    return (ndims(A) >= 2 && all(d -> size(A, d) == 1, 3:ndims(A))) ? fromArray(reshape(A, size(A, 1), size(A, 2))) : nothing
+    local M = arrays[1]
+    M === nothing && return nothing
+    ndims(M) == 1 && return fromArray(reshape(M, :, 1))
+    return (ndims(M) >= 2 && all(d -> size(M, d) == 1, 3:ndims(M))) ? fromArray(reshape(M, size(M, 1), size(M, 2))) : nothing
   end
   if n === :linspace && length(args) == 3 && all(x -> x !== nothing, scalars) && isinteger(scalars[3]) && scalars[3] >= 2
     return fromArray(collect(range(scalars[1], scalars[2]; length = Int(scalars[3]))))

@@ -58,7 +58,7 @@ const SCALAR_OPS = Dict{IR.Op, IR.Op}(
   IR.POW_EW => IR.POW, IR.POW_SCALAR_ARRAY => IR.POW, IR.POW_ARRAY_SCALAR => IR.POW)
 
 "A type of a scalar value (not an array, a record or an unknown type)."
-isScalarType(ty::IR.ModelicaType)::Bool = ty isa Union{IR.T_REAL, IR.T_INTEGER, IR.T_BOOLEAN, IR.T_ENUMERATION}
+isScalarType(ty::IR.ModelicaType)::Bool = ty isa IR.ScalarType
 
 """
     lowerAssignment(lhs, rhs, source)
@@ -107,7 +107,7 @@ end
 recordSize(ty::IR.T_RECORD)::Int = length(ty.fields)
 recordSize(ty::IR.T_ARRAY)::Int =
   recordSize(ty.elementType) * prod(something(IR.dimensionSize(d), 1) for d in ty.dimensions; init = 1)
-recordSize(ty::IR.ModelicaType)::Int = 1
+recordSize(::IR.ModelicaType)::Int = 1
 
 """
     whenBranch(condition, body; dropInitialDisjuncts = true)
@@ -256,16 +256,35 @@ const STATE_SELECTS = Dict("never" => IR.NEVER, "avoid" => IR.AVOID, "default" =
 
 "The variables `statements` assign, in the order of their first assignment."
 function assignedCrefs(statements::Vector{IR.Statement})::Vector{IR.ComponentRef}
-  local out = IR.ComponentRef[]
-  local seen = Set{Symbol}()
-  local visit(s::IR.ASSIGNMENT) = foreach(t -> (t isa IR.CREF && !(t.cref.name in seen)) && (push!(seen, t.cref.name); push!(out, t.cref)),
-                                         s.lhs isa IR.TUPLE ? s.lhs.elements : IR.Expression[s.lhs])
-  local visit(s::Union{IR.IF_STATEMENT, IR.WHEN_STATEMENT}) =
-    (foreach(b -> foreach(visit, b.body), s.branches); s isa IR.IF_STATEMENT && foreach(visit, s.elseBody))
-  local visit(s::Union{IR.FOR_STATEMENT, IR.WHILE_STATEMENT}) = foreach(visit, s.body)
-  local visit(s::IR.Statement) = nothing
-  foreach(visit, statements)
+  local out::Vector{IR.ComponentRef} = IR.ComponentRef[]
+  local seen::Set{Symbol} = Set{Symbol}()
+  for s::IR.Statement in statements
+    assignedCrefs!(out, seen, s)
+  end
   return out
+end
+
+"`assignedCrefs` of the statement `s` (its nested statements too) onto `out`, each name once (`seen`)."
+function assignedCrefs!(out::Vector{IR.ComponentRef}, seen::Set{Symbol}, s::IR.Statement)::Nothing
+  if s isa IR.ASSIGNMENT
+    for t in (s.lhs isa IR.TUPLE ? s.lhs.elements : IR.Expression[s.lhs])
+      (t isa IR.CREF && !(t.cref.name in seen)) && (push!(seen, t.cref.name); push!(out, t.cref))
+    end
+  elseif s isa Union{IR.IF_STATEMENT, IR.WHEN_STATEMENT}
+    for b in s.branches, x::IR.Statement in b.body
+      assignedCrefs!(out, seen, x)
+    end
+    if s isa IR.IF_STATEMENT
+      for x::IR.Statement in s.elseBody
+        assignedCrefs!(out, seen, x)
+      end
+    end
+  elseif s isa Union{IR.FOR_STATEMENT, IR.WHILE_STATEMENT}
+    for x::IR.Statement in s.body
+      assignedCrefs!(out, seen, x)
+    end
+  end
+  return nothing
 end
 
 """
@@ -334,7 +353,7 @@ function inlineDerivative(f::IR.ModelicaFunction, byName::Dict{Symbol, IR.Modeli
     return nothing
   local out = only(f.outputs)
   out.ty isa IR.T_REAL || return nothing
-  all(v -> v.ty isa Union{IR.T_REAL, IR.T_INTEGER, IR.T_BOOLEAN}, f.inputs) || return nothing
+  all(v -> v.ty isa IR.NumberType, f.inputs) || return nothing
   local stmt = only(f.body)
   (stmt isa IR.ASSIGNMENT && stmt.lhs isa IR.CREF && stmt.lhs.cref.name === out.name && stmt.rhs isa IR.CALL &&
    !stmt.rhs.attributes.builtin) || return nothing
@@ -355,7 +374,7 @@ function inlineDerivative(f::IR.ModelicaFunction, byName::Dict{Symbol, IR.Modeli
   local derArgs = IR.Expression[]
   for (i, a) in enumerate(call.arguments)
     local ty = g.inputs[i].ty
-    (i in gd.excludedInputs || ty isa Union{IR.T_INTEGER, IR.T_BOOLEAN, IR.T_ENUMERATION, IR.T_STRING}) && continue
+    (i in gd.excludedInputs || ty isa Union{IR.DiscreteType, IR.T_STRING}) && continue
     ty isa IR.T_REAL || return nothing
     local d = a isa IR.CREF ? get(derOf, a.cref.name, nothing) : a isa Union{IR.REAL, IR.INTEGER} ? IR.REAL(0.0) : nothing
     d === nothing && return nothing

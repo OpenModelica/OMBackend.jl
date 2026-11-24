@@ -50,7 +50,6 @@ using LinearAlgebra
 import ...SimCode
 import ...OMBackend
 import ..AlgorithmicCodeGeneration
-import ..CodeGenerationUtil
 using ..CodeGenerationUtil
 import ..CodeGeneration: lowerKnownSymbolicFunctionCall
 import ..MTKDump: dumpPreStructuralSimplifyExpr
@@ -58,7 +57,6 @@ import ..MTKDump: dumpPreStructuralSimplifyExpr
 import ...@BACKEND_LOGGING
 
 import Symbolics
-import Symbolics.RuntimeGeneratedFunctions
 import SymbolicUtils
 import OMRuntimeExternalC
 
@@ -108,7 +106,7 @@ state vector, and `!active` threw a MethodError (`when not active`, the StateGra
 """
 function _boolOperandMTK(e::SC.Exp, simCode::SC.SIM_CODE, cachedChange::Bool)
   local x = expToJuliaBoolMTK(e, simCode; cachedChange)
-  local isBool = e isa Union{SC.RELATION, SC.LBINARY, SC.LUNARY, SC.BCONST} ||
+  local isBool = e isa Union{SC.LogicalExp, SC.BCONST} ||
                  (e isa SC.CALL && e.kind === SC.CALL_BUILTIN && e.name in (:change, :edge, :initial, :terminal))
   return isBool ? x : :($x != 0)
 end
@@ -194,17 +192,16 @@ end
 
 "The relations of a condition that generate events (not inside noEvent)."
 function _eventRelations(cond::SC.Exp)::Vector{SC.RELATION}
-  local out = SC.RELATION[]
-  local visit = function (e::SC.Exp)
-    if SC.isBuiltin(e, :noEvent)
-      return
-    elseif e isa SC.RELATION
-      push!(out, e)
-      return
-    end
-    foreach(visit, SC.children(e))
+  return _eventRelations!(SC.RELATION[], cond)
+end
+
+"`_eventRelations` of `e` onto `out`: a relation's operands and noEvent() are not searched."
+function _eventRelations!(out::Vector{SC.RELATION}, e::SC.Exp)::Vector{SC.RELATION}
+  SC.isBuiltin(e, :noEvent) && return out
+  e isa SC.RELATION && return push!(out, e)
+  for c::SC.Exp in SC.children(e)
+    _eventRelations!(out, c)
   end
-  visit(cond)
   return out
 end
 
@@ -235,7 +232,7 @@ end
 A literal: a constant, its negation, an array of them.
 """
 function _isLiteralExp(e::SC.Exp)::Bool
-  e isa Union{SC.ICONST, SC.RCONST, SC.SCONST, SC.BCONST, SC.ENUM_LITERAL} && return true
+  e isa SC.ScalarLiteral && return true
   e isa SC.UNARY && return _isLiteralExp(e.exp)
   e isa SC.ARRAY_EXP && return all(_isLiteralExp, e.elements)
   return false
@@ -342,7 +339,7 @@ model's functions with its records' fields as arguments, of a built-in by its im
 """
 function expToJuliaExpMTK end
 
-expToJuliaExpMTK(e::Union{SC.BCONST, SC.ICONST, SC.RCONST, SC.SCONST}, ::SC.SIM_CODE)::Expr = quote $(e.value) end
+expToJuliaExpMTK(e::SC.ValueLiteral, ::SC.SIM_CODE)::Expr = quote $(e.value) end
 expToJuliaExpMTK(::SC.WILD, ::SC.SIM_CODE)::Expr = quote _ end
 "An enumeration literal is its index."
 expToJuliaExpMTK(e::SC.ENUM_LITERAL, ::SC.SIM_CODE)::Expr = quote $(e.index) end
@@ -880,7 +877,7 @@ end
 An expression of literals only (no variable, no call).
 """
 function _isConstantExp(e::SC.Exp)::Bool
-  e isa Union{SC.RCONST, SC.ICONST, SC.BCONST, SC.SCONST, SC.ENUM_LITERAL} && return true
+  e isa SC.ScalarLiteral && return true
   e isa SC.UNARY && return _isConstantExp(e.exp)
   e isa SC.BINARY && return _isConstantExp(e.exp1) && _isConstantExp(e.exp2)
   e isa SC.ARRAY_EXP && return all(_isConstantExp, e.elements)
@@ -1010,7 +1007,7 @@ elements', of a literal the literal, else the expression of the references' pre 
 """
 function _preExpr(arg::SC.Exp, simCode::SC.SIM_CODE)::Expr
   arg isa SC.ARRAY_EXP && return Expr(:vect, (_preExpr(x, simCode) for x in arg.elements)...)
-  arg isa Union{SC.RCONST, SC.ICONST, SC.BCONST} && return quote $(arg.value) end
+  arg isa SC.NumberLiteral && return quote $(arg.value) end
   local pre = SC.mapExp(x -> (x isa SC.EXP_CREF && x.cref.sym !== :time) ? SC.PRE(x.cref, x.ty) : x, arg)
   return expToJuliaExpMTK(pre, simCode)
 end
@@ -1504,7 +1501,7 @@ function evalCausalRHSAtT0(@nospecialize(rhsExpr), valMap::Dict{Symbol, Float64}
   end
 end
 
-_t0ContainsDer(@nospecialize(x)) = false
+_t0ContainsDer(@nospecialize(_x)) = false
 _t0ContainsDer(x::Expr) = (x.head == :call && !isempty(x.args) && x.args[1] in (:der, :D)) || any(_t0ContainsDer, x.args)
 
 """
@@ -1961,24 +1958,19 @@ function _ifConditionLiteral(condition::SC.Exp, simCode::SC.SIM_CODE)::Bool
     x isa SC.PRE || (x isa SC.CALL && x.kind === SC.CALL_BUILTIN && x.name in (:initial, :terminal, :sample, :edge, :change, :delay))
   end
   eventOperator && return false
-  local outside = OrderedSet{String}()
-  local visit = function (e::SC.Exp)
-    SC.isBuiltin(e, :noEvent) && return
-    e isa SC.EXP_CREF && push!(outside, SC.crefName(e.cref))
-    foreach(visit, SC.children(e))
-  end
-  visit(condition)
+  local outside::OrderedSet{String} = _crefNamesOutsideNoEvent!(OrderedSet{String}(), condition)
   local ht = simCode.stringToSimVarHT
   return all(n -> haskey(ht, n) && (last(ht[n]).varKind isa SC.DISCRETE || SC.isScalarParameter(last(ht[n]))), outside)
 end
 
-"""
-True when every non-else branch condition of an if-equation is discrete/parameter, so the
-residual gates directly on the boolean condition instead of emitting a continuous ifCond
-relay callback.
-"""
-function _allBranchConditionsDiscrete(branches::AbstractVector{<:SC.BRANCH}, simCode::SC.SIM_CODE)::Bool
-  return all(b -> b.targets == -1 || _ifConditionAllDiscreteOrParameter(b.condition, simCode), branches)
+"The names `e` reads outside noEvent() onto `out` (`_ifConditionLiteral`)."
+function _crefNamesOutsideNoEvent!(out::OrderedSet{String}, e::SC.Exp)::OrderedSet{String}
+  SC.isBuiltin(e, :noEvent) && return out
+  e isa SC.EXP_CREF && push!(out, SC.crefName(e.cref))
+  for c::SC.Exp in SC.children(e)
+    _crefNamesOutsideNoEvent!(out, c)
+  end
+  return out
 end
 
 """
@@ -2255,7 +2247,7 @@ end
 The variables an event's part reads, added to `out`: an equation's, an expression's, an imperative affect's observed
 and modified expressions; nothing for another part (no affect, a periodic discrete event's time).
 """
-_symbolicReads!(out::Vector{Any}, @nospecialize(x))::Nothing = nothing
+_symbolicReads!(::Vector{Any}, @nospecialize(_x))::Nothing = nothing
 _symbolicReads!(out::Vector{Any}, eq::Symbolics.Equation)::Nothing = (_symbolicReads!(out, eq.lhs); _symbolicReads!(out, eq.rhs))
 _symbolicReads!(out::Vector{Any}, x::Union{Symbolics.Num, SymbolicUtils.BasicSymbolic})::Nothing =
   (append!(out, Symbolics.get_variables(x)); nothing)

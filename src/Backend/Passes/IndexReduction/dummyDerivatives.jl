@@ -234,25 +234,9 @@ function partialDerivative(eq::IR.Equation, name::Symbol, functions::Dict{Symbol
   end
 end
 
-"""
-    jacobianEntry(eq, name, functions, values) -> Union{Nothing, Float64}
-
-`partialDerivative` at the start values; `nothing` where it does not evaluate (an if-equation,
-an unknown value).
-"""
-function jacobianEntry(eq::IR.Equation, name::Symbol, functions::Dict{Symbol, IR.ModelicaFunction}, values::StartValues)::Union{Nothing, Float64}
-  local d = partialDerivative(eq, name, functions)
-  return d === nothing ? nothing : evaluate(d, values)
-end
-
 "Whether `e` reads no continuous variable of `s` (nor `time`): a constant entry of a Jacobian."
 function isConstantEntry(e::IR.Expression, s::Structure)::Bool
-  local constant = true
-  IR.foreachExp(e) do x
-    (x isa IR.CREF && (x.cref.name === :time || haskey(s.index, x.cref.name))) && (constant = false)
-    nothing
-  end
-  return constant
+  return !IR.anyExp((x::IR.Expression) -> x isa IR.CREF && (x.cref.name === :time || haskey(s.index, x.cref.name)), e)
 end
 
 """
@@ -382,8 +366,10 @@ function numericChoice(s::Structure, rows::Vector{Int}, order::Vector{Int}, clas
   local groups = [(classes[order[j]], constant[j] && nonzero[j] ? 0 : 1) for j in eachindex(order)]
   local perm = sortperm(groups; alg = Base.Sort.MergeSort)
   local moved = invperm(perm)
-  (order, groups) = (order[perm], groups[perm])
-  local A = Elimination(length(rows), length(order))
+  #= `columns`, not `order` again: the comprehension above reads `order`, and a reassigned capture is boxed =#
+  local columns::Vector{Int} = order[perm]
+  groups = groups[perm]
+  local A = Elimination(length(rows), length(columns))
   local scale = 1.0
   for (i, j, x) in entries
     setEntry!(A, i, moved[j], x)
@@ -393,27 +379,27 @@ function numericChoice(s::Structure, rows::Vector{Int}, order::Vector{Int}, clas
   A.negligible = 1e-15 * scale
   local chosen = Int[]
   #= the columns already chosen elsewhere (at the start values) first, each by its largest entry =#
-  local at = Dict{Int, Int}(c => j for (j, c) in enumerate(order))
+  local at = Dict{Int, Int}(c => j for (j, c) in enumerate(columns))
   for c in forced
     local bj = get(at, c, 0)
     bj == 0 && return nothing
-    local (best, bi, _) = largestEntry(A, bj:bj, tolerance)
+    local (_, bi, _) = largestEntry(A, bj:bj, tolerance)
     bi == 0 && return nothing
     eliminate!(A, bi, bj)
-    push!(chosen, order[bj])
+    push!(chosen, columns[bj])
   end
   local j0 = 1
-  while length(chosen) < length(rows) && j0 <= length(order)
+  while length(chosen) < length(rows) && j0 <= length(columns)
     #= the columns of the next StateSelect class (its constant columns, then the others) =#
     local j1 = j0
-    while j1 < length(order) && groups[j1 + 1] == groups[j0]
+    while j1 < length(columns) && groups[j1 + 1] == groups[j0]
       j1 += 1
     end
     while length(chosen) < length(rows)
-      local (best, bi, bj) = largestEntry(A, j0:j1, tolerance)
+      local (_, bi, bj) = largestEntry(A, j0:j1, tolerance)
       bi == 0 && break
       eliminate!(A, bi, bj)
-      push!(chosen, order[bj])
+      push!(chosen, columns[bj])
     end
     j0 = j1 + 1
   end
@@ -577,12 +563,7 @@ end
 
 "Whether `e` reads the variable `name`."
 function readsVariable(e::IR.Expression, name::Symbol)::Bool
-  local found = false
-  IR.foreachExp(e) do x
-    (x isa IR.CREF && x.cref.name === name) && (found = true)
-    nothing
-  end
-  return found
+  return IR.anyExp((x::IR.Expression) -> x isa IR.CREF && x.cref.name === name, e)
 end
 
 """
@@ -592,30 +573,31 @@ The first columns in `order` that can be matched to the rows (a greedy choice in
 matroid: a column is taken where a matching of the rows to the taken columns grows).
 """
 function structuralChoice(s::Structure, rows::Vector{Int}, order::Vector{Int})::Vector{Int}
-  local rowIndex = Dict{Int, Int}(r => i for (i, r) in enumerate(rows))
   local columnRows = Dict{Int, Vector{Int}}(c => Int[] for c in order)
   for (i, r) in enumerate(rows), c in s.incidence[r]
     haskey(columnRows, c) && push!(columnRows[c], i)
   end
-  local rowMatch = zeros(Int, length(rows))     # row -> column taken
-  local chosen = Int[]
-  function augment(c::Int, seen::Set{Int})::Bool
-    for i in columnRows[c]
-      i in seen && continue
-      push!(seen, i)
-      if rowMatch[i] == 0 || augment(rowMatch[i], seen)
-        rowMatch[i] = c
-        return true
-      end
-    end
-    return false
-  end
+  local rowMatch::Vector{Int} = zeros(Int, length(rows))     # row -> column taken
+  local chosen::Vector{Int} = Int[]
   for c in order
     length(chosen) == length(rows) && break
-    augment(c, Set{Int}()) && push!(chosen, c)
+    _augmentChoice!(rowMatch, columnRows, c, Set{Int}()) && push!(chosen, c)
   end
   length(chosen) == length(rows) || throw(NotHandled("dummy derivatives: no regular choice of $(length(rows)) of $(length(order)) derivatives (a structural error)"))
   return chosen
+end
+
+"An augmenting path from the column `c` (`structuralChoice`'s matching, rows `seen` visited): `rowMatch` changed along it."
+function _augmentChoice!(rowMatch::Vector{Int}, columnRows::Dict{Int, Vector{Int}}, c::Int, seen::Set{Int})::Bool
+  for i in columnRows[c]
+    i in seen && continue
+    push!(seen, i)
+    if rowMatch[i] == 0 || _augmentChoice!(rowMatch, columnRows, rowMatch[i], seen)
+      rowMatch[i] = c
+      return true
+    end
+  end
+  return false
 end
 
 """
@@ -769,15 +751,11 @@ function linkSets(s::Structure, sets::Vector{DynamicSet}, root::Vector{Int})::Ve
   for b in sortperm([set.level for set in sets]; rev = true)
     linked[b] && continue
     local levels = Vector{Int}[]
-    local (level, candidates) = (sets[b].level, sets[b].candidates)
+    local level::Int = sets[b].level
+    local candidates::Vector{Int} = sets[b].candidates
     while true
-      local next = findfirst(eachindex(sets)) do a
-        local set = sets[a]
-        (!linked[a] && a != b && set.level == level - 1 && length(set.candidates) == length(candidates)) || return false
-        local roots = Set(root[s.antiderivative[c]] for c in set.candidates)
-        return length(roots) == length(set.candidates) && all(c -> root[c] in roots, candidates)
-      end
-      next === nothing && break
+      local next::Int = _derivativeSet(s, sets, root, linked, b, level, candidates)
+      next == 0 && break
       local set = sets[next]
       candidates = Int[set.candidates[findfirst(d -> root[s.antiderivative[d]] == root[c], set.candidates)] for c in candidates]
       push!(levels, candidates)
@@ -787,6 +765,22 @@ function linkSets(s::Structure, sets::Vector{DynamicSet}, root::Vector{Int})::Ve
     push!(bases, b => DynamicSet(sets[b].level, sets[b].candidates, sets[b].chosen, sets[b].jacobian, levels))
   end
   return DynamicSet[set for (b, set) in sort(bases; by = first) if !linked[b]]
+end
+
+"""
+The set of `sets` (`linkSets`) at `level - 1`, not `b` and not yet `linked`, whose candidates are the derivatives of
+`candidates` (one each, by their roots `root`); 0 for none. A function: in `linkSets`' loop, which reassigns `level`
+and `candidates`, a closure would box them.
+"""
+function _derivativeSet(s::Structure, sets::Vector{DynamicSet}, root::Vector{Int}, linked::BitVector, b::Int,
+                        level::Int, candidates::Vector{Int})::Int
+  for a::Int in eachindex(sets)
+    local set::DynamicSet = sets[a]
+    (!linked[a] && a != b && set.level == level - 1 && length(set.candidates) == length(candidates)) || continue
+    local roots::Set{Int} = Set{Int}(root[s.antiderivative[c]] for c in set.candidates)
+    (length(roots) == length(set.candidates) && all((c::Int) -> root[c] in roots, candidates)) && return a
+  end
+  return 0
 end
 
 "A block of the dummy derivatives' choice: its level, rows, candidates and the dummies chosen among them."

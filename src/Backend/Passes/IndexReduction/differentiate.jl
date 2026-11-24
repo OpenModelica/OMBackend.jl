@@ -119,7 +119,7 @@ function productOf(a::IR.Expression, op::IR.Op, b::IR.Expression, ty::IR.Modelic
 end
 
 "Whether `e` is of a type with no derivative (Integer, Boolean, String, an enumeration): piecewise constant."
-isPiecewiseConstant(e::IR.Expression)::Bool = IR.typeOf(e) isa Union{IR.T_INTEGER, IR.T_BOOLEAN, IR.T_STRING, IR.T_ENUMERATION}
+isPiecewiseConstant(e::IR.Expression)::Bool = IR.typeOf(e) isa Union{IR.DiscreteType, IR.T_STRING}
 
 """
     differentiate(e, seeds) -> Expression

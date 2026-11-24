@@ -63,15 +63,11 @@ Whether the equation `eq` reads one of the arrays `arrays` (by any subscripts, o
 that contains one (`containers`, `arrayContainers`: a record argument `G[\$c].frame.R` whose field `R.T` is split).
 """
 function readsArrays(eq::IR.Equation, arrays::Set{Symbol}, containers::Set{Symbol} = Set{Symbol}())::Bool
-  local found::Bool = false
-  IR.foreachExp(eq) do x::IR.Expression
-    found && return nothing
-    x isa IR.CREF || return nothing
+  return IR.anyExp(eq) do x::IR.Expression
+    x isa IR.CREF || return false
     local name::Symbol = IR.hasSubscripts(x.cref) ? unsubscriptedName(x.cref) : x.cref.name
-    (name in arrays || (x.ty isa Union{IR.T_RECORD, IR.T_ARRAY} && name in containers)) && (found = true)
-    nothing
+    return name in arrays || (x.ty isa Union{IR.T_RECORD, IR.T_ARRAY} && name in containers)
   end
-  return found
 end
 
 "The names that contain one of the arrays `arrays` (their prefixes up to a `.`: the records and components around them)."
@@ -245,8 +241,8 @@ function splitInner!(model::IR.Model, bases::Set{Symbol})::Nothing
   empty!(model.variables)
   foreach(v::IR.Variable -> push!(model.variables, v), out)
   local partition::IR.Partition = model.continuous[1]
-  partition.equations = IR.Equation[slicedEquation(eq, family, model.variables) for eq in partition.equations]
-  partition.initialEquations = IR.Equation[slicedEquation(eq, family, model.variables) for eq in partition.initialEquations]
+  partition.equations = IR.Equation[slicedEquation(eq, family) for eq in partition.equations]
+  partition.initialEquations = IR.Equation[slicedEquation(eq, family) for eq in partition.initialEquations]
   local unknowns::Vector{Symbol} = Symbol[]
   for u in partition.unknowns
     haskey(family, u) ? append!(unknowns, Symbol[sliceOf(u, t) for t in rowMajor(family[u])]) : push!(unknowns, u)
@@ -336,20 +332,20 @@ function slicedKind(kind::IR.VariableKind, family::Dict{Symbol, Vector{Int}}, t:
 end
 
 """
-    slicedEquation(eq, family, variables) -> IR.Equation
+    slicedEquation(eq, family) -> IR.Equation
 
 An equation reading the split arrays `family` by their slices (`slicedReference`); its for-equations whose iterators
 subscript an inner dimension unrolled first (`unrollIterators`).
 """
-function slicedEquation(@nospecialize(eq::IR.Equation), family::Dict{Symbol, Vector{Int}},
-                        variables::IR.VariableSet)::IR.Equation
+function slicedEquation(@nospecialize(eq::IR.Equation), family::Dict{Symbol, Vector{Int}})::IR.Equation
   local iterators::Set{Symbol} = Set{Symbol}()
-  local reads::Bool = false
+  #= a Ref: a flag the closure sets is boxed =#
+  local reads::Base.RefValue{Bool} = Base.RefValue{Bool}(false)
   IR.foreachExp(eq) do x::IR.Expression
     x isa IR.CREF || return nothing
     local name::Symbol = IR.hasSubscripts(x.cref) ? unsubscriptedName(x.cref) : x.cref.name
     haskey(family, name) || return nothing
-    reads = true
+    reads[] = true
     local subscripts::Vector{IR.Subscript} = allSubscripts(x.cref)
     for s in subscripts[min(2, end + 1):end]
       #= a literal index; a slice or the whole dimension (`slicedReference` writes them out) =#
@@ -359,7 +355,7 @@ function slicedEquation(@nospecialize(eq::IR.Equation), family::Dict{Symbol, Vec
     end
     nothing
   end
-  reads || return eq
+  reads[] || return eq
   local unrolled::Vector{IR.Equation} = isempty(iterators) ? IR.Equation[eq] : unrollIterators(eq, iterators)
   local mapped::Vector{IR.Equation} = IR.Equation[IR.mapEquation!(x::IR.Expression -> slicedReference(x, family), deepcopy(u)) for u in unrolled]
   length(mapped) == 1 && return mapped[1]
@@ -483,7 +479,10 @@ function splitArrays!(model::IR.Model, view::Scalarized, arrays::Vector{Symbol},
   local kept::Vector{IR.Variable} = IR.Variable[]
   for v in model.variables
     if v.name in split
-      foreach(n::Symbol -> push!(kept, view.model.variables[n]), E.elements[v.name])
+      #= a loop, not a closure: it would box the reassigned view =#
+      for n::Symbol in E.elements[v.name]
+        push!(kept, view.model.variables[n])
+      end
     else
       push!(kept, v)
     end

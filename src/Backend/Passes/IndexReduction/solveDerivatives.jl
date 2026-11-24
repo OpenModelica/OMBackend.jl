@@ -51,14 +51,11 @@ isDerivativeLink(eq::IR.Equation)::Bool = eq isa IR.SCALAR_EQUATION && eq.attrib
 
 "Whether `e` reads no unknown (only parameters, constants and literals; not `time`): a coefficient the code generators solve through."
 function readsNoUnknown(e::IR.Expression, variables::IR.VariableSet)::Bool
-  local known = true
-  IR.foreachExp(e) do x
-    x isa IR.CREF || return nothing
-    local v = get(variables, x.cref.name, nothing)
-    (v === nothing || !(v.kind isa Union{IR.PARAMETER, IR.CONSTANT})) && (known = false)
-    nothing
+  return !IR.anyExp(e) do x::IR.Expression
+    x isa IR.CREF || return false
+    local v::Union{Nothing, IR.Variable} = get(variables, x.cref.name, nothing)
+    return v === nothing || !(v.kind isa Union{IR.PARAMETER, IR.CONSTANT})
   end
-  return known
 end
 
 """
@@ -92,31 +89,21 @@ outside it; left an algebraic unknown, `der(p)` of R134a2's volumes jumped where
 crossed the dew line, and the steps fell to 1e-16 (Unstable).
 """
 function isPiecewise(e::IR.Expression)::Bool
-  local piecewise = false
-  IR.foreachExp(e) do x
-    (x isa IR.IF_EXPRESSION && (isZeroConstant(x.thenExp) || isZeroConstant(x.elseExp))) && (piecewise = true)
-    nothing
-  end
-  return piecewise
+  return IR.anyExp((x::IR.Expression) -> x isa IR.IF_EXPRESSION && (isZeroConstant(x.thenExp) || isZeroConstant(x.elseExp)), e)
 end
 
 "Whether `e` reads only variables whose start the model gives (parameters, constants, a `start` attribute): its value at the start values means something."
 function readsGivenStarts(e::IR.Expression, variables::IR.VariableSet)::Bool
-  local given = true
-  IR.foreachExp(e) do x
-    x isa IR.CREF || return nothing
-    local v = get(variables, x.cref.name, nothing)
-    (v === nothing || !(v.kind isa Union{IR.PARAMETER, IR.CONSTANT} || v.attributes.start !== nothing)) && (given = false)
-    nothing
+  return !IR.anyExp(e) do x::IR.Expression
+    x isa IR.CREF || return false
+    local v::Union{Nothing, IR.Variable} = get(variables, x.cref.name, nothing)
+    return v === nothing || !(v.kind isa Union{IR.PARAMETER, IR.CONSTANT} || v.attributes.start !== nothing)
   end
-  return given
 end
 
 "Whether `eq` reads `homotopy`: solved through its actual argument only, the simplified one would drop out of the initialization."
 function readsHomotopy(eq::IR.Equation)::Bool
-  local found = false
-  IR.foreachExp(x -> (x isa IR.CALL && x.name === :homotopy && (found = true); nothing), eq)
-  return found
+  return IR.anyExp((x::IR.Expression) -> x isa IR.CALL && x.name === :homotopy, eq)
 end
 
 """
@@ -180,9 +167,8 @@ function derivativeEdges(model::IR.Model, partition::IR.Partition, unknowns::Set
       end
       local c = partialDerivative(eq, d, functions; derivativeCalls = true)
       (c === nothing || isZeroConstant(c)) && continue
-      local linear = true
-      IR.foreachExp(x -> (x isa IR.CREF && x.cref.name === d && (linear = false); nothing), c)
-      linear || continue
+      #= linear in d: the coefficient does not read d =#
+      IR.anyExp((x::IR.Expression) -> x isa IR.CREF && x.cref.name === d, c) && continue
       local value = readsNoUnknown(c, model.variables) ? evaluate(c, known) : nothing
       (value !== nothing && (value == 0 || !isfinite(value))) && continue
       if value !== nothing
@@ -340,7 +326,7 @@ substitutable(ref::IR.CREF, value::IR.Expression)::IR.Expression =
   expressionLargerThan(value, SUBSTITUTED_VALUE_NODE_LIMIT) ? ref : value
 
 """
-    solveThroughSolved!(solved, equationOf, edges, partition, unknowns, functions, variables, start)
+    solveThroughSolved!(solved, equationOf, edges, partition, unknowns, functions, start)
 
 Two derivative unknowns whose solved values read each other (a cycle `resolvedValues` would leave the solver's)
 solved by substitution: the one whose equation, the other's value put in, reads neither the other nor another
@@ -356,8 +342,7 @@ the unknowns whose values were put into its equation (their values as matched, `
 """
 function solveThroughSolved!(solved::Dict{Symbol, IR.Expression}, equationOf::Dict{Symbol, Int},
                              edges::Dict{Symbol, Vector{DerivativeEdge}}, partition::IR.Partition, unknowns::Set{Symbol},
-                             functions::Dict{Symbol, IR.ModelicaFunction}, variables::IR.VariableSet,
-                             start::StartValues)::Dict{Symbol, Set{Symbol}}
+                             functions::Dict{Symbol, IR.ModelicaFunction}, start::StartValues)::Dict{Symbol, Set{Symbol}}
   local through::Dict{Symbol, Set{Symbol}} = Dict{Symbol, Set{Symbol}}()
   local readsOf = v -> (local r = Set{Symbol}(); IR.foreachExp(x -> (x isa IR.CREF && x.cref.name in unknowns && push!(r, x.cref.name); nothing), v); r)
   #= `d` from equation `i` with the values of `others` put in: its value, or nothing =#
@@ -371,9 +356,7 @@ function solveThroughSolved!(solved::Dict{Symbol, IR.Expression}, equationOf::Di
     (d in reads && !any(o -> o in reads, others)) || return nothing
     local c = partialDerivative(substituted, d, functions; derivativeCalls = true)
     (c === nothing || isZeroConstant(c) || isPiecewise(c)) && return nothing
-    local linear = true
-    IR.foreachExp(x -> (x isa IR.CREF && x.cref.name === d && (linear = false); nothing), c)
-    linear || return nothing
+    IR.anyExp((@nospecialize(x::IR.Expression)) -> x isa IR.CREF && x.cref.name === d, c) && return nothing
     local atStart = evaluate(c, start)
     (atStart !== nothing && isfinite(atStart) && abs(atStart) > ZERO_PIVOT) || return nothing
     return solvedValue(substituted, d, c)
@@ -466,20 +449,17 @@ Whether `e` reads a parameter with fixed = false (one the initialization compute
 the parameters it reads (`seen`: those followed).
 """
 function readsFreeParameter(e::IR.Expression, variables::IR.VariableSet, seen::Set{Symbol})::Bool
-  local found::Bool = false
-  IR.foreachExp(e) do x
-    (found || !(x isa IR.CREF) || x.cref.name in seen) && return nothing
+  return IR.anyExp(e) do x::IR.Expression
+    (!(x isa IR.CREF) || x.cref.name in seen) && return false
     push!(seen, x.cref.name)
     local v::Union{Nothing, IR.Variable} = get(variables, x.cref.name, nothing)
     #= an element of an array parameter: the array's =#
     (v === nothing && !isempty(IR.subscripts(x.cref))) && (v = get(variables, IR.upToFirstSubscripted(x.cref).name, nothing))
-    (v === nothing || !(v.kind isa IR.PARAMETER)) && return nothing
+    (v === nothing || !(v.kind isa IR.PARAMETER)) && return false
     local fixed::Union{Nothing, IR.Expression} = v.attributes.fixed
-    (fixed !== nothing && !(fixed isa IR.BOOLEAN && fixed.value)) && (found = true; return nothing)
-    v.binding === nothing || (found = readsFreeParameter(v.binding, variables, seen))
-    return nothing
+    (fixed !== nothing && !(fixed isa IR.BOOLEAN && fixed.value)) && return true
+    return v.binding !== nothing && readsFreeParameter(v.binding, variables, seen)
   end
-  return found
 end
 
 """
@@ -522,7 +502,7 @@ function derivativeSolution(model::IR.Model, partition::IR.Partition;
     equationOf[d] = e.equation
   end
   local through::Dict{Symbol, Set{Symbol}} =
-    solveThroughSolved!(solved, equationOf, edges, partition, unknowns, functions, model.variables, start)
+    solveThroughSolved!(solved, equationOf, edges, partition, unknowns, functions, start)
   isempty(solved) && return nothing
   local resolved = resolvedValues(solved)
   isempty(resolved) && return nothing

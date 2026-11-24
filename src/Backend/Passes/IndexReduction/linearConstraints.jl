@@ -290,7 +290,7 @@ function linearConstraints(model::IR.Model, partition::IR.Partition)::Vector{Tup
       false
     end
     linear || continue
-    filter!(((v, a),) -> !iszero(a), row.coefficients)
+    filter!(((_, a),) -> !iszero(a), row.coefficients)
     #= a row of states only is a constraint the structure shows =#
     any(v -> !isState[v], keys(row.coefficients)) || continue
     push!(rows, row)

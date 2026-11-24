@@ -364,10 +364,10 @@ function simulateIMTK(modelName::String, tspan, solver; parameters = nothing, kw
          world, the build call having returned), then remake: the FunctionWrappers built
          around the RGF-backed MTK callbacks now resolve to the live methods (build-time
          collapse captured a stale world -> wrong events). A model without callbacks too:
-         the prob has the model-independent type whose `solve` compiles once per process. =#
-      return Base.invokelatest() do
+         the prob has the model-independent type whose `solve` compiles once per process.
+         The prob an argument: captured, the reassigned prob is boxed. =#
+      return Base.invokelatest(prob) do p
         local SB = OMB.Runtime.ModelingToolkit.SciMLBase
-        local p = prob
         if OMB.DIRECT_RHS_TYPE_ERASE[]
           p = SB.remake(p; callback = OMB.CodeGeneration._eraseCallbackSet(get(p.kwargs, :callback, nothing)))
         end

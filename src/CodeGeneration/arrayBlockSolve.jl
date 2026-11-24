@@ -73,7 +73,9 @@ function columnColors(S::_SPARSE.SparseMatrixCSC{Float64, Int})::Vector{Int}
       push!(used, falses(size(S, 1)))
       c = length(used)
     end
-    foreach(r::Int -> (used[c][r] = true), rows)
+    for r::Int in rows
+      used[c][r] = true
+    end
     colors[j] = c
   end
   return colors
@@ -143,10 +145,10 @@ function BlockSolver(pattern::_SPARSE.SparseMatrixCSC{Float64, Int}, colors::Vec
 end
 
 "A solve without parameters (the solver's own tests): its residuals read no discrete state (`_holdDiscretes!`)."
-_holdDiscretes!(s::BlockSolver, ::Nothing)::Nothing = nothing
+_holdDiscretes!(::BlockSolver, ::Nothing)::Nothing = nothing
 
 "A solve without parameters: kept factors are for its matrix (`_sameDiscretes`)."
-_sameDiscretes(s::BlockSolver, ::Nothing)::Bool = true
+_sameDiscretes(::BlockSolver, ::Nothing)::Bool = true
 
 """
     BlockResidual(blocks!, k)

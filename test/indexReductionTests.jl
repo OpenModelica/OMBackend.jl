@@ -358,6 +358,13 @@ end
     _IRM.mapEquation!((@nospecialize(e::_IRM.Expression)) -> (e isa _IRM.CREF && e.cref.name === :y) ? _IRM.REAL(1.0) : e, copied)
     @test copied.branches[1].equations[1].rhs == _IRM.REAL(1.0)
     @test inner.rhs isa _IRM.CREF && inner.rhs.cref.name === :y && original.branches[1].equations[1] === inner
+    #= anyExp of an equation: the conditions and the nested equations' sides, as foreachExp; stops at the first hit =#
+    local isName = (n::Symbol) -> ((@nospecialize(e::_IRM.Expression)) -> e isa _IRM.CREF && e.cref.name === n)
+    @test _IRM.anyExp(isName(:c), original) && _IRM.anyExp(isName(:y), original) && !_IRM.anyExp(isName(:z), original)
+    @test _IRM.anyExp((@nospecialize(e::_IRM.Expression)) -> e == two, original)
+    local visited = Ref(0)
+    @test _IRM.anyExp((@nospecialize(e::_IRM.Expression)) -> (visited[] += 1; e isa _IRM.CREF && e.cref.name === :c), original)
+    @test visited[] == 1
   end
 
   @testset "an algorithm's record overwritten field: one equation per variable" begin

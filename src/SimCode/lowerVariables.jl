@@ -79,7 +79,7 @@ function simVarKind(v::IR.Variable, names::Names)::SimVarType
   (k isa Union{IR.DUMMY_STATE, IR.DUMMY_DER} && ty isa IR.T_REAL) && return ALG_VARIABLE(0)
   (known && ty isa Union{IR.T_RECORD, IR.T_CLASS, IR.T_EXTERNAL_OBJECT}) && return DATA_STRUCTURE(binding())
   ty isa IR.T_EXTERNAL_OBJECT && return DATA_STRUCTURE(binding())
-  ty isa Union{IR.T_REAL, IR.T_BOOLEAN, IR.T_INTEGER, IR.T_ENUMERATION} && known &&
+  ty isa IR.ScalarType && known &&
     return k isa IR.PARAMETER ? PARAMETER(binding()) : DATA_STRUCTURE(binding())
   (known && ty isa IR.T_STRING) && return STRING(binding())
   ty isa IR.T_INTEGER && return DISCRETE()

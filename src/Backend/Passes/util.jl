@@ -91,7 +91,7 @@ isFalse(e::Union{Nothing, IR.Expression})::Bool = e isa IR.BOOLEAN && !e.value
 
 "A discrete-time type: Integer, Boolean or an enumeration, or an array of them."
 isDiscreteType(ty::IR.ModelicaType)::Bool =
-  IR.elementType(ty) isa Union{IR.T_INTEGER, IR.T_BOOLEAN, IR.T_ENUMERATION}
+  IR.elementType(ty) isa IR.DiscreteType
 
 "A continuous type: Real, or an array of Real."
 isRealType(ty::IR.ModelicaType)::Bool = IR.elementType(ty) isa IR.T_REAL
@@ -99,9 +99,6 @@ isRealType(ty::IR.ModelicaType)::Bool = IR.elementType(ty) isa IR.T_REAL
 isRecordType(ty::IR.ModelicaType)::Bool = ty isa IR.T_RECORD
 
 #= Expressions =#
-
-"Whether `e` mentions `initial()`."
-mentionsInitial(e::IR.Expression)::Bool = IR.anyExp(isInitialCall, e)
 
 "Whether `e` is the built-in variable `time`."
 isTime(e::IR.Expression)::Bool = e isa IR.CREF && e.cref.name === :time
@@ -230,13 +227,15 @@ namesReadOutsidePre(e::IR.Expression)::Vector{Symbol} = Symbol[c.name for c in c
 
 "The relations in `e`, each once (structurally), in a bottom-up order."
 function relationsIn(@nospecialize(e::IR.Expression))::Vector{IR.RELATION}
-  local out = IR.RELATION[]
-  local visit
-  visit = (@nospecialize(x::IR.Expression)) -> begin
-    foreach(visit, IR.children(x))
-    x isa IR.RELATION && !(x in out) && push!(out, x)
+  return relationsIn!(IR.RELATION[], e)
+end
+
+"`relationsIn` of `x` onto `out`: the subexpressions' relations first."
+function relationsIn!(out::Vector{IR.RELATION}, @nospecialize(x::IR.Expression))::Vector{IR.RELATION}
+  for c::IR.Expression in IR.children(x)
+    relationsIn!(out, c)
   end
-  visit(e)
+  x isa IR.RELATION && !(x in out) && push!(out, x)
   return out
 end
 

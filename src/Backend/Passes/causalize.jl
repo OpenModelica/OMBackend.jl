@@ -61,7 +61,7 @@ function mapRoots!(g::G, eq::Union{IR.SCALAR_EQUATION, IR.ARRAY_EQUATION, IR.REC
   eq.rhs = g(eq.rhs)
   return eq
 end
-mapRoots!(g::G, eq::IR.ALGORITHM) where {G} = eq
+mapRoots!(::G, eq::IR.ALGORITHM) where {G} = eq
 function mapRoots!(g::G, eq::IR.IF_EQUATION)::IR.Equation where {G}
   eq.branches = IR.EquationBranch[IR.EquationBranch(g(b.condition), b.equations) for b in eq.branches]
   for b in eq.branches
@@ -104,7 +104,7 @@ mapRoots(g::G, s::IR.TERMINATE) where {G} = IR.TERMINATE(g(s.message), s.source)
 mapRoots(g::G, s::IR.REINIT) where {G} = IR.REINIT(s.state, g(s.value), s.source)
 mapRoots(g::G, s::IR.NORETCALL) where {G} = IR.NORETCALL(g(s.call), s.source)
 mapRoots(g::G, s::IR.RECOMPILATION) where {G} = IR.RECOMPILATION(s.component, g(s.newValue))
-mapRoots(g::G, s::Union{IR.RETURN, IR.BREAK, IR.AGENTIC_RECOMPILATION}) where {G} = s
+mapRoots(::G, s::Union{IR.RETURN, IR.BREAK, IR.AGENTIC_RECOMPILATION}) where {G} = s
 
 "The continuous-time partitions and the structural modes' systems, each with its variables."
 partitionsWithVariables(model::IR.Model) =
@@ -369,7 +369,7 @@ addForIterators!(names::Set{Symbol}, eq::IR.FOR_EQUATION) =
 addForIterators!(names::Set{Symbol}, eq::IR.IF_EQUATION) =
   (foreach(b -> foreach(e -> addForIterators!(names, e), b.equations), eq.branches);
    foreach(e -> addForIterators!(names, e), eq.elseEquations))
-addForIterators!(names::Set{Symbol}, eq::IR.Equation) = nothing
+addForIterators!(::Set{Symbol}, ::IR.Equation) = nothing
 
 function runtimeIndexChoice(e::IR.Expression, iterators::Set{Symbol})::IR.Expression
   e isa IR.CREF || return e
@@ -502,9 +502,7 @@ function ifReadsIterator(eq::IR.FOR_EQUATION, scope::Set{Symbol} = Set{Symbol}()
       ifReadsIterator(b, inner) && return true
       continue
     end
-    local hit = false
-    IR.foreachExp(x -> ((x isa IR.IF_EXPRESSION && IR.anyExp(readsInner, x)) && (hit = true); nothing), b)
-    hit && return true
+    IR.anyExp((x::IR.Expression) -> x isa IR.IF_EXPRESSION && IR.anyExp(readsInner, x), b) && return true
   end
   return false
 end
@@ -613,19 +611,18 @@ dependsOnTime(e::IR.Expression)::Bool = IR.anyExp(isTime, e)
 
 "Whether every relation of `e` is inside `noEvent`, and `e` has a `noEvent`: `e` makes no events."
 function relationsAllInNoEvent(e::IR.Expression)::Bool
-  local (sawNoEvent, bare) = (false, false)
-  local visit
-  visit = x -> begin
-    if IR.isBuiltinCall(x, :noEvent)
-      sawNoEvent = true
-    elseif x isa IR.RELATION
-      bare = true
-    else
-      foreach(visit, IR.children(x))
-    end
+  local seen::Tuple{Bool, Bool} = _noEventsAndBareRelations(e, (false, false))
+  return seen[1] && !seen[2]
+end
+
+"`seen` and whether `e` has a noEvent() and whether it has a relation outside one (`relationsAllInNoEvent`)."
+function _noEventsAndBareRelations(e::IR.Expression, seen::Tuple{Bool, Bool})::Tuple{Bool, Bool}
+  IR.isBuiltinCall(e, :noEvent) && return (true, seen[2])
+  e isa IR.RELATION && return (seen[1], true)
+  for c::IR.Expression in IR.children(e)
+    seen = _noEventsAndBareRelations(c, seen)
   end
-  visit(e)
-  return sawNoEvent && !bare
+  return seen
 end
 
 "A record value: a reference, a call or a record of a record type, or an if-expression of one."
@@ -714,14 +711,15 @@ function assembledBinding(sizes::Vector{Int}, elements::Dict{Vector{Int}, IR.Exp
   isempty(elements) && return nothing
   local missing = [collect(Tuple(i)) for i in CartesianIndices(Tuple(sizes)) if !haskey(elements, collect(Tuple(i)))]
   isempty(missing) || @warn "$(length(missing)) of $(prod(sizes)) element bindings missing for the array $(name); 0.0 for them" missing
-  local build
-  build = (prefix::Vector{Int}) -> begin
-    local k = length(prefix) + 1
-    k > length(sizes) && return get(elements, prefix, IR.REAL(0.0))
-    return IR.ARRAY(IR.Expression[build(vcat(prefix, i)) for i in 1:sizes[k]],
-                    IR.T_ARRAY(IR.T_REAL(), IR.Dimension[IR.DIM_SIZE(s) for s in sizes[k:end]]))
-  end
-  return build(Int[])
+  return _assembledArray(sizes, elements, Int[])
+end
+
+"The array of `assembledBinding` under the index `prefix`: its elements' bindings, 0.0 for a missing one."
+function _assembledArray(sizes::Vector{Int}, elements::Dict{Vector{Int}, IR.Expression}, prefix::Vector{Int})::IR.Expression
+  local k::Int = length(prefix) + 1
+  k > length(sizes) && return get(elements, prefix, IR.REAL(0.0))
+  return IR.ARRAY(IR.Expression[_assembledArray(sizes, elements, vcat(prefix, i)) for i in 1:sizes[k]],
+                  IR.T_ARRAY(IR.T_REAL(), IR.Dimension[IR.DIM_SIZE(s) for s in sizes[k:end]]))
 end
 
 """

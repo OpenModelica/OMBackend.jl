@@ -54,7 +54,7 @@
    t = 1e5). Each callback substitutes every other condition, n(n - 1) in all. =#
 const _TIME_EVENT_AHEAD = 1.0e-10
 
-function _buildTimeEventRefreshCallbacks(allPT::Vector, simCode::SC.SIM_CODE)
+function _buildTimeEventRefreshCallbacks(allPT::Vector)
   local n = length(allPT)
   local cbs = Expr[]
   for k in 1:n
@@ -105,7 +105,6 @@ So the first will have 1 and so on.
 """
 function createIfEquations(stateVariables::Vector, algebraicVariables::Vector, simCode::SC.SIM_CODE)
   local ifEquations = IfEquationComponent[]
-  local identifier::Int
   local sortedIfEquations = _sortedIfEquations(simCode)
   #= Shared relay-t0 map: targets computed by earlier if-equations feed the
      condition initial values of later ones. =#
@@ -119,7 +118,7 @@ function createIfEquations(stateVariables::Vector, algebraicVariables::Vector, s
      pure-time conditions are known. =#
   local allPT = collect(Iterators.flatten(c.pureTimeEvents for c in ifEquations))
   if !isempty(allPT)
-    local refreshCbs = _buildTimeEventRefreshCallbacks(allPT, simCode)
+    local refreshCbs = _buildTimeEventRefreshCallbacks(allPT)
     push!(ifEquations, IfEquationComponent(refreshCbs, Expr[], Symbol[],
                                            Tuple{String, Bool}[], Tuple{Symbol, Any, Any, Float64}[],
                                            Expr[]))
@@ -159,10 +158,6 @@ function _ifConditionDependsOnTime(condition::SC.Exp)::Bool
   return "time" in refs
 end
 
-#= _ifConditionAllDiscreteOrParameter / _allBranchConditionsDiscrete live in the
-   MTK_CodeGenerationUtil submodule (generateIfExpressions needs them); call them
-   here as MTK_CodeGenerationUtil._allBranchConditionsDiscrete. =#
-
 """
     _ifConditionIsPureTimeEvent(condition, simCode) -> Bool
 
@@ -188,46 +183,11 @@ function _ifConditionIsPureTimeEvent(condition::SC.Exp, simCode::SC.SIM_CODE)::B
 end
 
 """
-This function creates symbolic if equations for use in MTK.
-The function returns a tuple, where the first part of the tuple represent the conditions and the affect of the if-equation on the form:
-  continuous_events = [
-    <Condition> => <affect>
-    <Condition> => <affect>
-    ....
-  ]
-Each condition generates one variable with zero dynamics the variable being true or not depending on the branch.
-  Example:
-  if <condition> then
-    <equations>
-  elseif <condition> then
-    <equations>
-  else
-    <equations>
-  end if;
-Would result in:
-continuous_events = [
-    <condition> => [ifCond1 ~ true, ifCond2 ~ false]
-    <condition> => [ifCond1 ~ false, ifCond2 ~ true]
-]
-An if equation with a single condition would only generate one condition:
-continuous_events = [
-    <condition> => [ifCond1 ~ true]
-]
-
-The second value in the return tuple represent the if-equations itself:
-<lhs> = IfElse.ifelse(<condition>, <value>, IfElse.ifelse(<condition>, <value>, <value>))
-  lhs can be one or several variables. (TODO, fix the case for several variables in this kind of branch)
-
-The third part of the tuple contains a set of zero dynamic equations (One for each if equation condition variable)
-See the following issue: https://github.com/SciML/ModelingToolkit.jl/issues/1523
-
-The forth part of the tuple contains a vector of symbolic variables.
-One for each conditional variable created.
+True when a branch condition references a variable that is itself an
+if-equation relay target (key of the shared relay-t0 map): exactly the
+chained staged-trajectory case where a boundary crossing must re-evaluate
+sibling conditions live instead of applying static toggles.
 """
-#= True when a branch condition references a variable that is itself an
-   if-equation relay target (key of the shared relay-t0 map): exactly the
-   chained staged-trajectory case where a boundary crossing must re-evaluate
-   sibling conditions live instead of applying static toggles. =#
 function _conditionReferencesRelayTarget(@nospecialize(condition::SC.Exp), rT0::AbstractDict{Symbol, Float64})::Bool
   isempty(rT0) && return false
   local refs::OrderedSet{String} = OrderedSet{String}()
@@ -321,12 +281,49 @@ struct IfCondToggle <: Function
   value::Float64
 end
 
-function (a::IfCondToggle)(modified::NamedTuple{N}, observed, ctx, integrator) where {N}
+function (a::IfCondToggle)(modified::NamedTuple{N}, _, _, _) where {N}
   return NamedTuple{N}(ntuple(j -> N[j] === a.name ? a.value : Float64(modified[j]), Val(length(N))))
 end
 
-function createIfEquation(stateVariables::Vector,
-                          algebraicVariables::Vector,
+"""
+This function creates symbolic if equations for use in MTK.
+The function returns a tuple, where the first part of the tuple represent the conditions and the affect of the if-equation on the form:
+  continuous_events = [
+    <Condition> => <affect>
+    <Condition> => <affect>
+    ....
+  ]
+Each condition generates one variable with zero dynamics the variable being true or not depending on the branch.
+  Example:
+  if <condition> then
+    <equations>
+  elseif <condition> then
+    <equations>
+  else
+    <equations>
+  end if;
+Would result in:
+continuous_events = [
+    <condition> => [ifCond1 ~ true, ifCond2 ~ false]
+    <condition> => [ifCond1 ~ false, ifCond2 ~ true]
+]
+An if equation with a single condition would only generate one condition:
+continuous_events = [
+    <condition> => [ifCond1 ~ true]
+]
+
+The second value in the return tuple represent the if-equations itself:
+<lhs> = IfElse.ifelse(<condition>, <value>, IfElse.ifelse(<condition>, <value>, <value>))
+  lhs can be one or several variables. (TODO, fix the case for several variables in this kind of branch)
+
+The third part of the tuple contains a set of zero dynamic equations (One for each if equation condition variable)
+See the following issue: https://github.com/SciML/ModelingToolkit.jl/issues/1523
+
+The forth part of the tuple contains a vector of symbolic variables.
+One for each conditional variable created.
+"""
+function createIfEquation(::Vector,
+                          ::Vector,
                           ifEq::SC.IF_EQUATION,
                           identifier::Int,
                           simCode::SC.SIM_CODE,
@@ -386,7 +383,6 @@ function createIfEquation(stateVariables::Vector,
                                                                                   atInitial = true),
                                         simCode; closedBoundary = _closedB, extraVals = _rT0)
     local numVal = ivCond ? 1.0 : 0.0
-    local invVal = ivCond ? 0.0 : 1.0
     #= Build ImperativeAffect: function returns a NamedTuple of new values.
        modified NamedTuple maps aliases to the symbolic parameter variables.
        Callback fires for every branch condition; ifCondN is the load-bearing

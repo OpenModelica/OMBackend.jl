@@ -132,8 +132,7 @@ end
 const DAE_REINIT = IdDict{Any, Function}()
 
 """
-    buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, callbacks;
-                          allInitialValues=nothing)
+    buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, callbacks; ...)
 
 Build an ODEProblem by extracting the RHS function directly from the reduced MTK
 system's symbolic equations, bypassing MTK's ODEProblem constructor.
@@ -141,16 +140,11 @@ system's symbolic equations, bypassing MTK's ODEProblem constructor.
 Uses `Symbolics.build_function` with CSE to generate compact index-based code,
 wrapped in a `RuntimeGeneratedFunction` for world-age safety.
 
-`allInitialValues` provides Modelica start values for algebraic variables that
-`splitInitialValues` demoted to guesses. Without these, algebraic variables
-default to 0.0, which may cause InitialFailure for DAE systems.
-
 Returns an `ODEProblem` ready for `solve()`. `callbacks` is not specialized on: its type holds the generated
 module's closures (a new type per translate), and the method only passes it on; specialized, it compiled
 12-14 s again for each translate of MSL BatchPlant_StandardWater.
 """
 function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, @nospecialize(callbacks);
-                               allInitialValues=nothing,  # kept for API compat but guesses from reducedSystem are preferred
                                liftedDiscretes=String[],
                                freeParameters=String[],
                                assignedParameters=String[],
@@ -246,7 +240,7 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, @
     @debug "DirectRHS: empty system (0 unknowns), building trivial dummy problem"
     isempty(freeIdx) || OMBackend.unsupported("free parameters (fixed = false) of a system without states",
                                               join((variableName(params[k]) for k in freeIdx), ", "))
-    local emptyRHS = (du, u, p, t) -> (du[1] = 0.0)
+    local emptyRHS = (du, _, _, _) -> (du[1] = 0.0)
     local f0 = ModelingToolkit.ODEFunction{true}(emptyRHS; sys = reducedSystem)
     local p0 = _buildParamVector(params, pars; resolvedParams=resolvedParams)
     if assignParams! !== nothing
@@ -258,15 +252,14 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, @
   end
 
   # 1. Build the RHS function expression from symbolic equations
-  local rhs_list = [eq.rhs for eq in eqs]
+  local rhs_init = [eq.rhs for eq in eqs]
   #= A model with homotopy(): the simulation's RHS at λ = 1, where the blend
      is the actual expression (the simplified one folds away); only the
      initialization's (`rhsInitFunc`) reads λ. The simplified expression was
      evaluated at every step otherwise (an assert in it stopped a run). =#
   local homotopyIdx::Union{Nothing, Int} = findfirst(p -> variableName(p) == String(HOMOTOPY_LAMBDA), params)
-  local rhs_init = rhs_list
-  homotopyIdx === nothing ||
-    (rhs_list = [Symbolics.substitute(r, Dict(params[homotopyIdx] => 1.0)) for r in rhs_list])
+  local rhs_list = homotopyIdx === nothing ? rhs_init :
+    [Symbolics.substitute(r, Dict(params[homotopyIdx] => 1.0)) for r in rhs_init]
   local f_ip_expr = _buildRHSExpression(rhs_list, states, params, iv)
 
   # Dump the actual generated RHS expression — see MTKDump.
@@ -316,11 +309,14 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, @
      its own arguments. Without them the solver finite-differenced the states, by their
      magnitude, past a flow function's regularization (Buildings' Airflow.Multizone
      powerLaw05 around dp = 0 at pressures of 1e5 Pa: 47,225 steps for 36). =#
-  local (symJac, jacProto) = withNumericPartials(() -> _buildSparseJacobian(rhs_list, states, params, iv,
-                                                                            u0, p_vec, tspan[1]))
+  #= `u` the start state (u0 is the solved one later) =#
+  local (symJac, jacProto) = let u = u0
+    withNumericPartials(() -> _buildSparseJacobian(rhs_list, states, params, iv, u, p_vec, tspan[1]))
+  end
   local jacFunc = symJac === nothing ? nothing : _finiteJacobian(symJac, rhsFunc)
-  local tgradFunc = withNumericPartials(() -> _buildTimeDerivative(rhs_list, states, params, iv, rhsFunc,
-                                                                   u0, p_vec, tspan[1]))
+  local tgradFunc = let u = u0
+    withNumericPartials(() -> _buildTimeDerivative(rhs_list, states, params, iv, rhsFunc, u, p_vec, tspan[1]))
+  end
 
   # 4. Extract event callbacks from the reduced system and merge with custom callbacks.
   #    Our structural_simplify wrapper uses split=false, so the compiled event
@@ -409,7 +405,6 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, @
                                                      ModelingToolkit.get_iv(reducedSystem), mm;
                                                      resolvedParams=initResolved,
                                                      excludeNames=union(discreteNames, assignedNames))
-    local extraResiduals = nothing
     #= The residual rows for parameter values `pv` (a re-initialization for
        other tunable parameter values evaluates them at those). =#
     local symRowsAt = symInit === nothing ? nothing : let (gF, dIdxs, mmS) = symInit
@@ -471,9 +466,6 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, @
         end
       end
     end
-    #= The kinds of rows are probed apart below: a part that fails at the
-       entry guesses is left out on its own. =#
-    local residualsAt = nothing
     #= The init solve's RHS assigns the initialization-defined parameters
        first. Their f may assert where the model's own equations only guard
        (the MSL selectBranch asserts a regular loop position): at a trial point
@@ -489,14 +481,17 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, @
       end
       rhsInitFunc(du, u, p, t)
     end
-    local probeRows = rowsAt -> try
-      local duProbe = similar(u0)
-      initRhs(duProbe, u0, p_vec, t0)
-      all(isfinite, rowsAt(p_vec)(duProbe, u0))
-    catch _e
-      OMBackend._fallback(_e, :buildDirectRHSProblem_6, impact = :result)
-      false
+    local probeRows = let u = u0
+      rowsAt -> try
+        local duProbe = similar(u)
+        initRhs(duProbe, u, p_vec, t0)
+        all(isfinite, rowsAt(p_vec)(duProbe, u))
+      catch _e
+        OMBackend._fallback(_e, :buildDirectRHSProblem_6, impact = :result)
+        false
+      end
     end
+    #= The kinds of rows are probed apart: a part that fails at the entry guesses is left out on its own. =#
     local parts = Any[]
     for (label, rowsAt) in (("symbolic initialization", symRowsAt), ("derivative", derRowsAt))
       rowsAt === nothing && continue
@@ -505,11 +500,9 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, @
       probeRows(rowsAt) || OMBackend.unsupported("$(label) initial-equation rows not finite at the entry guesses", label)
       push!(parts, rowsAt)
     end
-    if !isempty(parts)
-      residualsAt = length(parts) == 1 ? parts[1] :
-        pv -> (local fs = [r(pv) for r in parts]; (du, u) -> reduce(vcat, [f(du, u) for f in fs]))
-      extraResiduals = residualsAt(p_vec)
-    end
+    local residualsAt = isempty(parts) ? nothing : length(parts) == 1 ? parts[1] :
+      pv -> (local fs = [r(pv) for r in parts]; (du, u) -> reduce(vcat, [f(du, u) for f in fs]))
+    local extraResiduals = residualsAt === nothing ? nothing : residualsAt(p_vec)
     local initDiscretes = _initialDiscreteClusters(initClusters, reducedSystem, discreteStarts)
     local keptIdx = vcat(pinnedIdx, discretePinnedIdx)
     #= The relations' literal values select the branches the initialization
@@ -606,7 +599,7 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, @
        only without it (`x(start = 1, fixed = true)` with an initial equation
        that wants another x: x = 0.48, `v(fixed = true)` with `v = xa^2 + 1`:
        v = 1). OpenModelica refuses such a model. =#
-    local userPinIdx = Int[]
+    local userPinIdx::Vector{Int} = Int[]
     if !isempty(userPins)
       local userPinSet = Set{String}(userPins)
       #= A pin whose value reads a parameter the initialization computes (free,
@@ -629,8 +622,8 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, @
         end
         any(v -> variableName(v) in unknownParamNames, vars)
       end
-      userPinIdx = Int[i for i in pinnedIdx if (local nm::Union{Nothing, String} = variableName(states[i]); nm in userPinSet) &&
-                                          !readsComputed(nm)]
+      append!(userPinIdx, (i for i in pinnedIdx if (local nm::Union{Nothing, String} = variableName(states[i]); nm in userPinSet) &&
+                                                  !readsComputed(nm)))
     end
     local checkUserPins = (u, uIn) -> begin
       local moved = Int[i for i in userPinIdx if !isapprox(u[i], uIn[i]; rtol = 1e-8, atol = 1e-10)]
@@ -659,9 +652,9 @@ function buildDirectRHSProblem(reducedSystem, finalInitialValues, pars, tspan, @
       #= The derivative targets read them too (`der(x) = p` kept x for p = 2).
          Those on algebraic or observed variables are inside the residual
          functions built above: a change there is refused. =#
-      local targets = derivativeInitTargets
+      local targets::Vector{Pair{Int, Float64}} = r === nothing ? derivativeInitTargets :
+        _derivativeInitializationTargets(reducedSystem, states; resolvedParams=r.initResolved)
       if r !== nothing
-        targets = _derivativeInitializationTargets(reducedSystem, states; resolvedParams=r.initResolved)
         (Pair{Int, Float64}[t for t in targets if 1 <= t.first <= size(mm, 1) && mm[t.first, t.first] == 0] == algDerTargets &&
          last(_observedDerivativeInitEquations(reducedSystem, states; resolvedParams=r.initResolved)) == obsTargets) ||
           OMBackend.unsupported("other tunable parameter values in a derivative initial equation on an algebraic or observed variable",
@@ -845,7 +838,7 @@ function _runEntry(reducedSystem; states, params, pars, finalInitialValues, syst
                                       OMBackend.isTunableParameter(nm, tunableSet))
   local followTunable! = something(_dependentsWriter(isempty(roots) ? nothing :
                                                       _parameterDependents(pars, params, roots; resolvedParams=resolvedParams)),
-                                   pv -> nothing)
+                                   _ -> nothing)
   local parsByName::Dict{String, Any} = Dict{String, Any}(variableName(k) => v for (k, v) in pars)
   local entryParams = _entryParameters(Iterators.flatten(((p.second for p in finalInitialValues),
                                                           (eq.rhs for eq in ModelingToolkit.initialization_equations(reducedSystem)),
@@ -1018,10 +1011,11 @@ function _symbolicInitializationResiduals(reducedSystem, states, params, iv, mm;
   local mmScales = Float64[]
   #= A derivative a row reads (`der(x) = der(y)`) by its equation: left in, the
      row did not reduce to states and was dropped (x(0) = 0, OpenModelica 1). =#
-  local systemEqs = nothing
+  #= Filled on first use; a Ref, so the closure does not box it. =#
+  local systemEqs::Base.RefValue{Union{Nothing, Vector{Symbolics.Equation}}} = Base.RefValue{Union{Nothing, Vector{Symbolics.Equation}}}(nothing)
   local withDerivatives = e -> begin
     _hasDerivative(Symbolics.unwrap(e)) || return e
-    systemEqs === nothing && (systemEqs = ModelingToolkit.full_equations(reducedSystem))
+    systemEqs[] === nothing && (systemEqs[] = ModelingToolkit.full_equations(reducedSystem))
     #= An observed variable's definition inside D() (`D(2y)`): 2 D(y) first. =#
     local ex = try
       Symbolics.expand_derivatives(e)
@@ -1029,7 +1023,7 @@ function _symbolicInitializationResiduals(reducedSystem, states, params, iv, mm;
       OMBackend._fallback(err, :initExpandDerivatives; impact = :result)
       e
     end
-    local r = substituteDerivatives(ex, systemEqs)
+    local r = substituteDerivatives(ex, systemEqs[])
     r === nothing ? ex : r
   end
   for eq in initEqs
@@ -1079,9 +1073,10 @@ function _symbolicInitializationResiduals(reducedSystem, states, params, iv, mm;
     OMBackend.unsupported("initialization equations that do not reduce to the states and parameters",
                           join((string(exprs[i]) for i in setdiff(eachindex(exprs), keep)), "; "))
   isempty(keep) && return nothing
-  exprs = exprs[keep]
-  derIdxs = derIdxs[keep]
-  mmScales = mmScales[keep]
+  #= In place: a reassigned `exprs` is boxed by the generator above. =#
+  keepat!(exprs, keep)
+  keepat!(derIdxs, keep)
+  keepat!(mmScales, keep)
   #= With CSE, as the RHS: the rows have the observed equations substituted,
      which a multibody model (MSL fullRobot: 119 unknowns, 1809 observed
      equations) expands to millions of terms as a tree; Julia never finishes
@@ -1112,7 +1107,7 @@ function _inlineObservedRows!(exprs, reducedSystem, states, params, iv)::Vector{
   end
   push!(allowed, variableName(iv))
   for i in 1:length(exprs)
-    for _pass in 1:(length(obsEqs) + 1)
+    for _ in 1:(length(obsEqs) + 1)
       local pending = OrderedDict{Any, Any}()
       for v in Symbolics.get_variables(exprs[i])
         local vs::Union{Nothing, String} = variableName(v)
@@ -1210,7 +1205,7 @@ function _parameterDependents(pars, params, roots::AbstractSet{String};
      dependents substituted by their bindings (bounded, bindings are acyclic),
      names outside `params` by their resolved values. =#
   local byVar = Dict{Any, Any}()
-  for (k, v) in pars
+  for (k, _) in pars
     local nm::Union{Nothing, String} = variableName(k)
     local uk = k isa Symbolics.Num ? Symbolics.unwrap(k) : k
     if nm in deps
@@ -1355,7 +1350,7 @@ end
 """
 The time derivative of rows that do not read t.
 """
-_zeroTimeDerivative(dT, u, p, t) = (fill!(dT, 0); nothing)
+_zeroTimeDerivative(dT, _, _, _) = (fill!(dT, 0); nothing)
 
 """
 ∂F/∂t of the rows `exprs` (explicit time) by the DAG differentiation, as an
@@ -1878,113 +1873,126 @@ are its derivative rules (derivative_idx); throws _NoDagDerivative where
 there is none.
 """
 function _dagSparseJacobian(rhs_list, states; columns::Union{Nothing, AbstractSet{Int}} = nothing)
-  local T = Symbolics.VartypeT
   local stateIdx = Dict{Any, Int}(Symbolics.unwrap(s) => j for (j, s) in enumerate(states))
   #= Whole-array uses of scalarized states would read no state here. =#
   local arrParents = Set{Any}(SymbolicUtils.arguments(u)[1] for u in keys(stateIdx)
                               if SymbolicUtils.iscall(u) && SymbolicUtils.operation(u) === getindex)
-  local depsMemo = IdDict{Any, BitSet}()
-  local deps = x -> begin
-    local hit = get(depsMemo, x, nothing)
-    hit === nothing || return hit
-    local j = get(stateIdx, x, 0)
-    local d = BitSet()
-    if j > 0
-      push!(d, j)
-    elseif x in arrParents
-      throw(_NoDagDerivative("array use of a scalarized state", true))
-    elseif SymbolicUtils.iscall(x)
-      for a in SymbolicUtils.arguments(x)
-        union!(d, deps(a))
-      end
-    end
-    depsMemo[x] = d
-    return d
-  end
-  #= Combined as plain terms, not with + and *: canonical sums and products
-     merge their operands' terms, copying what the DAG shares (EngineV6_analytic
-     grew to 16 GB that way too). Symbolic 0 and 1 (the rules of sign, floor,
-     comparisons) fold like numbers. =#
-  local isZero = x -> (local v = SymbolicUtils.unwrap_const(x); v isa Number && iszero(v))
-  local isOne = x -> (local v = SymbolicUtils.unwrap_const(x); v isa Number && isone(v))
-  local plus = (a, b) -> isZero(a) ? b : isZero(b) ? a : SymbolicUtils.term(+, a, b; vartype = T)
-  local times = (a, b) -> (isZero(a) || isZero(b)) ? 0 : isOne(a) ? b : isOne(b) ? a :
-                          SymbolicUtils.term(*, a, b; vartype = T)
-  local sumOf = terms -> foldl(plus, terms; init = 0)
-  local isSum = x -> SymbolicUtils.isadd(x) || (SymbolicUtils.isterm(x) && SymbolicUtils.operation(x) === (+))
-  local isProduct = x -> SymbolicUtils.ismul(x) || (SymbolicUtils.isterm(x) && SymbolicUtils.operation(x) === (*))
-  local derivative
-  derivative = (x, j, memo) -> begin
-    j in deps(x) || return 0
-    local hit = get(memo, x, nothing)
-    hit === nothing || return hit
-    local r = if get(stateIdx, x, 0) == j
-      1
-    elseif isSum(x)
-      sumOf(Any[derivative(a, j, memo) for a in SymbolicUtils.arguments(x) if j in deps(a)])
-    elseif isProduct(x)
-      local args = SymbolicUtils.arguments(x)
-      sumOf(Any[times(foldl(times, (args[k] for k in eachindex(args) if k != i); init = 1),
-                      derivative(args[i], j, memo))
-                for i in eachindex(args) if j in deps(args[i])])
-    elseif SymbolicUtils.isdiv(x)
-      local (num, den) = SymbolicUtils.arguments(x)
-      local dn = derivative(num, j, memo)
-      local dd = derivative(den, j, memo)
-      local a = isZero(dn) ? 0 : SymbolicUtils.term(/, dn, den; vartype = T)
-      local b = isZero(dd) ? 0 : SymbolicUtils.term(/, times(num, dd), SymbolicUtils.term(^, den, 2; vartype = T); vartype = T)
-      isZero(b) ? a : isZero(a) ? SymbolicUtils.term(-, b; vartype = T) : SymbolicUtils.term(-, a, b; vartype = T)
-    elseif SymbolicUtils.ispow(x) && !(j in deps(SymbolicUtils.arguments(x)[2]))
-      local (b, e) = SymbolicUtils.arguments(x)
-      local ev = SymbolicUtils.unwrap_const(e)
-      local bPow = ev isa Number ? (isone(ev - 1) ? b : SymbolicUtils.term(^, b, ev - 1; vartype = T)) :
-                   SymbolicUtils.term(^, b, SymbolicUtils.term(-, e, 1; vartype = T); vartype = T)
-      times(times(e, bPow), derivative(b, j, memo))
-    elseif SymbolicUtils.isterm(x)
-      local f = SymbolicUtils.operation(x)
-      local args = SymbolicUtils.arguments(x)
-      if f === ifelse || f === SymbolicUtils.ifelse_eager || f === SymbolicUtils.ifelse_branching
-        local dt = derivative(args[2], j, memo)
-        local df = derivative(args[3], j, memo)
-        (isZero(dt) && isZero(df)) ? 0 : SymbolicUtils.term(f, args[1], dt, df; vartype = T)
-      elseif f isa Symbolics.Differential || f isa Symbolics.Integral || f === getindex
-        throw(_NoDagDerivative(string(f), true))
-      elseif f isa SymbolicUtils.Operator
-        #= Pre, Sample, Hold, Shift: new variables, as in Symbolics. =#
-        0
-      elseif f isa SymbolicUtils.BasicSymbolic
-        throw(_NoDagDerivative(string(f), false))
-      else
-        local terms = Any[]
-        for (i, a) in enumerate(args)
-          j in deps(a) || continue
-          local rule = Symbolics.derivative_idx(x, i)
-          rule === nothing && throw(_NoDagDerivative(string(f), false))
-          isZero(rule) && continue
-          push!(terms, times(rule, derivative(a, j, memo)))
-        end
-        sumOf(terms)
-      end
-    else
-      throw(_NoDagDerivative(string(typeof(x)), true))
-    end
-    memo[x] = r
-    return r
-  end
+  local D::_DagDeps = _DagDeps(stateIdx, arrParents, IdDict{Any, BitSet}())
   local I = Int[]
   local J = Int[]
   local V = Symbolics.Num[]
   local memos = [IdDict{Any, Any}() for _ in states]
   for (i, ex) in enumerate(rhs_list)
     local x = Symbolics.unwrap(ex)
-    for j in deps(x)
+    for j in _dagDeps(D, x)
       columns === nothing || j in columns || continue
       push!(I, i)
       push!(J, j)
-      push!(V, Symbolics.Num(derivative(x, j, memos[j])))
+      push!(V, Symbolics.Num(_dagDerivative(D, x, j, memos[j])))
     end
   end
   return Symbolics.SparseArrays.sparse(I, J, V, length(rhs_list), length(states))
+end
+
+"The state dependencies of `_dagSparseJacobian`'s expressions: the states' indices, the arrays of scalarized states (a
+whole-array use reads no state here), the dependencies found (`memo`)."
+struct _DagDeps
+  stateIdx::Dict{Any, Int}
+  arrParents::Set{Any}
+  memo::IdDict{Any, BitSet}
+end
+
+"The indices of the states `x` depends on (`_dagSparseJacobian`), memoized."
+function _dagDeps(D::_DagDeps, x)::BitSet
+  local hit = get(D.memo, x, nothing)
+  hit === nothing || return hit
+  local j = get(D.stateIdx, x, 0)
+  local d = BitSet()
+  if j > 0
+    push!(d, j)
+  elseif x in D.arrParents
+    throw(_NoDagDerivative("array use of a scalarized state", true))
+  elseif SymbolicUtils.iscall(x)
+    for a in SymbolicUtils.arguments(x)
+      union!(d, _dagDeps(D, a))
+    end
+  end
+  D.memo[x] = d
+  return d
+end
+
+#= Combined as plain terms, not with + and *: canonical sums and products
+   merge their operands' terms, copying what the DAG shares (EngineV6_analytic
+   grew to 16 GB that way too). Symbolic 0 and 1 (the rules of sign, floor,
+   comparisons) fold like numbers. =#
+_dagIsZero(x)::Bool = (local v = SymbolicUtils.unwrap_const(x); v isa Number && iszero(v))
+_dagIsOne(x)::Bool = (local v = SymbolicUtils.unwrap_const(x); v isa Number && isone(v))
+_dagPlus(a, b) = _dagIsZero(a) ? b : _dagIsZero(b) ? a : SymbolicUtils.term(+, a, b; vartype = Symbolics.VartypeT)
+_dagTimes(a, b) = (_dagIsZero(a) || _dagIsZero(b)) ? 0 : _dagIsOne(a) ? b : _dagIsOne(b) ? a :
+                  SymbolicUtils.term(*, a, b; vartype = Symbolics.VartypeT)
+_dagSum(terms) = foldl(_dagPlus, terms; init = 0)
+_dagIsSum(x)::Bool = SymbolicUtils.isadd(x) || (SymbolicUtils.isterm(x) && SymbolicUtils.operation(x) === (+))
+_dagIsProduct(x)::Bool = SymbolicUtils.ismul(x) || (SymbolicUtils.isterm(x) && SymbolicUtils.operation(x) === (*))
+
+"The derivative of `x` by the state `j` (`_dagSparseJacobian`), as plain terms, memoized in `memo`."
+function _dagDerivative(D::_DagDeps, x, j::Int, memo::IdDict{Any, Any})
+  local T = Symbolics.VartypeT
+  j in _dagDeps(D, x) || return 0
+  local hit = get(memo, x, nothing)
+  hit === nothing || return hit
+  local r = if get(D.stateIdx, x, 0) == j
+    1
+  elseif _dagIsSum(x)
+    _dagSum(Any[_dagDerivative(D, a, j, memo) for a in SymbolicUtils.arguments(x) if j in _dagDeps(D, a)])
+  elseif _dagIsProduct(x)
+    #= `factors`, not `args`: one local in two branches is assigned twice, and the generator would box it =#
+    local factors = SymbolicUtils.arguments(x)
+    _dagSum(Any[_dagTimes(foldl(_dagTimes, (factors[k] for k in eachindex(factors) if k != i); init = 1),
+                          _dagDerivative(D, factors[i], j, memo))
+                for i in eachindex(factors) if j in _dagDeps(D, factors[i])])
+  elseif SymbolicUtils.isdiv(x)
+    local (num, den) = SymbolicUtils.arguments(x)
+    local dn = _dagDerivative(D, num, j, memo)
+    local dd = _dagDerivative(D, den, j, memo)
+    local a = _dagIsZero(dn) ? 0 : SymbolicUtils.term(/, dn, den; vartype = T)
+    local b = _dagIsZero(dd) ? 0 : SymbolicUtils.term(/, _dagTimes(num, dd), SymbolicUtils.term(^, den, 2; vartype = T); vartype = T)
+    _dagIsZero(b) ? a : _dagIsZero(a) ? SymbolicUtils.term(-, b; vartype = T) : SymbolicUtils.term(-, a, b; vartype = T)
+  elseif SymbolicUtils.ispow(x) && !(j in _dagDeps(D, SymbolicUtils.arguments(x)[2]))
+    local (b, e) = SymbolicUtils.arguments(x)
+    local ev = SymbolicUtils.unwrap_const(e)
+    local bPow = ev isa Number ? (isone(ev - 1) ? b : SymbolicUtils.term(^, b, ev - 1; vartype = T)) :
+                 SymbolicUtils.term(^, b, SymbolicUtils.term(-, e, 1; vartype = T); vartype = T)
+    _dagTimes(_dagTimes(e, bPow), _dagDerivative(D, b, j, memo))
+  elseif SymbolicUtils.isterm(x)
+    local f = SymbolicUtils.operation(x)
+    local args = SymbolicUtils.arguments(x)
+    if f === ifelse || f === SymbolicUtils.ifelse_eager || f === SymbolicUtils.ifelse_branching
+      local dt = _dagDerivative(D, args[2], j, memo)
+      local df = _dagDerivative(D, args[3], j, memo)
+      (_dagIsZero(dt) && _dagIsZero(df)) ? 0 : SymbolicUtils.term(f, args[1], dt, df; vartype = T)
+    elseif f isa Symbolics.Differential || f isa Symbolics.Integral || f === getindex
+      throw(_NoDagDerivative(string(f), true))
+    elseif f isa SymbolicUtils.Operator
+      #= Pre, Sample, Hold, Shift: new variables, as in Symbolics. =#
+      0
+    elseif f isa SymbolicUtils.BasicSymbolic
+      throw(_NoDagDerivative(string(f), false))
+    else
+      local terms = Any[]
+      for (i, a) in enumerate(args)
+        j in _dagDeps(D, a) || continue
+        local rule = Symbolics.derivative_idx(x, i)
+        rule === nothing && throw(_NoDagDerivative(string(f), false))
+        _dagIsZero(rule) && continue
+        push!(terms, _dagTimes(rule, _dagDerivative(D, a, j, memo)))
+      end
+      _dagSum(terms)
+    end
+  else
+    throw(_NoDagDerivative(string(typeof(x)), true))
+  end
+  memo[x] = r
+  return r
 end
 
 """
@@ -2098,18 +2106,26 @@ function _sinkBranchAssignmentsInBlock!(block::Expr)::Expr
     isempty(place[i]) || push!(get!(moved, last(place[i]), Int[]), i)
   end
   isempty(moved) && return block
-  local branchStatements = b -> b isa Expr && b.head === :block ? b.args : Any[b]
-  function rebuild(i::Int)
-    local st = stmts[i]
-    local ifex = _assignedIf(st)
-    (ifex === nothing || !(haskey(moved, (i, 2)) || haskey(moved, (i, 3)))) && return st
-    local branches = [Expr(:block, Any[rebuild(j) for j in get(moved, (i, k), Int[])]..., branchStatements(ifex.args[k])...)
-                      for k in (2, 3)]
-    return Expr(:(=), st.args[1], Expr(:if, ifex.args[1], branches...))
-  end
-  block.args = Any[rebuild(i) for i in eachindex(stmts) if isempty(place[i])]
+  block.args = Any[_withSunkStatements(stmts, moved, i) for i in eachindex(stmts) if isempty(place[i])]
   return block
 end
+
+"""
+Statement `i` of `stmts` (`_sinkBranchAssignmentsInBlock!`): an if-expression's assignment with the statements
+`moved` places in its branches (each one rebuilt alike) before the branch's own; any other statement as it is.
+"""
+function _withSunkStatements(stmts::Vector{Any}, moved::Dict{Tuple{Int, Int}, Vector{Int}}, i::Int)
+  local st = stmts[i]
+  local ifex = _assignedIf(st)
+  (ifex === nothing || !(haskey(moved, (i, 2)) || haskey(moved, (i, 3)))) && return st
+  local branches::Vector{Expr} = Expr[Expr(:block, Any[_withSunkStatements(stmts, moved, j) for j in get(moved, (i, k), Int[])]...,
+                                           _branchStatements(ifex.args[k])...)
+                                      for k in (2, 3)]
+  return Expr(:(=), st.args[1], Expr(:if, ifex.args[1], branches...))
+end
+
+"The statements of an if-expression's branch `b`: a block's, else `b` alone."
+_branchStatements(@nospecialize(b))::Vector{Any} = b isa Expr && b.head === :block ? b.args : Any[b]
 
 
 """
@@ -2430,7 +2446,7 @@ function _resolveParamValues(pars; used::Union{Nothing, Set{String}} = nothing)
 
   # Build a substitution dict from numeric values (using unwrapped symbolic keys)
   local subDict = Dict{Any, Any}()
-  for (k, v) in pars
+  for (k, _) in pars
     local kStr::Union{Nothing, String} = variableName(k)
     if haskey(numericByStr, kStr)
       local uk = k isa Symbolics.Num ? Symbolics.unwrap(k) : k
@@ -2563,7 +2579,7 @@ Requires the reduced system to have been compiled with `split=false` so that
 the generated event callback functions expect a flat parameter vector.
 """
 function _extractAndMergeEventCallbacks(reducedSystem, @nospecialize(customCallbacks))
-  local eventCBs = nothing
+  local eventCBs
   try
     eventCBs = ModelingToolkit.process_events(reducedSystem)
   catch ex
@@ -2728,7 +2744,7 @@ struct _MergedContinuousInitialize{S}
   nsub::Int
 end
 
-function (m::_MergedContinuousInitialize)(c, u, t, integrator)::Nothing
+function (m::_MergedContinuousInitialize)(_, u, t, integrator)::Nothing
   for k in 1:m.nsub
     local s = m.subs[k]
     s.initialize(s, u, t, integrator)

@@ -187,10 +187,10 @@ function causalSchedule!(g::Gen; keepsArrays::Bool, full::Bool, fixedMask::Vecto
      `OMBackend._arrayStartFailure`) =#
   local hasArrays::Bool = keepsArrays && any(c::EqClass -> size(c.domain, 2) > 1, g.classes)
   local large::BitVector = _largeBlocks(g, loops, matchRow, el)
-  local deps::Union{Nothing, Vector{Vector{Int}}} = _stateDeps(el, matchRow, batches, producer, loops, g.nStates)
+  local deps::Union{Nothing, Vector{Vector{Int}}} = _stateDeps(el, matchRow, batches, producer, loops)
   local pattern::Union{Nothing, Tuple{Vector{Int}, Vector{Int}}} = _jacobianPattern(el, matchRow, deps, g.nStates)
   local initial::InitialMatching =
-    _initialMatching(g, deps, producer, fixedMask, _freeParameterDeps(g, el, matchRow, batches, producer, loops))
+    _initialMatching(g, deps, producer, fixedMask, _freeParameterDeps(g, el, batches, producer, loops))
   #= initial algorithms that run after the initial system: what they assign, which initial equations may not read =#
   local initAlgOuts::Set{String} = _initAlgAssigned(g, .!_parameterAlgorithms(g))
   for c in g.initClasses, r in accesses!(accesses!(Ref[], c.lhs), c.rhs)
@@ -364,7 +364,7 @@ function _knownSubscript(x::IR, d::Matrix{Int}, col::Int)::Union{Nothing, Int}
 end
 
 "Whether `x` calls a function (`:fcall`, also in a relation's or an event-generating function's operand)."
-_callsFunction(x::IR)::Bool = false
+_callsFunction(::IR)::Bool = false
 _callsFunction(x::Op)::Bool = x.op == :fcall || any(_callsFunction, x.args)
 _callsFunction(x::Rel)::Bool = _callsFunction(x.lhs) || _callsFunction(x.rhs)
 _callsFunction(x::EvFn)::Bool = _callsFunction(x.arg)
@@ -375,8 +375,8 @@ _callsFunction(x::EvFn)::Bool = _callsFunction(x.arg)
 Whether the algorithm statement `st` asserts (`SAssert`) or, where a function has an assert (`functionAsserts`), calls
 a function (`_callsFunction`), at any depth.
 """
-_checks(st::Stmt, functionAsserts::Bool)::Bool = false
-_checks(st::SAssert, functionAsserts::Bool)::Bool = true
+_checks(::Stmt, ::Bool)::Bool = false
+_checks(::SAssert, ::Bool)::Bool = true
 _checks(st::SAssign, functionAsserts::Bool)::Bool = functionAsserts && _callsFunction(st.value)
 _checks(st::SCall, functionAsserts::Bool)::Bool = functionAsserts && _callsFunction(st.call)
 _checks(st::Union{SIf, SWhen}, functionAsserts::Bool)::Bool =

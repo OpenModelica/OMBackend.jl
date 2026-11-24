@@ -39,7 +39,6 @@ import DifferentialEquations
 import DifferentialEquations.ReturnCode
 import ModelingToolkit
 import OMBackend
-import OMBackend.@BACKEND_LOGGING
 
 """
   Converts a symbol (of a MTK variable) to a string.
@@ -113,18 +112,6 @@ function createNewU0(symsOfOldProblem::Vector{Symbol},
     end
   end
   return newU0
-end
-
-
-
-"""
-```
-isReturnCodeSuccess(integrator)
-```
-Returns true if the current return code of the supplied integrator argument is `Success`.
-"""
-function isReturnCodeSuccess(integrator)
-  integrator.sol.retcode == ReturnCode.Success
 end
 
 function getUnknowns(integrator)

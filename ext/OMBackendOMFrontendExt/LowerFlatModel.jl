@@ -331,7 +331,7 @@ end
 lowerIterators(iters::Union{AbstractVector{<:Tuple}, MetaModelica.List{<:Tuple}})::Vector{IR.Iterator} =
   IR.Iterator[IR.Iterator(Symbol(F.name(node)), lowerExp(range)) for (node, range) in iters]
 
-lowerClock(k::F.INFERRED_CLOCK)::IR.ClockKind = IR.INFERRED_CLOCK()
+lowerClock(::F.INFERRED_CLOCK)::IR.ClockKind = IR.INFERRED_CLOCK()
 lowerClock(k::F.INTEGER_CLOCK)::IR.ClockKind =
   IR.INTEGER_CLOCK(lowerExp(k.intervalCounter), lowerExp(k.resolution))
 lowerClock(k::F.REAL_CLOCK)::IR.ClockKind = IR.REAL_CLOCK(lowerExp(k.interval))

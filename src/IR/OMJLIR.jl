@@ -213,6 +213,15 @@ struct T_ENUMERATION <: ModelicaType
   literals::Vector{Symbol}
 end
 
+"Real, Integer or Boolean: a type of Julia `Number` values."
+const NumberType = Union{T_REAL, T_INTEGER, T_BOOLEAN}
+
+"A discrete-time scalar type: Integer, Boolean or an enumeration."
+const DiscreteType = Union{T_INTEGER, T_BOOLEAN, T_ENUMERATION}
+
+"A scalar type other than String and Clock: Real, Integer, Boolean or an enumeration."
+const ScalarType = Union{T_REAL, T_INTEGER, T_BOOLEAN, T_ENUMERATION}
+
 "An array type: its element type and its dimensions, outermost first."
 struct T_ARRAY <: ModelicaType
   elementType::ModelicaType
@@ -1037,6 +1046,12 @@ struct ALGEBRAIC_DER <: VariableKind
   state::Symbol
 end
 
+"A state or an algebraic variable (`ALGEBRAIC_DER` included): a continuous variable other than a state derivative."
+const StateOrAlgebraic = Union{STATE, ALGEBRAIC, ALGEBRAIC_DER}
+
+"A continuous-time variable of the continuous system: a state, a state derivative or an algebraic variable."
+const ContinuousKind = Union{STATE, STATE_DER, ALGEBRAIC, ALGEBRAIC_DER}
+
 "A state derivative that index reduction made algebraic: the derivative of `dummyState`."
 struct DUMMY_DER <: VariableKind
   dummyState::Symbol
@@ -1198,11 +1213,6 @@ function Base.filter!(f::F, set::VariableSet)::VariableSet where {F}
     set.index[v.name] = i
   end
   return set
-end
-
-"The variables of `set` of kind `K`."
-function variablesOfKind(set::VariableSet, ::Type{K})::Vector{Variable} where {K <: VariableKind}
-  return Variable[v for v in set.variables if v.kind isa K]
 end
 
 isState(v::Variable)::Bool = v.kind isa STATE
@@ -1497,9 +1507,6 @@ struct SubClock <: Node
   solverMethod::Union{Nothing, String}
 end
 
-"The clock that ticks with its base clock."
-const IDENTITY_SUBCLOCK = SubClock(1 // 1, 0 // 1, nothing)
-
 "Evaluated at the ticks of the sub-clock `subClock` of base clock `baseClock`."
 struct CLOCKED_PARTITION <: Association
   baseClock::Int
@@ -1673,7 +1680,6 @@ dimensions(ty::T_SLICE)::Vector{Dimension} = dimensions(ty.of)[1:end - length(ty
 dimensions(::ModelicaType)::Vector{Dimension} = Dimension[]
 
 isArray(ty::ModelicaType)::Bool = ty isa T_ARRAY
-isScalar(ty::ModelicaType)::Bool = !(ty isa T_ARRAY)
 
 #= ==================================================================================== =#
 #= Traversal                                                                            =#
@@ -1809,6 +1815,20 @@ function _anyExp(s::_Any, e::Expression)::Bool
   (s.p(e)::Bool) && return true
   return last(traverseFields(e, s, false))
 end
+
+"""
+    anyExp(p, x::Union{Statement, Equation})
+
+Whether `p` holds for an expression of a statement or an equation (or of the equations and statements in it), or for
+one of its subexpressions, as `foreachExp` visits them; the expressions after the first that holds are not visited.
+"""
+anyExp(@nospecialize(p), @nospecialize(x::Union{Statement, Equation}))::Bool = _anyRootExp(_Any(p), x)
+
+(s::_Any)(x::Union{Statement, Equation}, found::Bool) = (x, found || _anyRootExp(s, x))
+
+"`anyExp` of a statement or an equation by its wrapper; a reinit's state as a reference (`foreachRootExp`)."
+_anyRootExp(s::_Any, x::Union{Statement, Equation})::Bool = last(traverseFields(x, s, false))
+_anyRootExp(s::_Any, r::REINIT)::Bool = _anyExp(s, CREF(r.state, T_REAL())) || _anyExp(s, r.value)
 
 "The direct subexpressions of `e`, the subscripts' expressions included, in field order."
 children(@nospecialize(e::Expression))::Vector{Expression} = last(traverseFields(e, _pushChild, Expression[]))

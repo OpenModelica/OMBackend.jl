@@ -68,10 +68,10 @@ function arrayAliasPairs(view::Scalarized, blocked::Set{Symbol})::Dict{Tuple{Sym
   local discretes::Set{Symbol} = discreteTargets(partition)
   local isCandidate = (name::Symbol) -> begin
     local v::Union{Nothing, IR.Variable} = get(variables, name, nothing)
-    v !== nothing && v.ty isa IR.T_REAL && v.kind isa Union{IR.STATE, IR.ALGEBRAIC, IR.ALGEBRAIC_DER} &&
+    v !== nothing && v.ty isa IR.T_REAL && v.kind isa IR.StateOrAlgebraic &&
       !(name in discretes) && v.direction !== IR.INPUT
   end
-  local noConstant = (e::IR.Expression) -> false
+  local noConstant = (::IR.Expression) -> false
   local pairs::Dict{Tuple{Symbol, Symbol}, ArrayPair} = Dict{Tuple{Symbol, Symbol}, ArrayPair}()
   for (j::Int, eq::IR.Equation) in enumerate(partition.equations)
     local a::Union{Nothing, Tuple} = aliasEquation(eq, isCandidate, noConstant)
@@ -177,11 +177,12 @@ function arrayAliasBlocked(model::IR.Model, E::Elements)::Union{Nothing, Set{Sym
   local antiderivative::Dict{Symbol, Symbol} = antiderivatives(variables)
   local blocked::Set{Symbol} = Set{Symbol}()
   local resolve::Resolver = Resolver(Symbol[v.name for v in variables])
-  local sliced::Bool = false
+  #= a Ref: a flag the closure sets is boxed =#
+  local sliced::Base.RefValue{Bool} = Base.RefValue{Bool}(false)
   local scan = (@nospecialize(e::IR.Expression)) -> begin
     IR.foreachExp(e) do @nospecialize(x::IR.Expression)
       x isa IR.CREF || return nothing
-      any(p -> p.ty isa IR.T_SLICE, x.cref.parts) && (sliced = true; return nothing)
+      any(p -> p.ty isa IR.T_SLICE, x.cref.parts) && (sliced[] = true; return nothing)
       local (name::Symbol, subscripts::Vector{IR.Subscript}) = aliasReference(x.cref, variables)
       if haskey(variables, name)
         local n::Int = length(subscripts)
@@ -200,7 +201,7 @@ function arrayAliasBlocked(model::IR.Model, E::Elements)::Union{Nothing, Set{Sym
   for eq in partition.initialEquations
     IR.foreachRootExp(scan, eq)
   end
-  return sliced ? nothing : blocked
+  return sliced[] ? nothing : blocked
 end
 
 """
@@ -317,15 +318,9 @@ function substituteArrayAliases!(model::IR.Model, view::Scalarized)::AliasUndo
     local e::IR.CREF = IR.CREF(cref, x.ty)
     return r.negated ? IR.UNARY(IR.UMINUS, e, x.ty) : e
   end
-  local reads = (eq::IR.Equation) -> begin
-    local found::Bool = false
-    IR.foreachRootExp(eq) do @nospecialize(e::IR.Expression)
-      found || (found = IR.anyExp((@nospecialize(x::IR.Expression)) ->
-                                    x isa IR.CREF && haskey(replacements, first(aliasReference(x.cref, variables))), e))
-      nothing
-    end
-    found
-  end
+  local reads = (eq::IR.Equation) ->
+    IR.anyExp((@nospecialize(x::IR.Expression)) ->
+                x isa IR.CREF && haskey(replacements, first(aliasReference(x.cref, variables))), eq)
   partition.equations = IR.Equation[rewriteAliasLeaves(eq, (i, Int[]), kept, substitute, reads)
                                     for (i, eq) in enumerate(partition.equations)]
   local noLeaves::Set{EquationLeaf} = Set{EquationLeaf}()

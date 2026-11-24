@@ -421,10 +421,10 @@ end
 Whether an initial algorithm reads der().
 """
 function _readsDerivative(ia::SC.INITIAL_ALGORITHM)::Bool
-  local found = false
-  foreach((@nospecialize(s::SC.Statement)) ->
-            SC.mapStatementExps((@nospecialize(e::SC.Exp)) -> (found |= containsDerCall(e); e), s), ia.statements)
-  return found
+  #= a Ref: a flag the closure sets is boxed =#
+  local found::Base.RefValue{Bool} = Base.RefValue{Bool}(false)
+  SC.foreachStatementExp((@nospecialize(e::SC.Exp)) -> (found[] = found[] || containsDerCall(e); nothing), ia.statements)
+  return found[]
 end
 
 """
@@ -562,21 +562,29 @@ end
 The iterators of the for loops of the early initial algorithms.
 """
 function _initAlgIterators(simCode::SC.SIM_CODE)::Set{String}
-  local out = Set{String}()
-  local walk! = nothing
-  walk! = (body::Vector{SC.Statement}) -> foreach(body) do s
+  local out::Set{String} = Set{String}()
+  for ia in _earlyInitialAlgorithms(simCode)
+    _forIterators!(out, ia.statements)
+  end
+  return out
+end
+
+"The iterators of the for-statements in `body` (nested ones too) into `out`."
+function _forIterators!(out::Set{String}, body::Vector{SC.Statement})::Nothing
+  for s::SC.Statement in body
     if s isa SC.FOR
       push!(out, String(s.iterator.name))
-      walk!(s.body)
+      _forIterators!(out, s.body)
     elseif s isa SC.IF
-      foreach(b -> walk!(b.body), s.branches)
-      walk!(s.elseBody)
+      for b in s.branches
+        _forIterators!(out, b.body)
+      end
+      _forIterators!(out, s.elseBody)
     elseif s isa SC.WHILE
-      walk!(s.body)
+      _forIterators!(out, s.body)
     end
   end
-  foreach(ia -> walk!(ia.statements), _earlyInitialAlgorithms(simCode))
-  return out
+  return nothing
 end
 
 """
@@ -623,7 +631,7 @@ end
 
 _callsDer(@nospecialize(ex)) = ex isa Expr && ((ex.head === :call && ex.args[1] === :der) || any(_callsDer, ex.args))
 
-#= The value of a `begin #= line =# x end` the algorithm lowering wraps expressions in. =#
+"The value of a `begin #= line =# x end` the algorithm lowering wraps expressions in."
 function _blockValue(@nospecialize(ex))
   (ex isa Expr && ex.head === :block) || return ex
   local body = filter(a -> !(a isa LineNumberNode), ex.args)
@@ -1004,7 +1012,7 @@ function generateInitialAlgorithmFunction(simCode::SC.SIM_CODE)::Expr
     if haskey(ht, name)
       local sv = last(ht[name])
       if name in selfRead && !(sv.varKind isa Union{SC.PARAMETER, SC.DATA_STRUCTURE, SC.STRING}) &&
-         sv.attributes.start isa Union{Nothing, SC.RCONST, SC.ICONST, SC.BCONST}
+         sv.attributes.start isa Union{Nothing, SC.NumberLiteral}
         #= a target an arm reads itself reads its pre() value, at the initialization its start (MLS 11.1.2): the
            problem holds the early pass's results already (`when {initial(), sample(...)} then n := n + 1` gave 2);
            a start that is no literal, the problem's value as before. Another arm's target read here is the

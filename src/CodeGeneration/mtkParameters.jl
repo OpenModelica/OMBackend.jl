@@ -271,33 +271,42 @@ function _dataStructureParameterPrelude(simCode::SC.SIM_CODE, emitted::Set{Strin
      does not lower): not tried again from each parameter that reads it =#
   local failed = Set{String}()
   #= at module level the model's functions are CodeGeneration's (qualifyModelicaFunctions!) =#
-  local funcNames = OrderedSet{Symbol}(Symbol(f.name) for f in simCode.functions)
-  local emit!
-  emit! = function (nm::String)
-    nm in emitted && return true
-    (nm in visiting || nm in failed) && return false
-    local e = get(ht, nm, nothing)
-    e === nothing && return false
-    local sv = last(e)
-    (SC.isScalarParameter(sv) && !OMBackend.isTunableParameter(nm)) || return false
-    local b = sv.varKind.bindExp
-    b === nothing && return false
-    push!(visiting, nm)
-    local ok = all(emit!, SC.allCrefNames(b))
-    local rhs = ok ? OMBackend._tryOr(() -> expToJuliaExpMTK(b, simCode), nothing, :dataStructureParameterPrelude;
-                                     only = UnsupportedLowering, impact = :result) : nothing
-    delete!(visiting, nm)
-    rhs === nothing && (push!(failed, nm); return false)
-    rhs isa Expr && !isempty(funcNames) && qualifyModelicaFunctions!(rhs, funcNames)
-    push!(out, :($(Symbol(sv.name)) = $(rhs)))
-    push!(emitted, nm)
-    return true
-  end
+  local funcNames::OrderedSet{Symbol} = OrderedSet{Symbol}(Symbol(f.name) for f in simCode.functions)
   for (_, (_, sv)) in ht
     (sv.varKind isa SC.DATA_STRUCTURE && sv.varKind.bindExp !== nothing) || continue
-    foreach(emit!, SC.allCrefNames(sv.varKind.bindExp))
+    for nm::String in SC.allCrefNames(sv.varKind.bindExp)
+      _emitDataStructureParameter!(out, nm, simCode, emitted, visiting, failed, funcNames)
+    end
   end
   return out
+end
+
+"""
+The assignment of the parameter `nm` (`_dataStructureParameterPrelude`), after those of the parameters its binding
+reads, onto `out`: whether `nm` is computed (`emitted`). `visiting`: the parameters on the way to it (a cycle);
+`failed`: those that cannot be computed at module level.
+"""
+function _emitDataStructureParameter!(out::Vector{Expr}, nm::String, simCode::SC.SIM_CODE, emitted::Set{String},
+                                      visiting::Set{String}, failed::Set{String}, funcNames::OrderedSet{Symbol})::Bool
+  nm in emitted && return true
+  (nm in visiting || nm in failed) && return false
+  local e = get(simCode.stringToSimVarHT, nm, nothing)
+  e === nothing && return false
+  local sv = last(e)
+  (SC.isScalarParameter(sv) && !OMBackend.isTunableParameter(nm)) || return false
+  local b = sv.varKind.bindExp
+  b === nothing && return false
+  push!(visiting, nm)
+  local ok::Bool = all((r::String) -> _emitDataStructureParameter!(out, r, simCode, emitted, visiting, failed, funcNames),
+                       SC.allCrefNames(b))
+  local rhs = ok ? OMBackend._tryOr(() -> expToJuliaExpMTK(b, simCode), nothing, :dataStructureParameterPrelude;
+                                   only = UnsupportedLowering, impact = :result) : nothing
+  delete!(visiting, nm)
+  rhs === nothing && (push!(failed, nm); return false)
+  rhs isa Expr && !isempty(funcNames) && qualifyModelicaFunctions!(rhs, funcNames)
+  push!(out, :($(Symbol(sv.name)) = $(rhs)))
+  push!(emitted, nm)
+  return true
 end
 
 #= Emit the array parameters' bindings at module top so that DATA_STRUCTURE
@@ -400,7 +409,7 @@ function createArrayParameterPrelude(simCode::SC.SIM_CODE)::Vector{Expr}
        BearingFriction's ExternalCombiTable1D(table = tau_pos) with RobotR3's tau_pos = [0, Rv0
        / unitTorque; ...]: the table was undefined). =#
     local b = SC.isScalarParameter(simVar) ? simVar.varKind.bindExp : nothing
-    local val = b === nothing ? nothing : b isa Union{SC.RCONST, SC.ICONST, SC.BCONST} ? b.value : SC.valueAtBuildStart(b, simCode)
+    local val = b === nothing ? nothing : b isa SC.NumberLiteral ? b.value : SC.valueAtBuildStart(b, simCode)
     val === nothing && continue
     push!(get!(scalarGroups, baseName, Tuple{Vector{Int}, Any, Int}[]),
           (indices, val, length(indices)))
@@ -597,7 +606,7 @@ end
   The index here is the index assigned by the code generator earlier in the lowering
   of the hybrid DAE.
 """
-function createParameterArray(parameters::Vector, parameterAssignments::Vector, simCode::SC.SIM_CODE)
+function createParameterArray(parameters::Vector, simCode::SC.SIM_CODE)
   local paramArray = Union{Float64, Symbol}[]
   local hT = simCode.stringToSimVarHT
   for param in parameters

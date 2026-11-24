@@ -161,23 +161,27 @@ A variable for each equation among its candidates, each variable for one equatio
 paths, Kuhn); `nothing` for an equation left without one.
 """
 function matchAssignments(candidates::Vector{Vector{Symbol}})::Vector{Union{Nothing, Symbol}}
-  local owner = Dict{Symbol, Int}()
-  local result = Vector{Union{Nothing, Symbol}}(nothing, length(candidates))
-  local augment!
-  augment! = (i, seen) -> begin
-    for v in candidates[i]
-      v in seen && continue
-      push!(seen, v)
-      if !haskey(owner, v) || augment!(owner[v], seen)
-        owner[v] = i
-        result[i] = v
-        return true
-      end
-    end
-    return false
+  local owner::Dict{Symbol, Int} = Dict{Symbol, Int}()
+  local result::Vector{Union{Nothing, Symbol}} = Vector{Union{Nothing, Symbol}}(nothing, length(candidates))
+  for i in eachindex(candidates)
+    _augmentAssignment!(owner, result, candidates, i, Set{Symbol}())
   end
-  foreach(i -> augment!(i, Set{Symbol}()), eachindex(candidates))
   return result
+end
+
+"An augmenting path from the assignment `i` (`matchAssignments`, variables `seen` visited): `owner` and `result` changed along it."
+function _augmentAssignment!(owner::Dict{Symbol, Int}, result::Vector{Union{Nothing, Symbol}},
+                             candidates::Vector{Vector{Symbol}}, i::Int, seen::Set{Symbol})::Bool
+  for v in candidates[i]
+    v in seen && continue
+    push!(seen, v)
+    if !haskey(owner, v) || _augmentAssignment!(owner, result, candidates, owner[v], seen)
+      owner[v] = i
+      result[i] = v
+      return true
+    end
+  end
+  return false
 end
 
 nameOf(e::IR.Expression)::Union{Nothing, Symbol} = e isa IR.CREF ? e.cref.name : nothing

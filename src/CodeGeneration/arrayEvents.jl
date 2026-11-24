@@ -197,7 +197,7 @@ function conditions!(out::AbstractVector, u::AbstractVector, t::Real,
 end
 
 "At the start of a solve: the relations' hysteresis for its tolerance and span."
-function _startHysteresis!(cb::DiffEqBase.SciMLBase.DECallback, u::AbstractVector, t::Real,
+function _startHysteresis!(::DiffEqBase.SciMLBase.DECallback, ::AbstractVector, ::Real,
                           integrator::DiffEqBase.DEIntegrator)::Nothing
   integrator.p.hyst[1] = _hysteresis(integrator)
   return nothing
@@ -406,7 +406,7 @@ end
 The samples' stops as a callback: the first stop at the start of a solve (a tick at the start time handled there), then
 each from the one before (affectSample!), a solver stop where within tspan.
 """
-function _sampleStart!(cb::DiffEqBase.SciMLBase.DECallback, u::AbstractVector, t::Real,
+function _sampleStart!(::DiffEqBase.SciMLBase.DECallback, ::AbstractVector, t::Real,
                        integrator::DiffEqBase.DEIntegrator)::Nothing
   local stops::Vector{Float64} = integrator.p.state.sampleStops
   local tspan::Tuple{Real, Real} = integrator.sol.prob.tspan
@@ -422,7 +422,7 @@ function _sampleStart!(cb::DiffEqBase.SciMLBase.DECallback, u::AbstractVector, t
 end
 
 "Whether a sample stop is due at t (the samples' callback's condition)."
-_sampleDue(u::AbstractVector, t::Real, integrator::DiffEqBase.DEIntegrator)::Bool =
+_sampleDue(::AbstractVector, t::Real, integrator::DiffEqBase.DEIntegrator)::Bool =
   t == integrator.p.state.sampleStops[2]
 
 """

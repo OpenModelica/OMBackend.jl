@@ -916,12 +916,12 @@ function differentiatedArrayEquations(partition::IR.Partition, view::Scalarized,
 end
 
 """
-    stateSets(model, p, E, variables, viewVariables) -> Tuple{Vector{IR.Variable}, Vector{IR.Equation}, Int}
+    stateSets(p, E, variables, viewVariables) -> Tuple{Vector{IR.Variable}, Vector{IR.Equation}, Int}
 
 The plan's dynamic state sets: of scalars as `commit!` makes them (`dynamicSetParts`), of the elements of arrays by
 family (`setFamilies`, `familyParts`); their variables, equations and number.
 """
-function stateSets(model::IR.Model, p::Plan, E::Elements, variables::IR.VariableSet,
+function stateSets(p::Plan, E::Elements, variables::IR.VariableSet,
                    viewVariables::IR.VariableSet)::Tuple{Vector{IR.Variable}, Vector{IR.Equation}, Int}
   local newVariables = IR.Variable[]
   local equations = IR.Equation[]
@@ -976,7 +976,7 @@ function arrayCommit(model::IR.Model, partition::IR.Partition, view::Scalarized,
   local kinds = arrayKinds(plannedKinds(s, p.dummies), E, variables)
   local equations = differentiatedArrayEquations(expandedPartition, view, p, E, variables, derivatives, model.functions)
   append!(equations, linkEquations)
-  local (setVariables, setEquations, sets) = stateSets(model, p, E, variables, view.model.variables)
+  local (setVariables, setEquations, sets) = stateSets(p, E, variables, view.model.variables)
   append!(equations, setEquations)
   return ArrayCommit(vcat(added, links, setVariables), kinds, equations, sets, expanded)
 end
@@ -1031,12 +1031,7 @@ function initialDummyDerivatives(eq::IR.Equation, variables::IR.VariableSet)::IR
     v === nothing && (v = get(variables, IR.withoutSubscripts(a.cref).name, nothing))
     return v !== nothing && v.kind isa IR.DUMMY_STATE
   end
-  local found::Bool = false
-  IR.foreachRootExp(eq) do @nospecialize(e::IR.Expression)
-    found || (found = IR.anyExp(isDummy, e))
-    nothing
-  end
-  found || return eq
+  IR.anyExp(isDummy, eq) || return eq
   local replace::Function = (@nospecialize(x::IR.Expression)) ->
     isDummy(x) ? IR.CREF(IR.derivativeCref(only((x::IR.CALL).arguments).cref), IR.T_REAL()) : x
   return IR.mapEquation!(replace, deepcopy(eq))
@@ -1064,6 +1059,15 @@ function exposeArrayLinearConstraints!(model::IR.Model, view::Scalarized)::Bool
     written = true
   end
   return written
+end
+
+"The elements of the continuous arrays of `model` that the element view `view` lists."
+function continuousArrayElements(model::IR.Model, view::Scalarized)::Int
+  local n::Int = 0
+  for v in model.variables
+    (isContinuousArray(v) && haskey(view.elements.elements, v.name)) && (n += length(view.elements.elements[v.name]))
+  end
+  return n
 end
 
 """
@@ -1109,15 +1113,12 @@ function reduceIndexArrays!(model::IR.Model; arrays::Bool = true)::Bool
   local splits::Int = 0
   local stale::Bool = false
   local final::Union{Nothing, Tuple{Scalarized, Plan, ArrayCommit}} = nothing
-  local arrayElements::Int = sum((length(view.elements.elements[v.name]) for v in model.variables
-                                  if isContinuousArray(v) && haskey(view.elements.elements, v.name)); init = 0)
+  local arrayElements::Int = continuousArrayElements(model, view)
   while true
     try
       arrayCommit(model, model.continuous[1], view, written)
       stale || break
       (view, written) = knownPlan(model, view, nothing)
-      partition = view.model.continuous[1]
-      stale = false
       final = (view, written, arrayCommit(model, model.continuous[1], view, written))
       break
     catch err
@@ -1126,33 +1127,16 @@ function reduceIndexArrays!(model::IR.Model; arrays::Bool = true)::Bool
       splits += 1
       #= split down to no array equations, or most of the arrays' elements split: little the array form keeps, the
          scalarized path is the one (MSL EngineV6: its frames' vectors and rotations, 10877 elements split) =#
-      local kept::Int = sum((length(view.elements.elements[v.name]) for v in model.variables
-                             if isContinuousArray(v) && haskey(view.elements.elements, v.name)); init = 0)
+      local kept::Int = continuousArrayElements(model, view)
       (hasArrayEquations(model) && 2 * kept >= arrayElements) ||
         throw(NotHandled("slicing that splits most of the arrays ($(arrayElements - kept) of $(arrayElements) elements, " *
                          "starting at $(err.reason))"))
       view = scalarizeArrays(model; cache)
-      partition = view.model.continuous[1]
       stale = true
     end
   end
   final === nothing && return commitArrayPlan!(model, view, written)
   return commitPlan!(model, final...)
-end
-
-"""
-    commitIndexOne!(model) -> Bool
-
-A model without continuous arrays (on the arrays-kept route, for the array code) of index 1 committed as
-`reduceIndexArrays!` commits one: the plan that differentiates nothing, its states, their derivative variables and
-links. False, the model not changed, where its index is above one (the scalarized path reduces it).
-"""
-function commitIndexOne!(model::IR.Model)::Bool
-  local view::Scalarized = scalarizeArrays(model)
-  local written::Plan = plan(view.model, view.model.continuous[1]; indexOne = true, initialDerivatives = true)
-  isempty(written.differentiated) || return false
-  commitArrayPlan!(model, view, written)
-  return true
 end
 
 """

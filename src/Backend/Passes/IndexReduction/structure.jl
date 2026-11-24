@@ -139,19 +139,35 @@ The variables a when-equation of the partition assigns: discrete, known to the c
 system (as parameters, constants and time are).
 """
 function discreteTargets(partition::IR.Partition)::Set{Symbol}
-  local out = Set{Symbol}()
-  local visit(s::IR.ASSIGNMENT) = s.lhs isa IR.CREF && push!(out, s.lhs.cref.name)
-  local visit(s::Union{IR.IF_STATEMENT, IR.WHEN_STATEMENT}) =
-    (foreach(b -> foreach(visit, b.body), s.branches); s isa IR.IF_STATEMENT && foreach(visit, s.elseBody))
-  local visit(s::Union{IR.FOR_STATEMENT, IR.WHILE_STATEMENT}) = foreach(visit, s.body)
-  local visit(s::IR.Statement) = nothing
+  local out::Set{Symbol} = Set{Symbol}()
   for eq in partition.equations
     eq isa IR.WHEN_EQUATION || continue
-    for b in eq.branches
-      foreach(visit, b.body)
+    for b in eq.branches, s::IR.Statement in b.body
+      whenAssignedNames!(out, s)
     end
   end
   return out
+end
+
+"The names the statement `s` assigns a reference to (its nested statements too) into `out` (`discreteTargets`)."
+function whenAssignedNames!(out::Set{Symbol}, s::IR.Statement)::Nothing
+  if s isa IR.ASSIGNMENT
+    s.lhs isa IR.CREF && push!(out, s.lhs.cref.name)
+  elseif s isa Union{IR.IF_STATEMENT, IR.WHEN_STATEMENT}
+    for b in s.branches, x::IR.Statement in b.body
+      whenAssignedNames!(out, x)
+    end
+    if s isa IR.IF_STATEMENT
+      for x::IR.Statement in s.elseBody
+        whenAssignedNames!(out, x)
+      end
+    end
+  elseif s isa Union{IR.FOR_STATEMENT, IR.WHILE_STATEMENT}
+    for x::IR.Statement in s.body
+      whenAssignedNames!(out, x)
+    end
+  end
+  return nothing
 end
 
 """
@@ -163,7 +179,7 @@ state derivative or an algebraic variable, not a when-equation's target.
 function isContinuousVariable(v::IR.Variable, discretes::Set{Symbol})::Bool
   v.ty isa IR.T_REAL || return false
   v.name in discretes && return false
-  return v.kind isa Union{IR.STATE, IR.STATE_DER, IR.ALGEBRAIC, IR.ALGEBRAIC_DER}
+  return v.kind isa IR.ContinuousKind
 end
 
 "The built-in calls whose arguments are not read at the current time as continuous variables."
@@ -241,15 +257,13 @@ end
 "Whether the body of an array constructor reads a reference subscripted by one of its iterators (`x[i]`)."
 function readsIterated(e::IR.ARRAY_CONSTRUCTOR)::Bool
   local names = Set{Symbol}(it.name for it in e.iterators)
-  local found = false
-  IR.foreachExp(e.body) do x
-    x isa IR.CREF || return nothing
-    for p in x.cref.parts, sub in p.subscripts
-      sub isa IR.INDEX && any(c -> c.name in names, IR.crefsOf(sub.exp)) && (found = true)
+  return IR.anyExp(e.body) do x::IR.Expression
+    x isa IR.CREF || return false
+    for p::IR.CrefPart in x.cref.parts, sub::IR.Subscript in p.subscripts
+      (sub isa IR.INDEX && any((c::IR.ComponentRef) -> c.name in names, IR.crefsOf(sub.exp))) && return true
     end
-    nothing
+    return false
   end
-  return found
 end
 
 """
@@ -323,10 +337,11 @@ function equationReads(@nospecialize(eq::IR.Equation), resolve::F, functions::Di
     end
     return Union{Nothing, Vector{Symbol}}[r === nothing ? nothing : unique!(r) for r in rows]
   elseif eq isa IR.ALGORITHM
-    local out = Symbol[]
-    IR.foreachRootExp(e -> continuousReads!(out, e, resolve), eq)
+    #= its own name: `if` opens no scope, and the closure boxed the `out` the branches above assign =#
+    local algorithmReads = Symbol[]
+    IR.foreachRootExp(e -> continuousReads!(algorithmReads, e, resolve), eq)
     local outputs = sum(c -> length(resolve(c.name)), eq.outputs; init = 0)
-    return Union{Nothing, Vector{Symbol}}[copy(out) for _ in 1:outputs]
+    return Union{Nothing, Vector{Symbol}}[copy(algorithmReads) for _ in 1:outputs]
   elseif eq isa Union{IR.ASSERT_EQUATION, IR.WHEN_EQUATION}
     return Union{Nothing, Vector{Symbol}}[]
   end
@@ -447,7 +462,7 @@ flow; AST_BatchPlant TwoTanks failed where the levels meet). A record or array v
 elements are picked from the literal).
 """
 function withoutEvents(e::IR.Expression, ty::IR.ModelicaType)::IR.Expression
-  ty isa Union{IR.T_REAL, IR.T_INTEGER, IR.T_BOOLEAN} || return e
+  ty isa IR.NumberType || return e
   (IR.isBuiltinCall(e, :noEvent) || !IR.anyExp((@nospecialize(x::IR.Expression)) -> x isa IR.RELATION, e)) && return e
   return builtinCall(:noEvent, IR.Expression[e], ty)
 end

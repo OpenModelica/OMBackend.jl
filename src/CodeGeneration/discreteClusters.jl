@@ -601,8 +601,10 @@ struct ClusterCrossings
   cluster::DiscreteCluster
 end
 
-#= `events`: per relation 0 (no crossing) or the crossing's direction, -sign of the crossing function before it: -1
-   to negative (the relation true), 1 to positive (false). =#
+"""
+`events`: per relation 0 (no crossing) or the crossing's direction, -sign of the crossing function before it: -1
+to negative (the relation true), 1 to positive (false).
+"""
 function (a::ClusterCrossings)(integrator, events)
   for (k, d) in pairs(events)
     d == 0 || (a.cluster.crossed[k] = Int8(d))
@@ -618,7 +620,7 @@ function _clusterCallback(c::DiscreteCluster)
      iteration does it), and an initialize function that leaves the modified
      flag alone. The event iteration sets the buffers. =#
   return DiffEqBase.VectorContinuousCallback(condition, ClusterCrossings(c), length(c.rel);
-                                             initialize = (cb, u, t, integrator) -> nothing,
+                                             initialize = (_, _, _, _) -> nothing,
                                              initializealg = ModelingToolkit.SciMLBase.NoInit(),
                                              rootfind = ModelingToolkit.SciMLBase.RightRootFind,
                                              save_positions = (true, false))

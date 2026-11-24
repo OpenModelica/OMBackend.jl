@@ -48,6 +48,7 @@ import ..@VSS_DEBUG
 import ModelingToolkit
 import Setfield
 import DiffEqBase
+import LinearAlgebra
 
 using DataStructures
 using ModelingToolkit
@@ -257,6 +258,10 @@ function _rememberMode!(key::RecompiledModeKey, mode::RecompiledMode)::Nothing
   return nothing
 end
 
+"""
+The problem of a model with structural modes that are all compiled in advance (its submodels): the active mode's
+problem, the callbacks that switch modes and the variables the modes share.
+"""
 mutable struct OM_ProblemStructural{T0 <: String, T1, T2, T3}
   "The name of the active mode"
   activeModeName::T0
@@ -274,6 +279,10 @@ mutable struct OM_ProblemStructural{T0 <: String, T1, T2, T3}
   callbackConditions
 end
 
+"""
+The problem of a model whose structural changes recompile it (a frontend model is kept): the active mode's problem
+and the callbacks that detect a structural change.
+"""
 mutable struct OM_ProblemRecompilation{T0 <: String, T1, T2, T3}
   "The name of the active mode"
   activeModeName::T0
@@ -314,8 +323,6 @@ function solve(omProblem::OM_ProblemStructural, tspan, alg; kwargs...)
   local problem = omProblem.problem
   local oldSystem = problem
   local structuralCallbacks = omProblem.structuralCallbacks
-  local commonVariableSet = omProblem.commonVariables
-  local symsOfInitialMode = getSyms(problem)
   local activeModeName = omProblem.activeModeName
   #= Create integrator =#
   integrator = init(problem, alg; solverVerbosity(kwargs)..., kwargs...)
@@ -335,7 +342,6 @@ function solve(omProblem::OM_ProblemStructural, tspan, alg; kwargs...)
         indicesOfCommonVariables = getIndicesOfCommonVariables(getSyms(newSystem)
                                                                ,getSyms(oldSystem)
                                                                ,omProblem.topVariables
-                                                               ,commonVariableSet
                                                                ;destinationPrefix = cb.name
                                                                ,srcPrefix = activeModeName)
 
@@ -509,7 +515,7 @@ function _isDAETransferTarget(newSystem)::Bool
     if mm === nothing
       return false
     end
-    if mm isa UniformScaling
+    if mm isa LinearAlgebra.UniformScaling
       return false
     end
     local d = [mm[k, k] for k in 1:size(mm, 1)]
@@ -956,7 +962,7 @@ end
   use an external server compatible with MockAgentServer.jl.
 """
 const AGENT_CALLBACK = Ref{Function}(
-  (componentsToChange, context, metamodel, t) -> [nothing for _ in componentsToChange]
+  (componentsToChange, _, _, _) -> [nothing for _ in componentsToChange]
 )
 
 """
@@ -1011,7 +1017,7 @@ function solve(omProblem::OM_Problem, tspan, alg; kwargs...)
   #= Create integrator =#
   integrator = init(problem, alg; stop_at_next_tstop = true, solverVerbosity(kwargs)..., kwargs...)
   add_tstop!(integrator, tspan[2])
-  for i in integrator
+  for _ in integrator
   end
   #= Return the final solution =#
   return integrator.sol
@@ -1033,7 +1039,6 @@ end
 function getIndicesOfCommonVariables(syms1::Vector{Symbol} # New system
                                      ,syms2::Vector{Symbol} # old system
                                      ,topVariables::Vector{Symbol}
-                                     ,inCommonVariables::Vector{String}
                                      ;destinationPrefix::String = ""
                                      ,srcPrefix::String = "")
   #= The common variables have the name without the prefix of the destination system =#

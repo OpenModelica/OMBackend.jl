@@ -215,12 +215,12 @@ end
 
 "`foreachRead` by its wrapper."
 function _foreachRead(v::_VisitReads, e::Exp)::Nothing
-  if e isa Union{EXP_CREF, DER, PRE}
+  if e isa CrefExp
     v.f(e.cref, nothing, false)
   elseif e isa ASUB && e.exp isa EXP_CREF
     if all(s::Exp -> s isa ICONST, e.subs)
       v.f(e.exp.cref, Int[(s::ICONST).value for s in e.subs], false)
-    elseif any(s::Exp -> anyExp(x::Exp -> x isa Union{EXP_CREF, DER, PRE}, s), e.subs)
+    elseif any(s::Exp -> anyExp(x::Exp -> x isa CrefExp, s), e.subs)
       v.f(e.exp.cref, nothing, true)
     end
   end

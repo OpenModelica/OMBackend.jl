@@ -98,7 +98,7 @@ end
 const MEMBER_PLACEHOLDER = Symbol("§")
 
 "The subscript of the instance `k` of the group `gi` in a reference outside a rolled equation: its literal index."
-instanceLiteral(gi::Int, k::Int)::IR.Expression = IR.INTEGER(k)
+instanceLiteral(::Int, k::Int)::IR.Expression = IR.INTEGER(k)
 
 """
 The share of the instances' equations rolled into for-equations below which a group is left as it is (`rollGroup!`):
@@ -235,7 +235,7 @@ function rollGroup!(model::IR.Model, g::ComponentGroup)::Bool
     push!(newVariables, rolledVariable(byKey[key], g, groups, memberOf, names, crefOf))
   end
   for (j, auxs) in enumerate(auxiliaries)
-    push!(newVariables, rolledAuxiliary(auxs, j, g, model.variables, names))
+    push!(newVariables, rolledAuxiliary(auxs, j, model.variables, names))
   end
   #= the equations =#
   local rewrite::Function = (e::IR.Expression, index::Function) -> rolledExpression(e, groups, memberOf, names, index)
@@ -522,12 +522,12 @@ function rolledName(name::Symbol, crefOf::Dict{Symbol, IR.ComponentRef}, memberO
 end
 
 """
-    rolledAuxiliary(auxs, j, g, variables, names) -> IR.Variable
+    rolledAuxiliary(auxs, j, variables, names) -> IR.Variable
 
 The auxiliaries `auxs` (one per instance, of role `j`) as an array of one part of type `T_COMPONENTS` (an element
 named as its auxiliary), recorded in `names`.
 """
-function rolledAuxiliary(auxs::Vector{Symbol}, j::Int, g::ComponentGroup, variables::IR.VariableSet, names::RolledNames)::IR.Variable
+function rolledAuxiliary(auxs::Vector{Symbol}, j::Int, variables::IR.VariableSet, names::RolledNames)::IR.Variable
   local first::IR.Variable = variables[auxs[1]]
   isempty(IR.dimensions(first.ty)) || throw(NotHandled("the auxiliary array $(first.name)"))
   all(x::Symbol -> typeof(variables[x].kind) == typeof(first.kind) && variables[x].ty == first.ty, auxs) ||
@@ -702,7 +702,7 @@ equations (the instance's literal subscript).
 """
 function rolledEquations(equations::Vector{IR.Equation}, groups::Vector{ComponentGroup}, memberOf::Dict{Symbol, Tuple{Int, Int}},
                          names::RolledNames, n::Int, iterator::Symbol; aliases::Bool)::Vector{IR.Equation}
-  local loop::Function = (gi::Int, k::Int) -> IR.CREF(IR.ComponentRef(iterator, IR.T_INTEGER()), IR.T_INTEGER())
+  local loop::Function = (::Int, ::Int) -> IR.CREF(IR.ComponentRef(iterator, IR.T_INTEGER()), IR.T_INTEGER())
   local rewrite::Function = (@nospecialize(eq::IR.Equation), index::Function) ->
     rolledReinits(IR.mapEquation!((@nospecialize(e::IR.Expression)) ->
                                     rolledExpression(e, groups, memberOf, names, index), deepcopy(eq)),

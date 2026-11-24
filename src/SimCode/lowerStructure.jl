@@ -194,7 +194,7 @@ The names of the references in `e`, each once, in the reverse order of their fir
 """
 function allCrefNames(@nospecialize(e::Exp))::Vector{String}
   local out = String[]
-  foreachExp(x -> x isa Union{EXP_CREF, DER, PRE} && push!(out, crefName(x.cref)), e)
+  foreachExp(x -> x isa CrefExp && push!(out, crefName(x.cref)), e)
   return reverse(unique(out))
 end
 
@@ -211,7 +211,7 @@ function whenStatementExps(s::IF)::Vector{Exp}
   end
   return out
 end
-whenStatementExps(s::Statement)::Vector{Exp} = Exp[]
+whenStatementExps(::Statement)::Vector{Exp} = Exp[]
 
 #= ==================================================================================== =#
 #= If-equations                                                                         =#

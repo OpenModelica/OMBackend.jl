@@ -221,8 +221,8 @@ struct DelayedValueFn
   model::Symbol
   k::Int
 end
-SymbolicUtils.promote_symtype(::DelayedValueFn, args...) = Real
-SymbolicUtils.promote_shape(::DelayedValueFn, szs::SymbolicUtils.ShapeT...) = SymbolicUtils.ShapeVecT()
+SymbolicUtils.promote_symtype(::DelayedValueFn, _...) = Real
+SymbolicUtils.promote_shape(::DelayedValueFn, ::SymbolicUtils.ShapeT...) = SymbolicUtils.ShapeVecT()
 
 function (f::DelayedValueFn)(t, delayTime, x)
   local s = delayState(f.model)
@@ -245,7 +245,7 @@ the event iteration (withRelationRefresh) runs after it; from its affect until t
 event, the delayed values are right limits. Due times already passed are dropped.
 """
 function withDelayEvents(callbacks, model::Symbol)
-  local due = function (u, t, integrator)
+  local due = function (_, t, _)
     local s = delayState(model)
     return s !== nothing && delayJumpsDue!(s, Float64(t))
   end
@@ -277,14 +277,14 @@ function withDelayRecords(callbacks, problem, model::Symbol, args::Vector, delay
   local now(integrator) = Base.invokelatest(argumentValues, integrator.u, integrator.p, integrator.t)
   #= The start values once every other callback's initialization (the clusters' start bodies) has run:
      the last callback's. =#
-  local stepEnd = function (u, t, integrator)
+  local stepEnd = function (_, t, integrator)
     local s = delayState(model)
     s === nothing && return false
     s.now .= now(integrator)
     recordDelayStepEnd!(s, Float64(t))
     return false
   end
-  local start! = function (c, u, t, integrator)
+  local start! = function (_, u, t, integrator)
     local s = delayHistories!(model, n)
     s.now .= Base.invokelatest(argumentValues, u, integrator.p, t)
     startDelayHistories!(s, Float64(t))
@@ -300,7 +300,7 @@ function withDelayRecords(callbacks, problem, model::Symbol, args::Vector, delay
                       integrator)
     return false
   end
-  local never! = integrator -> nothing
+  local never! = _ -> nothing
   local cbStepEnd = DiffEqBase.DiscreteCallback(NotAnEvent(stepEnd), never!; save_positions = (false, false))
   local cbAfterEvents = DiffEqBase.DiscreteCallback(NotAnEvent(afterEvents), never!; initialize = start!,
                                                     save_positions = (false, false))

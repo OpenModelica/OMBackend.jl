@@ -75,7 +75,7 @@ function lowerStructuralModes(model::IR.Model)::SIM_CODE
     push!(subModels, lowerSystem(model, variables, system; name = mode.name, functions))
   end
   local simCode = lowerSystem(model, model.variables, top; functions)
-  local names = systemNames(IR.Variable[v for v in model.variables if !(v.kind isa IR.STATE_DER)], model.name)
+  local names = systemNames(IR.Variable[v for v in model.variables if !(v.kind isa IR.STATE_DER)])
   local transitions = StructuralTransition[EXPLICIT_STRUCTURAL_TRANSITION(t.from, t.to, simExp(names, t.condition))
                                            for t in model.transitions]
   local topVariables = String[simName(names, v.cref) for v in model.variables if !(v.kind isa IR.STATE_DER)]
@@ -94,9 +94,9 @@ every mode has, then the top level's states, algebraic and discrete variables by
 """
 function sharedModeVariables(model::IR.Model)::Vector{String}
   local inMode = v::IR.Variable -> length(v.cref.parts) > 1 ? join((String(p.name) for p in v.cref.parts[2:end]), ".") : String(v.cref.parts[1].name)
-  local perMode = [String[inMode(v) for v in mode.variables if v.kind isa Union{IR.STATE, IR.ALGEBRAIC, IR.ALGEBRAIC_DER}] for mode in model.modes]
+  local perMode = [String[inMode(v) for v in mode.variables if v.kind isa IR.StateOrAlgebraic] for mode in model.modes]
   local common = isempty(perMode) ? String[] : intersect(perMode...)
-  return vcat(common, String[inMode(v) for v in model.variables if v.kind isa Union{IR.STATE, IR.ALGEBRAIC, IR.ALGEBRAIC_DER, IR.DISCRETE}])
+  return vcat(common, String[inMode(v) for v in model.variables if v.kind isa Union{IR.StateOrAlgebraic, IR.DISCRETE}])
 end
 
 #= ==================================================================================== =#
@@ -112,7 +112,7 @@ structural mode's), with the functions `functions` (the model's).
 function lowerSystem(model::IR.Model, variables::IR.VariableSet, partition::IR.Partition; name::String = model.name,
                      functions::Vector{ModelicaFunction} = simFunctions(model.functions))::SIM_CODE
   local vars = IR.Variable[v for v in variables if !(v.kind isa IR.STATE_DER)]
-  local names = systemNames(vars, model.name)
+  local names = systemNames(vars)
   local simVars = SIMVAR[SIMVAR(simName(names, v.cref), nothing, simVarKind(v, names), simVarAttributes(v, names),
                                 simType(IR.elementType(v.ty)), arrayDimensions(v), simKind(v.kind, variables, names), v.origin,
                                 v.cref) for v in vars]
@@ -231,13 +231,13 @@ function derivativeReferences(vars::Vector{IR.Variable}, variables::IR.VariableS
 end
 
 """
-    systemNames(vars, modelName)
+    systemNames(vars)
 
 The keys of the variables `vars` (`Names`: their references' flat names) and the keys known as
 variables: theirs, the states' derivatives' (their IR derivative variables'), `time`, `pi`, `e`;
 those of the variables that are not arrays.
 """
-function systemNames(vars::Vector{IR.Variable}, modelName::String)::Names
+function systemNames(vars::Vector{IR.Variable})::Names
   local stateOf = Dict{Symbol, IR.ComponentRef}()
   for v in vars
     (v.kind isa IR.STATE && v.kind.derivative !== nothing) && (stateOf[v.kind.derivative] = v.cref)
@@ -595,28 +595,42 @@ function substituteSampleTriggers(whens::Vector{IR.WHEN_EQUATION}, equations::Ve
     end
   end
   isempty(defs) && return whens
-  local subst
-  subst = c -> c isa IR.CREF ? get(defs, c.cref.name, c) :
-               c isa IR.LBINARY ? IR.LBINARY(subst(c.exp1), c.op, subst(c.exp2)) : c
-  local inBody = e -> IR.mapExpTopDown(e) do x
+  return IR.WHEN_EQUATION[IR.WHEN_EQUATION(IR.WhenBranch[IR.WhenBranch(IR.Expression[_sampleTriggersInCondition(t, defs) for t in b.triggers],
+                                                                      b.atInitial, b.atTerminal,
+                                                                      IR.Statement[_sampleTriggersInStatement(s, defs) for s in whenOperators(b.body)])
+                                                          for b in w.branches], w.kind, w.source, w.attributes)
+                          for w in whens]
+end
+
+"The trigger `c` with the sample triggers `defs` substituted (`substituteSampleTriggers`): in references, and, or."
+function _sampleTriggersInCondition(c::IR.Expression, defs::Dict{Symbol, IR.Expression})::IR.Expression
+  c isa IR.CREF && return get(defs, c.cref.name, c)
+  c isa IR.LBINARY && return IR.LBINARY(_sampleTriggersInCondition(c.exp1, defs), c.op, _sampleTriggersInCondition(c.exp2, defs))
+  return c
+end
+
+"The when body's expression `e` with the sample triggers `defs` substituted, outside pre(), edge() and change()."
+function _sampleTriggersInBody(e::IR.Expression, defs::Dict{Symbol, IR.Expression})::IR.Expression
+  return IR.mapExpTopDown(e) do x
     isBuiltinCallOf(x, (:pre, :edge, :change)) && return (x, false)
     x isa IR.CREF && return (get(defs, x.cref.name, x), false)
     return (x, true)
   end
-  local bodyStatement
-  bodyStatement = s -> s isa IR.ASSIGNMENT ? IR.ASSIGNMENT(s.lhs, inBody(s.rhs), s.source) :
-                       s isa IR.REINIT ? IR.REINIT(s.state, inBody(s.value), s.source) :
-                       s isa IR.ASSERT ? IR.ASSERT(inBody(s.condition), s.message, s.level, s.source) :
-                       s isa IR.NORETCALL ? IR.NORETCALL(inBody(s.exp), s.source) :
-                       s isa IR.TERMINATE ? IR.TERMINATE(inBody(s.message), s.source) :
-                       s isa IR.IF_STATEMENT ? IR.IF_STATEMENT(IR.StatementBranch[IR.StatementBranch(inBody(b.condition), IR.Statement[bodyStatement(x) for x in b.body])
-                                                                                   for b in s.branches],
-                                                                IR.Statement[bodyStatement(x) for x in s.elseBody], s.source) : s
-  return IR.WHEN_EQUATION[IR.WHEN_EQUATION(IR.WhenBranch[IR.WhenBranch(IR.Expression[subst(t) for t in b.triggers],
-                                                                      b.atInitial, b.atTerminal,
-                                                                      IR.Statement[bodyStatement(s) for s in whenOperators(b.body)])
-                                                          for b in w.branches], w.kind, w.source, w.attributes)
-                          for w in whens]
+end
+
+"The when body's statement `s` with `_sampleTriggersInBody` in the expressions it reads (if-statements recursively)."
+function _sampleTriggersInStatement(s::IR.Statement, defs::Dict{Symbol, IR.Expression})::IR.Statement
+  s isa IR.ASSIGNMENT && return IR.ASSIGNMENT(s.lhs, _sampleTriggersInBody(s.rhs, defs), s.source)
+  s isa IR.REINIT && return IR.REINIT(s.state, _sampleTriggersInBody(s.value, defs), s.source)
+  s isa IR.ASSERT && return IR.ASSERT(_sampleTriggersInBody(s.condition, defs), s.message, s.level, s.source)
+  s isa IR.NORETCALL && return IR.NORETCALL(_sampleTriggersInBody(s.exp, defs), s.source)
+  s isa IR.TERMINATE && return IR.TERMINATE(_sampleTriggersInBody(s.message, defs), s.source)
+  s isa IR.IF_STATEMENT &&
+    return IR.IF_STATEMENT(IR.StatementBranch[IR.StatementBranch(_sampleTriggersInBody(b.condition, defs),
+                                                                 IR.Statement[_sampleTriggersInStatement(x, defs) for x in b.body])
+                                              for b in s.branches],
+                           IR.Statement[_sampleTriggersInStatement(x, defs) for x in s.elseBody], s.source)
+  return s
 end
 
 """
@@ -629,24 +643,11 @@ marked to run at the start of a solve too). A tuple assignment in an initial bod
 target.
 """
 function extractInitialWhenAlgorithms(whens::Vector{IR.WHEN_EQUATION})::Tuple{Vector{RuntimeWhen}, Vector{Vector{IR.Statement}}}
-  local runtime = RuntimeWhen[]
-  local initial = Vector{IR.Statement}[]
-  local visit
-  visit = (branches::Vector{IR.WhenBranch}, w::IR.WHEN_EQUATION, afterInitial::Bool) -> begin
-    local b = branches[1]
-    if b.atInitial && isempty(b.triggers) && !b.atTerminal
-      afterInitial || push!(initial, tupleAssignmentsSplit(whenOperators(b.body)))
-      length(branches) > 1 && visit(branches[2:end], w, true)
-    elseif b.atInitial
-      afterInitial || push!(initial, tupleAssignmentsSplit(whenOperators(b.body)))
-      #= its other triggers as one condition, a terminal() one among them (not split) =#
-      local runtimeBranches = IR.WhenBranch[IR.WhenBranch(b.triggers, false, b.atTerminal, b.body), branches[2:end]...]
-      push!(runtime, RuntimeWhen(runtimeBranches, w.source, true))
-    else
-      append!(runtime, splitTerminalTrigger(RuntimeWhen(branches, w.source, false)))
-    end
+  local runtime::Vector{RuntimeWhen} = RuntimeWhen[]
+  local initial::Vector{Vector{IR.Statement}} = Vector{IR.Statement}[]
+  for w::IR.WHEN_EQUATION in whens
+    _initialWhenBranches!(runtime, initial, w.branches, w, false)
   end
-  foreach(w -> visit(w.branches, w, false), whens)
   return (runtime, initial)
 end
 
@@ -655,6 +656,28 @@ struct RuntimeWhen
   branches::Vector{IR.WhenBranch}
   source::IR.Source
   alsoInitial::Bool
+end
+
+"""
+`extractInitialWhenAlgorithms` of the branches `branches` of `w` onto `runtime` and `initial`; `afterInitial`: an
+earlier branch was the `initial()` one.
+"""
+function _initialWhenBranches!(runtime::Vector{RuntimeWhen}, initial::Vector{Vector{IR.Statement}},
+                               branches::Vector{IR.WhenBranch}, w::IR.WHEN_EQUATION, afterInitial::Bool)::Nothing
+  local b::IR.WhenBranch = branches[1]
+  if b.atInitial && isempty(b.triggers) && !b.atTerminal
+    afterInitial || push!(initial, tupleAssignmentsSplit(whenOperators(b.body)))
+    length(branches) > 1 && _initialWhenBranches!(runtime, initial, branches[2:end], w, true)
+  elseif b.atInitial
+    afterInitial || push!(initial, tupleAssignmentsSplit(whenOperators(b.body)))
+    #= its other triggers as one condition, a terminal() one among them (not split) =#
+    local runtimeBranches::Vector{IR.WhenBranch} =
+      IR.WhenBranch[IR.WhenBranch(b.triggers, false, b.atTerminal, b.body), branches[2:end]...]
+    push!(runtime, RuntimeWhen(runtimeBranches, w.source, true))
+  else
+    append!(runtime, splitTerminalTrigger(RuntimeWhen(branches, w.source, false)))
+  end
+  return nothing
 end
 
 """

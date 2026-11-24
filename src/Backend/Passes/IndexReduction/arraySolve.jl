@@ -196,7 +196,7 @@ function replaceBody!(eq::IR.FOR_EQUATION, path::Vector{Int}, new::IR.Equation):
 end
 
 """
-    solvedTemplate(body, iterators, rows, view, E, model, functions, parameters) -> SolvedTemplate
+    solvedTemplate(body, iterators, rows, view, E, model, functions) -> SolvedTemplate
 
 The body equation `body` solved in array form for the derivative its iterations `rows` (element view row => the
 derivative solved from it) are solved for: the reference in the body that is each row's derivative at its iteration
@@ -206,8 +206,8 @@ where it reads only parameters too: `literalCoefficients = false`; the literal i
 rows solve for references the body does not have alike.
 """
 function solvedTemplate(body::IR.SCALAR_EQUATION, iterators::Vector{Symbol}, rows::Vector{Pair{Int, Symbol}},
-                        view::Scalarized, E::Elements, model::IR.Model, functions::Dict{Symbol, IR.ModelicaFunction},
-                        parameters::StartValues)::SolvedTemplate
+                        view::Scalarized, E::Elements, model::IR.Model,
+                        functions::Dict{Symbol, IR.ModelicaFunction})::SolvedTemplate
   local canonical::IR.SCALAR_EQUATION = IR.SCALAR_EQUATION(canonicalReferences(body.lhs, E, model.variables), canonicalReferences(body.rhs, E, model.variables),
                                        body.ty, body.source, body.attributes)
   local valuesAt::Function = (r::Int) -> Dict{Symbol, Int}(zip(iterators, view.origins[r].iteration))
@@ -340,7 +340,6 @@ function solvedInArrays(model::IR.Model;
       arrayTemplates(model, view, solution)
       solution = derivativeSolution(view.model, view.model.continuous[1]; known, literalCoefficients = false)
       solution === nothing && return (model, Symbol[])
-      stale = false
       return solvedInArraysOnce(model, view, solution)
     catch err
       (err isa NotHandled && needsSplit(err)) || rethrow()
@@ -373,31 +372,37 @@ end
 
 "A cycle among the templates' reads reachable from `target` (depth first), or the reads of `target`: for a refusal."
 function readChain(target::Symbol, E::Elements, templates::Dict{Symbol, SolvedTemplate})::String
-  local readsOf::Function = (t::Symbol) -> begin
-    local reads::Vector{Symbol} = Symbol[]
-    IR.foreachExp(x::IR.Expression -> (local s::Union{Nothing, Symbol} = solvedTarget(x, E, templates); (s === nothing || s in reads) || push!(reads, s); nothing),
-                  templates[t].value)
-    reads
-  end
-  local stack::Vector{Symbol} = Symbol[]
-  local done::Set{Symbol} = Set{Symbol}()
   local cycle::Vector{Symbol} = Symbol[]
-  local visit::Function = function (t::Symbol)
-    t in done && return false
-    local at::Union{Nothing, Int} = findfirst(==(t), stack)
-    if at !== nothing
-      append!(cycle, stack[at:end]); push!(cycle, t)
-      return true
-    end
-    push!(stack, t)
-    for r in readsOf(t)
-      visit(r) && return true
-    end
-    pop!(stack); push!(done, t)
-    return false
+  _findReadCycle!(cycle, Symbol[], Set{Symbol}(), target, E, templates) && return "cycle " * join(String.(cycle), " -> ")
+  return join(String.(_solvedReads(target, E, templates)), ", ")
+end
+
+"The solved targets the template of `t` reads, each once, in the order read (`readChain`)."
+function _solvedReads(t::Symbol, E::Elements, templates::Dict{Symbol, SolvedTemplate})::Vector{Symbol}
+  local reads::Vector{Symbol} = Symbol[]
+  IR.foreachExp(x::IR.Expression -> (local s::Union{Nothing, Symbol} = solvedTarget(x, E, templates); (s === nothing || s in reads) || push!(reads, s); nothing),
+                templates[t].value)
+  return reads
+end
+
+"""
+Whether a chain of reads from `t` comes back to a target on `stack` (`readChain`, depth first; `done`: the targets
+searched without one): the cycle onto `cycle`.
+"""
+function _findReadCycle!(cycle::Vector{Symbol}, stack::Vector{Symbol}, done::Set{Symbol}, t::Symbol, E::Elements,
+                         templates::Dict{Symbol, SolvedTemplate})::Bool
+  t in done && return false
+  local at::Union{Nothing, Int} = findfirst(==(t), stack)
+  if at !== nothing
+    append!(cycle, stack[at:end]); push!(cycle, t)
+    return true
   end
-  visit(target) && return "cycle " * join(String.(cycle), " -> ")
-  return join(String.(readsOf(target)), ", ")
+  push!(stack, t)
+  for r in _solvedReads(t, E, templates)
+    _findReadCycle!(cycle, stack, done, r, E, templates) && return true
+  end
+  pop!(stack); push!(done, t)
+  return false
 end
 
 """
@@ -484,7 +489,6 @@ function arrayTemplates(model::IR.Model, view::Scalarized,
                      "$(length(splitEquations)) for-equations: slicing)", sort!(collect(splitArrays)), sort!(collect(splitEquations))))
   end
   local functions::Dict{Symbol, IR.ModelicaFunction} = Dict{Symbol, IR.ModelicaFunction}(f.name => f for f in model.functions)
-  local parameters::StartValues = StartValues(model.variables, model.functions; parametersOnly = true)
   local templates::Dict{Symbol, SolvedTemplate} = Dict{Symbol, SolvedTemplate}()
   local partners::Dict{Symbol, Set{Symbol}} = throughPartners(solution, E, bodyOf)
   for (target, key) in bodyOf
@@ -493,7 +497,7 @@ function arrayTemplates(model::IR.Model, view::Scalarized,
     local (body::IR.SCALAR_EQUATION, iterators::Vector{Symbol}) = templateBody(partition, key)
     #= a body its iterations solve for different references, or not in array form: unrolled (slicing) =#
     try
-      templates[target] = solvedTemplate(body, iterators, rows, view, E, model, functions, parameters)
+      templates[target] = solvedTemplate(body, iterators, rows, view, E, model, functions)
     catch err
       (err isa NotHandled && !isempty(iterators)) || rethrow()
       push!(splitEquations, key[1])
@@ -510,7 +514,7 @@ function arrayTemplates(model::IR.Model, view::Scalarized,
     local (body::IR.SCALAR_EQUATION, iterators::Vector{Symbol}) = templateBody(partition, key)
     local substituted::IR.SCALAR_EQUATION = withTemplateValues(body, others, E, templates)
     try
-      templates[target] = solvedTemplate(substituted, iterators, solvedRows[key], view, E, model, functions, parameters)
+      templates[target] = solvedTemplate(substituted, iterators, solvedRows[key], view, E, model, functions)
     catch err
       (err isa NotHandled && !isempty(iterators)) || rethrow()
       push!(splitEquations, key[1])

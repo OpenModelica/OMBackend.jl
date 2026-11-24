@@ -42,12 +42,6 @@
 =#
 
 """
-  Contains the headerstring defining the OpenModelica copyright notice.
-"""
-const HEADER_STRING ="
-  $(copyrightString())"
-
-"""
 An elsewhen arm as a when-equation of its own, `nothing` for none.
 """
 _elsewhenInner(::Nothing) = nothing
@@ -116,7 +110,7 @@ function _statementWrites!(out::Vector{String}, s::SC.IF)::Nothing
   foreach(x -> _statementWrites!(out, x), Iterators.flatten((Iterators.flatten(b.body for b in s.branches), s.elseBody)))
   return nothing
 end
-_statementWrites!(out::Vector{String}, ::SC.Statement)::Nothing = nothing
+_statementWrites!(::Vector{String}, ::SC.Statement)::Nothing = nothing
 
 """
 The names a condition reads OUTSIDE any `change(...)` or `pre(...)`: the level-valued
@@ -124,19 +118,23 @@ Booleans of the condition (`when boolVar then`), for which the discrete callback
 edge latch.
 """
 function _collectBareCrefStrings(@nospecialize(cond::SC.Exp))::OrderedSet{String}
-  local out = OrderedSet{String}()
-  local walk = function (@nospecialize(e::SC.Exp), insideObs::Bool)
-    if e isa Union{SC.EXP_CREF, SC.DER}
-      insideObs || push!(out, SC.crefName(e.cref))
-    elseif e isa SC.CALL
-      local nested = insideObs || e.name in (:change, :pre)
-      foreach(a -> walk(a, nested), e.args)
-    elseif e isa Union{SC.BINARY, SC.LBINARY, SC.RELATION, SC.UNARY, SC.LUNARY, SC.IFEXP}
-      foreach(c -> walk(c, insideObs), SC.children(e))
+  return _bareCrefStrings!(OrderedSet{String}(), cond, false)
+end
+
+"`_collectBareCrefStrings` of `e` onto `out`; `insideObs`: inside change() or pre(), whose references are left out."
+function _bareCrefStrings!(out::OrderedSet{String}, @nospecialize(e::SC.Exp), insideObs::Bool)::OrderedSet{String}
+  if e isa Union{SC.EXP_CREF, SC.DER}
+    insideObs || push!(out, SC.crefName(e.cref))
+  elseif e isa SC.CALL
+    local nested::Bool = insideObs || e.name in (:change, :pre)
+    for a in e.args
+      _bareCrefStrings!(out, a, nested)
     end
-    return
+  elseif e isa Union{SC.BINARY, SC.LBINARY, SC.RELATION, SC.UNARY, SC.LUNARY, SC.IFEXP}
+    for c in SC.children(e)
+      _bareCrefStrings!(out, c, insideObs)
+    end
   end
-  walk(cond, false)
   return out
 end
 
@@ -233,7 +231,7 @@ function createEquations(equations::Vector{SC.WHEN_EQUATION}, simCode::SC.SIM_CO
   local calls = Expr[]
   for (i, eq) in enumerate(equations)
     local firstIndex::Int = COUNT_CALLBACKS() + 1
-    local code::Expr = eqToJulia(eq, simCode, i)
+    local code::Expr = eqToJulia(eq, simCode)
     local cbs::Vector{Symbol} = Symbol[Symbol("cb", k) for k in firstIndex:COUNT_CALLBACKS()]
     local name::Symbol = Symbol("_", modelName, "_whenCallbacks", i)
     push!(functions, :(function $(name)(p, reals, reducedSystem)
@@ -281,12 +279,13 @@ binding (createDataStructureAssignments), never a state or parameter slot.
 """
 function _whenLookupBindings(names::Vector{String}, simCode::SC.SIM_CODE)::Vector{Expr}
   local u = _WHEN_STATE_VECTOR
-  local readsStates = false
+  #= a Ref: a flag the closure sets is boxed =#
+  local readsStates::Base.RefValue{Bool} = Base.RefValue{Bool}(false)
   #= a state lookup `getindex(x, i)` reads `u` instead =#
   local lookup = function (key::String)
     local e = getIdxForLookupMTK(key, simCode)
     (e isa Expr && e.head === :call && e.args[1] === getindex && e.args[2] === :x) || return e
-    readsStates = true
+    readsStates[] = true
     return Expr(:call, getindex, u, e.args[3:end]...)
   end
   local out = Expr[]
@@ -305,7 +304,7 @@ function _whenLookupBindings(names::Vector{String}, simCode::SC.SIM_CODE)::Vecto
     push!(out, Expr(:(=), Symbol(name), lookup(name)))
   end
   #= taken where a lookup reads it (a callback that reads no state may have no `x`) =#
-  readsStates && pushfirst!(out, :($(u) = @isdefined($(u)) ? $(u) : x))
+  readsStates[] && pushfirst!(out, :($(u) = @isdefined($(u)) ? $(u) : x))
   return out
 end
 
@@ -353,7 +352,7 @@ end
 pure time-threshold chain.
 """
 function _isConstChangeArg(a::SC.Exp, simCode::SC.SIM_CODE)::Bool
-  a isa Union{SC.RCONST, SC.ICONST, SC.BCONST} && return true
+  a isa SC.NumberLiteral && return true
   a isa SC.EXP_CREF || return false
   local entry = get(simCode.stringToSimVarHT, SC.crefName(a.cref), nothing)
   return entry !== nothing && SC.isScalarParameter(last(entry))
@@ -793,15 +792,16 @@ end
 The sample() calls of a condition that is only sample()s or-ed (more than one), or nothing.
 """
 function _sampleDisjuncts(@nospecialize(cond::SC.Exp))::Union{Vector{SC.CALL}, Nothing}
-  local out = SC.CALL[]
-  local collect! = nothing
-  collect! = (@nospecialize(e::SC.Exp)) -> begin
-    (e isa SC.LBINARY && e.op === SC.OP_OR) && return collect!(e.exp1) && collect!(e.exp2)
-    SC.isBuiltin(e, :sample) || return false
-    push!(out, e)
-    return true
-  end
-  return (collect!(cond) && length(out) > 1) ? out : nothing
+  local out::Vector{SC.CALL} = SC.CALL[]
+  return (_sampleDisjuncts!(out, cond) && length(out) > 1) ? out : nothing
+end
+
+"The sample() calls of the disjunction `e` onto `out`: false at the first operand that is no sample() call."
+function _sampleDisjuncts!(out::Vector{SC.CALL}, @nospecialize(e::SC.Exp))::Bool
+  (e isa SC.LBINARY && e.op === SC.OP_OR) && return _sampleDisjuncts!(out, e.exp1) && _sampleDisjuncts!(out, e.exp2)
+  SC.isBuiltin(e, :sample) || return false
+  push!(out, e)
+  return true
 end
 
 """
@@ -810,22 +810,24 @@ triggers, none of them under a sample() (Buildings' occupant lighting: `when {oc
 sampleTrigger}`, edge(occ) or sample(t0, samplePeriod)), or nothing.
 """
 function _sampleOrOthers(@nospecialize(cond::SC.Exp))::Union{Tuple{Vector{SC.CALL}, SC.Exp}, Nothing}
-  local samples = SC.CALL[]
-  local others = SC.Exp[]
-  local collect! = nothing
-  collect! = (@nospecialize(e::SC.Exp)) -> begin
-    if e isa SC.LBINARY && e.op === SC.OP_OR
-      collect!(e.exp1); collect!(e.exp2)
-    elseif SC.isBuiltin(e, :sample)
-      push!(samples, e)
-    else
-      push!(others, e)
-    end
-    return nothing
-  end
-  collect!(cond)
+  local samples::Vector{SC.CALL} = SC.CALL[]
+  local others::Vector{SC.Exp} = SC.Exp[]
+  _sampleOrOthers!(samples, others, cond)
   (isempty(samples) || isempty(others) || any(_containsSampleCall, others)) && return nothing
   return (samples, foldl((a, b) -> SC.LBINARY(a, SC.OP_OR, b), others))
+end
+
+"The operands of the disjunction `e`: its sample() calls onto `samples`, the others onto `others`."
+function _sampleOrOthers!(samples::Vector{SC.CALL}, others::Vector{SC.Exp}, @nospecialize(e::SC.Exp))::Nothing
+  if e isa SC.LBINARY && e.op === SC.OP_OR
+    _sampleOrOthers!(samples, others, e.exp1)
+    _sampleOrOthers!(samples, others, e.exp2)
+  elseif SC.isBuiltin(e, :sample)
+    push!(samples, e)
+  else
+    push!(others, e)
+  end
+  return nothing
 end
 
 """
@@ -880,7 +882,7 @@ _containsSampleCall(@nospecialize(e::SC.Exp))::Bool = _containsCallTo(e, :sample
 _containsCallTo(@nospecialize(e::SC.Exp), name::Symbol)::Bool = SC.anyExp(x -> SC.isBuiltin(x, name), e)
 
 """
-    eqToJulia(eq, simCode, arrayIdx)
+    eqToJulia(eq, simCode)
 
 The callback of a when-equation: by its condition, a PresetTimeCallback (a table/time when), a
 PeriodicCallback (a sample() clock, alone or and-ed with a guard, or-ed with others; a Pulse's
@@ -888,7 +890,7 @@ PeriodicCallback (a sample() clock, alone or and-ed with a guard, or-ed with oth
 8.5), a ContinuousCallback (a continuous condition), else a discrete callback of the event
 iteration; an elsewhen arm a callback of its own.
 """
-function eqToJulia(eq::SC.WHEN_EQUATION, simCode::SC.SIM_CODE, arrayIdx::Int)::Expr
+function eqToJulia(eq::SC.WHEN_EQUATION, simCode::SC.SIM_CODE)::Expr
   local wEq = eq.whenEquation
   local condition = wEq.condition
   local cond = transformToZeroCrossingCondition(condition)
@@ -1117,7 +1119,7 @@ function _continuousWhen(eq::SC.WHEN_EQUATION, cond::SC.Exp, simCode::SC.SIM_COD
     $(Symbol("cb$(callbacks)")) = ContinuousCallback($(Symbol("condition$(callbacks)")),
                                                      $(Symbol("affect$(callbacks)!")),
                                                      rootfind = ModelingToolkit.SciMLBase.RightRootFind, save_positions=(true, true))
-    $(wEq.elsewhenPart === nothing ? nothing : eqToJulia(_elsewhenInner(wEq.elsewhenPart), simCode, 0))
+    $(wEq.elsewhenPart === nothing ? nothing : eqToJulia(_elsewhenInner(wEq.elsewhenPart), simCode))
   end
 end
 
@@ -1181,7 +1183,7 @@ function _periodicWhen(eq::SC.WHEN_EQUATION, sampleCalls::Vector{SC.CALL}, sampl
       Expr(:call, :CallbackSet, [:(PeriodicCallback($(Symbol("affect$(callbacks)!")), $(c[1]);
                                                       phase = $(c[2]), initial_affect = $(c[3]), final_affect = true,
                                                       save_positions = (true, true))) for c in clocks]...))
-    $(wEq.elsewhenPart === nothing ? nothing : eqToJulia(_elsewhenInner(wEq.elsewhenPart), simCode, 4))
+    $(wEq.elsewhenPart === nothing ? nothing : eqToJulia(_elsewhenInner(wEq.elsewhenPart), simCode))
   end
 end
 
@@ -1437,7 +1439,7 @@ function _discreteWhen(eq::SC.WHEN_EQUATION, @nospecialize(condition::SC.Exp), @
     $(if ewThr !== nothing
         _emitElsewhenThresholdTimeWhen(ewArm, simCode, ewRefSym, ewThr)
       elseif wEq.elsewhenPart !== nothing
-        eqToJulia(ewArm, simCode, 4)
+        eqToJulia(ewArm, simCode)
       end)
   end
 end
@@ -1456,7 +1458,7 @@ derivative `dx[i]`, a data structure or a String by its module-level name, `time
 """
 function expToJuliaExp end
 
-expToJuliaExp(e::Union{SC.BCONST, SC.ICONST, SC.RCONST, SC.SCONST}, ::SC.SIM_CODE;
+expToJuliaExp(e::SC.ValueLiteral, ::SC.SIM_CODE;
               varPrefix::String = "x", varSuffix::String = "")::Expr = quote $(e.value) end
 
 function expToJuliaExp(e::SC.EXP_CREF, simCode::SC.SIM_CODE; varPrefix::String = "x", varSuffix::String = "")::Expr

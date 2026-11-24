@@ -350,7 +350,7 @@ function _freeExternalObject!(h::ExternalObjectHandle)::Nothing
   return nothing
 end
 "By its argument names and its code's hash (`id`), not its type (see `_RGF_TAG`)."
-Base.hash(f::RuntimeGeneratedFunctions.RuntimeGeneratedFunction{A, _RGF_TAG, _RGF_TAG, ID}, h::UInt) where {A, ID} =
+Base.hash(::RuntimeGeneratedFunctions.RuntimeGeneratedFunction{A, _RGF_TAG, _RGF_TAG, ID}, h::UInt) where {A, ID} =
   hash(ID, hash(A, hash(:RuntimeGeneratedFunction, h)))
 "By its name and arity, not its type (see `_RGF_TAG`)."
 Base.hash(w::ModelicaFunctionWrapper{N}, h::UInt) where {N} = hash(N, hash(w.name, hash(:ModelicaFunctionWrapper, h)))
@@ -763,9 +763,10 @@ end
 Get or create a per-element extractor function for an array-returning Modelica function.
 The extractor calls the implementation directly via MODELICA_FUNCTION_IMPLS and extracts
 a single element by index. This avoids creating getindex(Term{Real}(...), i) symbolic
-terms which crash Symbolics._linear_expansion (OffsetArrays.Origin error).
+terms which crash Symbolics._linear_expansion (OffsetArrays.Origin error). `indices`: one index (a vector
+result, or a linear index) or two (a matrix).
 """
-function getOrCreateElemFunc(funcName::Symbol, indices::Tuple{Vararg{Int}}, nArgs::Int)
+function getOrCreateElemFunc(funcName::Symbol, indices::Union{Tuple{Int}, Tuple{Int, Int}}, nArgs::Int)
   local key = (funcName, indices, nArgs)
   if haskey(ELEM_FUNC_CACHE, key)
     return ELEM_FUNC_CACHE[key]
@@ -773,7 +774,7 @@ function getOrCreateElemFunc(funcName::Symbol, indices::Tuple{Vararg{Int}}, nArg
   local fnQuote = QuoteNode(funcName)
   local argNames = [Symbol("a", k) for k in 1:nArgs]
   local implCall = Expr(:call, :_memoizedCall, fnQuote, :impl, argNames...)
-  local body
+  local body::Expr
   #= Results pass through exactly. Converting to Float64 corrupts Integer
      results (RNG state words exceed 2^53) and float-ifies integer exponents,
      so non-float Reals must keep their type. =#
@@ -784,7 +785,7 @@ function getOrCreateElemFunc(funcName::Symbol, indices::Tuple{Vararg{Int}}, nArg
       :(result = $implCall),
       :(return result[$idx])
     ))
-  elseif length(indices) == 2
+  else
     local i = indices[1]
     local j = indices[2]
     body = Expr(:->, Expr(:tuple, argNames...), Expr(:block,
@@ -848,9 +849,10 @@ end
 Get or create a flat element extractor that accepts individual scalar arguments,
 reassembles them into the original array shapes, calls the implementation, and
 extracts a single element. This avoids array_literal in Term arguments, which
-Pantelides index reduction cannot differentiate.
+Pantelides index reduction cannot differentiate. `indices` as `getOrCreateElemFunc`'s.
 """
-function _getOrCreateFlatElemFunc(funcName::Symbol, indices::Tuple{Vararg{Int}}, nFlat::Int, shapes::Tuple)
+function _getOrCreateFlatElemFunc(funcName::Symbol, indices::Union{Tuple{Int}, Tuple{Int, Int}}, nFlat::Int,
+                                  shapes::Tuple)
   local key = (funcName, :flat, indices, nFlat, shapes)
   if haskey(TUPLE_ELEM_FUNC_CACHE, key)
     return TUPLE_ELEM_FUNC_CACHE[key]
@@ -888,7 +890,7 @@ function _getOrCreateFlatElemFunc(funcName::Symbol, indices::Tuple{Vararg{Int}},
      so non-float Reals must keep their type. =#
   if length(indices) == 1
     push!(stmts, :(return result[$(indices[1])]))
-  elseif length(indices) == 2
+  else
     local i = indices[1]
     local j = indices[2]
     push!(stmts, :(row = result[$i]))
@@ -915,8 +917,8 @@ end
 # can be cached and later returned even when makeSymbolicTerm passes
 # `type = Real` explicitly, poisoning subsequent sums and breaking
 # `-(::SymReal, ::SymReal)` in MTK alias_elimination.
-SymbolicUtils._promote_symtype(::Union{RuntimeGeneratedFunctions.RuntimeGeneratedFunction, ModelicaFunctionWrapper, ModelicaFunctionPartial, CallPartial}, args) = Real
-SymbolicUtils._promote_symtype(::typeof(floor), args) = Real
+SymbolicUtils._promote_symtype(::Union{RuntimeGeneratedFunctions.RuntimeGeneratedFunction, ModelicaFunctionWrapper, ModelicaFunctionPartial, CallPartial}, _) = Real
+SymbolicUtils._promote_symtype(::typeof(floor), _) = Real
 
 # Same reason for shape. Scalar-returning extractor RGFs must be reported as
 # scalar (`ShapeVecT()`) rather than the default `Unknown(-1)` so they can be
@@ -924,9 +926,9 @@ SymbolicUtils._promote_symtype(::typeof(floor), args) = Real
 # mismatch in MTK's substitution rebuild path (terminterface.jl `maketerm` for
 # `+`/`-`). Without this, a wrapper whose body returns a Modelica vector can
 # poison a sum with shape `Unknown(2)`.
-SymbolicUtils.promote_shape(::Union{RuntimeGeneratedFunctions.RuntimeGeneratedFunction, ModelicaFunctionWrapper, ModelicaFunctionPartial, CallPartial}, args::SymbolicUtils.ShapeT...) = SymbolicUtils.ShapeVecT()
-SymbolicUtils.promote_shape(::typeof(floor), args::SymbolicUtils.ShapeT...) = SymbolicUtils.ShapeVecT()
-SymbolicUtils.promote_shape(::typeof(floor), arg::SymbolicUtils.Unknown) = SymbolicUtils.ShapeVecT()
+SymbolicUtils.promote_shape(::Union{RuntimeGeneratedFunctions.RuntimeGeneratedFunction, ModelicaFunctionWrapper, ModelicaFunctionPartial, CallPartial}, ::SymbolicUtils.ShapeT...) = SymbolicUtils.ShapeVecT()
+SymbolicUtils.promote_shape(::typeof(floor), ::SymbolicUtils.ShapeT...) = SymbolicUtils.ShapeVecT()
+SymbolicUtils.promote_shape(::typeof(floor), ::SymbolicUtils.Unknown) = SymbolicUtils.ShapeVecT()
 
 """
     makeSymbolicTerm(f, args)
@@ -1375,10 +1377,9 @@ Symbolics._linear_expansion.
 Each element is a scalar symbolic term created via `makeSymbolicTerm`.
 """
 function createSymbolicArrayCall(funcRef, uwArgs::Vector{Any}, dims::Tuple{Vararg{Int}}; funcName::Symbol = Symbol())
-  #= If funcName not provided, try to extract it from funcRef =#
-  if funcName === Symbol()
-    funcName = funcRef isa Symbol ? funcRef : nameof(funcRef)
-  end
+  #= If funcName not provided, try to extract it from funcRef (a new local: the reassigned keyword is boxed by the
+     comprehensions below) =#
+  local name::Symbol = funcName !== Symbol() ? funcName : funcRef isa Symbol ? funcRef : nameof(funcRef)
   #= Check if any argument is an array. ALL arrays must be flattened to scalars
      because SymbolicUtils wraps Term arguments with array shape metadata that
      triggers "Differentiation with array expressions" in Pantelides. =#
@@ -1387,22 +1388,22 @@ function createSymbolicArrayCall(funcRef, uwArgs::Vector{Any}, dims::Tuple{Varar
     local flatArgs, shapes = _flattenSymArgs(uwArgs)
     local nFlat = length(flatArgs)
     if length(dims) == 1
-      return [makeSymbolicTerm(_getOrCreateFlatElemFunc(funcName, (i,), nFlat, shapes), flatArgs) for i in 1:dims[1]]
+      return [makeSymbolicTerm(_getOrCreateFlatElemFunc(name, (i,), nFlat, shapes), flatArgs) for i in 1:dims[1]]
     elseif length(dims) == 2
-      return [makeSymbolicTerm(_getOrCreateFlatElemFunc(funcName, (i, j), nFlat, shapes), flatArgs) for i in 1:dims[1], j in 1:dims[2]]
+      return [makeSymbolicTerm(_getOrCreateFlatElemFunc(name, (i, j), nFlat, shapes), flatArgs) for i in 1:dims[1], j in 1:dims[2]]
     else
       local totalLen = prod(dims)
-      return [makeSymbolicTerm(_getOrCreateFlatElemFunc(funcName, (i,), nFlat, shapes), flatArgs) for i in 1:totalLen]
+      return [makeSymbolicTerm(_getOrCreateFlatElemFunc(name, (i,), nFlat, shapes), flatArgs) for i in 1:totalLen]
     end
   else
     local nArgs = length(uwArgs)
     if length(dims) == 1
-      return [makeSymbolicTerm(getOrCreateElemFunc(funcName, (i,), nArgs), uwArgs) for i in 1:dims[1]]
+      return [makeSymbolicTerm(getOrCreateElemFunc(name, (i,), nArgs), uwArgs) for i in 1:dims[1]]
     elseif length(dims) == 2
-      return [makeSymbolicTerm(getOrCreateElemFunc(funcName, (i, j), nArgs), uwArgs) for i in 1:dims[1], j in 1:dims[2]]
+      return [makeSymbolicTerm(getOrCreateElemFunc(name, (i, j), nArgs), uwArgs) for i in 1:dims[1], j in 1:dims[2]]
     else
       local totalLen = prod(dims)
-      return [makeSymbolicTerm(getOrCreateElemFunc(funcName, (i,), nArgs), uwArgs) for i in 1:totalLen]
+      return [makeSymbolicTerm(getOrCreateElemFunc(name, (i,), nArgs), uwArgs) for i in 1:totalLen]
     end
   end
 end
@@ -1437,27 +1438,15 @@ function hasSymbolicArgs(args...)
 end
 
 """
-Look up an element of a constant Modelica array using runtime-resolvable
-subscripts. Used for `Table[in1, in2]` patterns where the table is constant
-but indices are runtime CREFs (Modelica.Electrical.Digital gates, lookup
-tables, etc.).
-
-When called with numeric args, returns `table[Int(round(i)), Int(round(j))]`
-directly. When called with at least one symbolic arg, wraps the lookup in an
-opaque Symbolics term so MTK structural-simplify treats it as a black box
-(rather than refusing to use a Num as an array index, or constructing an
-unwieldy ifelse chain).
-
-Vararg subscripts to support both vectors and N-dimensional arrays.
+Named functor for the symbolic-argument table lookup. Must be a NAMED type, not
+an anonymous closure: MTK's `substitute` / `alias_elimination` rebuild the term
+via `maketerm`, which RE-INFERS the symtype from `promote_symtype(op, ...)`,
+ignoring the explicit `type = Real` set in `makeSymbolicTerm`. An anonymous
+closure has no `promote_symtype` method, so the rebuilt term defaults to symtype
+`Any`; arithmetic on it then trips the SymReal/`Any` subtraction guard in
+`find_eq_solvables!` (`-(::SymReal, ::SymReal)` throws when a symtype is
+non-numeric). Declaring the result `Real` keeps the rebuilt term numeric.
 """
-#= Named functor for the symbolic-argument table lookup. Must be a NAMED type, not
-   an anonymous closure: MTK's `substitute` / `alias_elimination` rebuild the term
-   via `maketerm`, which RE-INFERS the symtype from `promote_symtype(op, ...)`,
-   ignoring the explicit `type = Real` set in `makeSymbolicTerm`. An anonymous
-   closure has no `promote_symtype` method, so the rebuilt term defaults to symtype
-   `Any`; arithmetic on it then trips the SymReal/`Any` subtraction guard in
-   `find_eq_solvables!` (`-(::SymReal, ::SymReal)` throws when a symtype is
-   non-numeric). Declaring the result `Real` keeps the rebuilt term numeric. =#
 struct ConstTableLookupFn{A <: AbstractArray}
   table::A
 end
@@ -1490,7 +1479,7 @@ function (c::ConstTableLookupFn)(rt_idxs...)
   end
   return c.table[resolved...]
 end
-SymbolicUtils.promote_symtype(::ConstTableLookupFn, args...) = Real
+SymbolicUtils.promote_symtype(::ConstTableLookupFn, _...) = Real
 
 """
 A constant table lookup is piecewise constant in its indices (`_primalValue`): its derivative by each
@@ -1506,8 +1495,22 @@ maketerm RE-INFERS shape too, not just symtype; the generic fallback yields
 Unknown, which trips `promote_shape(==, Unknown, scalar)` once the rebuilt term
 lands in a relational during substitute/full_equations. The lookup is scalar.
 """
-SymbolicUtils.promote_shape(::ConstTableLookupFn, szs::SymbolicUtils.ShapeT...) = SymbolicUtils.ShapeVecT()
+SymbolicUtils.promote_shape(::ConstTableLookupFn, ::SymbolicUtils.ShapeT...) = SymbolicUtils.ShapeVecT()
 
+"""
+Look up an element of a constant Modelica array using runtime-resolvable
+subscripts. Used for `Table[in1, in2]` patterns where the table is constant
+but indices are runtime CREFs (Modelica.Electrical.Digital gates, lookup
+tables, etc.).
+
+When called with numeric args, returns `table[Int(round(i)), Int(round(j))]`
+directly. When called with at least one symbolic arg, wraps the lookup in an
+opaque Symbolics term so MTK structural-simplify treats it as a black box
+(rather than refusing to use a Num as an array index, or constructing an
+unwieldy ifelse chain).
+
+Vararg subscripts to support both vectors and N-dimensional arrays.
+"""
 function constTableLookup(table::AbstractArray, idxs...)
   if hasSymbolicArgs(idxs...)
     return makeSymbolicTerm(ConstTableLookupFn(table), Any[idxs...])
@@ -1521,7 +1524,7 @@ An index of a constant table (constTableLookup): a scalar clamped to `1:n` (_toI
 indices as they are (a function's `X[1:nXi]` of an inlined literal X: the clamp's MethodError of a
 range).
 """
-_tableIndex(v::Union{Colon, AbstractVector{<:Integer}}, n::Int) = v
+_tableIndex(v::Union{Colon, AbstractVector{<:Integer}}, ::Int) = v
 _tableIndex(v::Any, n::Int) = clamp(_toIndex(v), 1, n)
 
 """
@@ -1809,10 +1812,8 @@ The names `ex` defines: its arguments, the names it assigns or declares local, i
 comprehensions' variables, its closures' arguments.
 """
 function _ownNames(ex::Expr)::Set{Symbol}
-  local own = Set{Symbol}()
-  local add!(x) = x isa Symbol ? push!(own, x) :
-    x isa Expr && x.head in (:tuple, :(::), :..., :parameters) ? foreach(add!, x.head === :(::) ? x.args[1:1] : x.args) :
-    x isa Expr && x.head === :(=) ? add!(x.args[1]) : nothing
+  local own::Set{Symbol} = Set{Symbol}()
+  local add! = (@nospecialize(x)) -> _addOwnNames!(own, x)
   ex.head === :-> && add!(ex.args[1])
   local worklist = Any[ex]
   while !isempty(worklist)
@@ -1826,6 +1827,23 @@ function _ownNames(ex::Expr)::Set{Symbol}
     append!(worklist, e.args)
   end
   return own
+end
+
+"""
+The names the binding target `x` introduces into `own` (`_ownNames`): a symbol; through a tuple, a typed name (its
+name), a splat, keyword parameters and a default's left side.
+"""
+function _addOwnNames!(own::Set{Symbol}, @nospecialize(x))::Nothing
+  if x isa Symbol
+    push!(own, x)
+  elseif x isa Expr && x.head in (:tuple, :(::), :..., :parameters)
+    for a in (x.head === :(::) ? x.args[1:1] : x.args)
+      _addOwnNames!(own, a)
+    end
+  elseif x isa Expr && x.head === :(=)
+    _addOwnNames!(own, x.args[1])
+  end
+  return nothing
 end
 
 "Whether `e.args[i]` is a name that is not read: `end` and `begin` in an index, a macro's name, a keyword's name."
@@ -1976,19 +1994,6 @@ function wrapWithInvokelatest(expr::Expr)
 end
 
 wrapWithInvokelatest(x) = x  #= For non-Expr types, return as-is =#
-
-
-"""
-  Structurally simplify algebraic equations in a system and compute the
-  topological sort of the observed equations. When `simplify=true`, the `simplify`
-  function will be applied during the tearing process. It also takes kwargs
-  `allow_symbolic=false` and `allow_parameter=true` which limits the coefficient
-  types during tearing.
-
-  The optional argument `io` may take a tuple `(inputs, outputs)`.
-  This will convert all `inputs` to parameters and allow them to be unconnected, i.e.,
-  simplification will allow models where `n_states = n_equations - n_inputs`.
-  """
 
 """
   Filter out equations that contain no symbolic variables (e.g. `0 ~ 0.0`, `0 ~ 255.0`).
@@ -2393,38 +2398,41 @@ equation determines them as much as its left side (`der(v) = x - 1` fixes
 x; pinned at its start, the init solve moved the fixed v instead).
 """
 function _initializationVarStrs(initEqs; reads::Bool = false)::OrderedSet{String}
-  local out = OrderedSet{String}()
-  local visit
-  visit = function (ex, isLhs0::Bool)
-    local isLhs = isLhs0 || reads
-    local v = Symbolics.unwrap(ex)
-    if !SymbolicUtils.iscall(v)
-      #= a parameter, time or a constant (no name) =#
-      local name::Union{Nothing, String} = variableName(v)
-      isLhs && name !== nothing && push!(out, name)
-      return nothing
-    end
-    local op = SymbolicUtils.operation(v)
-    if op isa ModelingToolkit.Differential
-      #= D(x), or D(expr): an observed variable the backend replaced by its
-         definition; every variable in it. =#
-      foreach(a -> union!(out, _variableNames(Symbolics.get_variables(a))), SymbolicUtils.arguments(v))
-      return nothing
-    end
-    #= x(t) is a call of x on t: a variable, not an expression. =#
-    if SymbolicUtils.issym(op)
-      isLhs && push!(out, variableName(v))
-      return nothing
-    end
-    #= An expression on the left (`x + y = 1`) determines every variable in it. =#
-    foreach(a -> visit(a, isLhs), SymbolicUtils.arguments(v))
-    return nothing
-  end
+  local out::OrderedSet{String} = OrderedSet{String}()
   for eq in initEqs
-    visit(eq.lhs, true)
-    visit(eq.rhs, false)
+    _initializationVarStrs!(out, eq.lhs, true, reads)
+    _initializationVarStrs!(out, eq.rhs, false, reads)
   end
   return out
+end
+
+"`_initializationVarStrs` of the side `ex` of an equation (`isLhs0`: the left side) onto `out`."
+function _initializationVarStrs!(out::OrderedSet{String}, @nospecialize(ex), isLhs0::Bool, reads::Bool)::Nothing
+  local isLhs::Bool = isLhs0 || reads
+  local v = Symbolics.unwrap(ex)
+  if !SymbolicUtils.iscall(v)
+    #= a parameter, time or a constant (no name) =#
+    local name::Union{Nothing, String} = variableName(v)
+    isLhs && name !== nothing && push!(out, name)
+    return nothing
+  end
+  local op = SymbolicUtils.operation(v)
+  if op isa ModelingToolkit.Differential
+    #= D(x), or D(expr): an observed variable the backend replaced by its
+       definition; every variable in it. =#
+    foreach(a -> union!(out, _variableNames(Symbolics.get_variables(a))), SymbolicUtils.arguments(v))
+    return nothing
+  end
+  #= x(t) is a call of x on t: a variable, not an expression. =#
+  if SymbolicUtils.issym(op)
+    isLhs && push!(out, variableName(v))
+    return nothing
+  end
+  #= An expression on the left (`x + y = 1`) determines every variable in it. =#
+  for a in SymbolicUtils.arguments(v)
+    _initializationVarStrs!(out, a, isLhs, reads)
+  end
+  return nothing
 end
 
 """
@@ -2489,7 +2497,7 @@ function splitInitialValues(reducedSystem,
 end
 
 function splitInitialValues(reducedSystem, finalInitialValues::AbstractVector,
-                            allInitialValues::AbstractVector = Pair[],
+                            ::AbstractVector = Pair[],
                             pars::AbstractDict = Dict{Any, Any}())
   local massMatrix = ModelingToolkit.calculate_massmatrix(reducedSystem)
   local reducedUnks = unknowns(reducedSystem)
@@ -2762,7 +2770,7 @@ function splitInitialValues(reducedSystem, finalInitialValues::AbstractVector,
     local _targets = Any[k for (k, v) in ModelingToolkit.guesses(reducedSystem)
                          if (Symbolics.value(v) isa Number && iszero(Symbolics.value(v)))]
     local _resolved = Dict{Any, Float64}()
-    for _round in 1:6
+    for _ in 1:6
       local _progress = false
       for X in _targets
         haskey(_resolved, X) && continue
@@ -2921,18 +2929,19 @@ through `System(...)` (mutating the field via `@set`/`substitute` is a no-op:
 `setmetadata` leaves variables `isequal`, so MTK keeps the original priority).
 """
 function neutralizeSoftStatePriority(sys::ModelingToolkit.AbstractSystem)
-  local n = 0
+  #= a Ref: a counter the closure increments is boxed =#
+  local n::Base.RefValue{Int} = Base.RefValue{Int}(0)
   local newUnknowns = map(ModelingToolkit.get_unknowns(sys)) do u
     local uv = Symbolics.unwrap(u)
     local p = SymbolicUtils.getmetadata(uv, ModelingToolkit.VariableStatePriority, nothing)
     if p !== nothing && abs(p) <= 2
-      n += 1
+      n[] += 1
       SymbolicUtils.setmetadata(uv, ModelingToolkit.VariableStatePriority, 0)
     else
       uv
     end
   end
-  n == 0 && return (0, sys)
+  n[] == 0 && return (0, sys)
   local relaxed = ModelingToolkit.System(
     equations(sys),
     ModelingToolkit.get_iv(sys),
@@ -2944,7 +2953,7 @@ function neutralizeSoftStatePriority(sys::ModelingToolkit.AbstractSystem)
     guesses = ModelingToolkit.get_guesses(sys),
     initialization_eqs = ModelingToolkit.get_initialization_eqs(sys),
   )
-  return (n, relaxed)
+  return (n[], relaxed)
 end
 
 #= simplify=true polynomial normalization rationalizes Float64 coefficients;
@@ -2979,18 +2988,13 @@ function _demoteWideNumerics(ex)
 end
 
 function _demoteWideNumericsInEquations(eqs)
-  local changed = 0
-  local newEqs = map(eqs) do eq
-    local l = Symbolics.unwrap(eq.lhs)
-    local r = Symbolics.unwrap(eq.rhs)
-    if _containsWideNumeric(l) || _containsWideNumeric(r)
-      changed += 1
-      Symbolics.Equation(_demoteWideNumerics(l), _demoteWideNumerics(r))
-    else
-      eq
-    end
+  #= which first, then the count: a counter the closure increments is boxed =#
+  local wide::Vector{Bool} = Bool[_containsWideNumeric(Symbolics.unwrap(eq.lhs)) || _containsWideNumeric(Symbolics.unwrap(eq.rhs))
+                                  for eq in eqs]
+  local newEqs = map(eqs, wide) do eq, w::Bool
+    w ? Symbolics.Equation(_demoteWideNumerics(Symbolics.unwrap(eq.lhs)), _demoteWideNumerics(Symbolics.unwrap(eq.rhs))) : eq
   end
-  return (newEqs, changed)
+  return (newEqs, count(wide))
 end
 
 """
@@ -3113,6 +3117,30 @@ function scaleNonUnitIntegerEquations(sys::ModelingToolkit.AbstractSystem)::Tupl
 end
 
 """
+The array-shaped subtrees of `expr` into `results` as (path, shape, node), a raw array with the shape `:raw_array`;
+50 levels deep at most. A diagnostic of `structural_simplify` (BACKEND_LOGGING).
+"""
+function _findArrayShapes!(results::Vector{Tuple{String, Any, Any}}, @nospecialize(expr), path::String,
+                           depth::Int)::Nothing
+  depth > 50 && return nothing
+  if expr isa SymbolicUtils.BasicSymbolic
+    local sh::Any = try; Symbolics.shape(expr); catch; nothing; end
+    if sh !== nothing && sh !== () && SymbolicUtils.is_array_shape(sh)
+      push!(results, (path, sh, expr))
+      return nothing
+    end
+    if SymbolicUtils.iscall(expr)
+      for (j, a) in enumerate(SymbolicUtils.arguments(expr))
+        _findArrayShapes!(results, a, "$path.args[$j]", depth + 1)
+      end
+    end
+  elseif expr isa AbstractArray
+    push!(results, (path, :raw_array, expr))
+  end
+  return nothing
+end
+
+"""
   The irreducible variables scheme does not work using plain simplify.
 
   It should be noted that for some models both running tearing and structural simplification are needed.
@@ -3121,7 +3149,7 @@ end
   One example is running tearing twice broke the system
 """
 function structural_simplify(sys::ModelingToolkit.AbstractSystem,
-                             io = nothing;
+                             _ = nothing;
                              simplify = false,
                              allow_parameter = true,
                              kwargs...)
@@ -3142,34 +3170,12 @@ function structural_simplify(sys::ModelingToolkit.AbstractSystem,
      set, and the assertion in mslTests.jl handles the off case. =#
   @BACKEND_LOGGING begin
     let
-      function _find_array_shapes(expr, path, results; depth=0)
-        depth > 50 && return  # guard against infinite recursion
-        if expr isa SymbolicUtils.BasicSymbolic
-          local sh = try; Symbolics.shape(expr); catch; nothing; end
-          if sh !== nothing && sh !== () && SymbolicUtils.is_array_shape(sh)
-            push!(results, (path, sh, expr))
-            return  # do not recurse further into this subtree
-          end
-          if SymbolicUtils.iscall(expr)
-            local args = SymbolicUtils.arguments(expr)
-            for (j, a) in enumerate(args)
-              _find_array_shapes(a, "$path.args[$j]", results; depth=depth+1)
-            end
-          end
-        elseif expr isa AbstractArray
-          push!(results, (path, :raw_array, expr))
-        end
-      end
-      local allResults = Tuple{Int,String,Symbol,Any}[]
+      local allResults::Vector{Tuple{Int, String, Any, Any}} = Tuple{Int, String, Any, Any}[]
       for (i, eq) in enumerate(equations(sys))
-        local lhsR = Pair{String,Any}[]
-        local rhsR = Pair{String,Any}[]
-        _find_array_shapes(Symbolics.unwrap(eq.lhs), "eq[$i].lhs", lhsR)
-        _find_array_shapes(Symbolics.unwrap(eq.rhs), "eq[$i].rhs", rhsR)
-        for (p, sh, node) in lhsR
-          push!(allResults, (i, p, sh, node))
-        end
-        for (p, sh, node) in rhsR
+        local found::Vector{Tuple{String, Any, Any}} = Tuple{String, Any, Any}[]
+        _findArrayShapes!(found, Symbolics.unwrap(eq.lhs), "eq[$i].lhs", 0)
+        _findArrayShapes!(found, Symbolics.unwrap(eq.rhs), "eq[$i].rhs", 0)
+        for (p, sh, node) in found
           push!(allResults, (i, p, sh, node))
         end
       end
@@ -3177,7 +3183,7 @@ function structural_simplify(sys::ModelingToolkit.AbstractSystem,
       if !isempty(allResults)
         @warn "Found $(length(allResults)) array-shaped subtree(s) in equations before structural_simplify"
         for (idx, p, sh, node) in allResults[1:min(10, length(allResults))]
-          nodeStr = try; string(node)[1:min(200, length(string(node)))]; catch e; "$(typeof(node))"; end
+          nodeStr = try; string(node)[1:min(200, length(string(node)))]; catch; "$(typeof(node))"; end
           @warn "  eq $idx at $p: shape=$sh node=$nodeStr"
         end
       else
@@ -3271,7 +3277,9 @@ function structural_simplify(sys::ModelingToolkit.AbstractSystem,
   #= Diagnostic only: full_equations expands observed eqs and can hit
      SymbolicUtils Rational{Int64} overflow on some systems. A log count must
      never abort the build, so fall back to -1 (rendered as "n/a") on failure. =#
-  local post_full_eqs = OMBackend._tryOr(() -> length(ModelingToolkit.full_equations(sys)), -1, :fullEquationsCount)
+  local post_full_eqs = let reduced = sys
+    OMBackend._tryOr(() -> length(ModelingToolkit.full_equations(reduced)), -1, :fullEquationsCount)
+  end
   local post_unknowns = length(unknowns(sys))
   @info "[MTK GEN: simplify] After structural_simplify: equations=$(post_eqs), full_equations=$(post_full_eqs), unknowns=$(post_unknowns)"
   if post_eqs != post_unknowns
@@ -3320,112 +3328,6 @@ function structural_simplify(sys::ModelingToolkit.AbstractSystem,
   return sys
 end
 
-"""
-  Takes a Nth order System and returns a new System written in first order
-  form by defining new variables which represent the N-1 derivatives.
-  """
-function ode_order_lowering(sys::System)
-  iv = ModelingToolkit.get_iv(sys)
-  eqs_lowered, new_vars = ode_order_lowering(equations(sys), iv, unknowns(sys))
-  @set! sys.eqs = eqs_lowered
-  @set! sys.unknowns = new_vars
-  return sys
-end
-
-function dae_order_lowering(sys::System)
-  iv = get_iv(sys)
-  eqs_lowered, new_vars = dae_order_lowering(equations(sys), iv, unknowns(sys))
-  @set! sys.eqs = eqs_lowered
-  @set! sys.unknowns = new_vars
-  return sys
-end
-
-function ode_order_lowering(eqs, iv, unknown_vars)
-  var_order = OrderedDict{Any, Int}()
-  D = Differential(iv)
-  diff_eqs = Equation[]
-  diff_vars = Any[]
-  alge_eqs = Equation[]
-  for (i, eq) in enumerate(eqs)
-    if !isdiffeq(eq)
-      push!(alge_eqs, eq)
-    else
-      var, maxorder = Symbolics.var_from_nested_derivative(eq.lhs)
-      maxorder > get(var_order, var, 1) && (var_order[var] = maxorder)
-      var′ = Symbolics.lower_varname(var, iv, maxorder - 1)
-      if ! isreal(eq.rhs) #= Modification by me. =#
-        rhs′ = ModelingToolkit.diff2term_with_unit(eq.rhs, iv)
-      else
-        rhs′ = eq.rhs
-      end
-      push!(diff_vars, var′)
-      push!(diff_eqs, D(var′) ~ rhs′)
-    end
-  end
-  for (var, order) in var_order
-    for o in (order - 1):-1:1
-      lvar = Symbolics.lower_varname(var, iv, o - 1)
-      rvar = Symbolics.lower_varname(var, iv, o)
-      push!(diff_vars, lvar)
-
-      rhs = rvar
-      eq = Differential(iv)(lvar) ~ rhs
-      push!(diff_eqs, eq)
-    end
-  end
-  # we want to order the equations and variables to be `(diff, alge)`
-  return (vcat(diff_eqs, alge_eqs), vcat(diff_vars, setdiff(unknown_vars, diff_vars)))
-end
-
-function dae_order_lowering(eqs, iv, unknown_vars)
-  var_order = OrderedDict{Any, Int}()
-  D = Differential(iv)
-  diff_eqs = Equation[]
-  diff_vars = OrderedSet()
-  alge_eqs = Equation[]
-  vars = OrderedSet()
-  subs = Dict()
-
-  for (i, eq) in enumerate(eqs)
-    vars!(vars, eq)
-    n_diffvars = 0
-    for vv in vars
-      isdifferential(vv) || continue
-      var, maxorder = Symbolics.var_from_nested_derivative(vv)
-      isparameter(var) && continue
-      n_diffvars += 1
-      order = get(var_order, var, nothing)
-      seen = order !== nothing
-      if !seen
-        order = 1
-      end
-      maxorder > order && (var_order[var] = maxorder)
-      var′ = Symbolics.lower_varname(var, iv, maxorder - 1)
-      subs[vv] = D(var′)
-      if !seen
-        push!(diff_vars, var′)
-      end
-    end
-    n_diffvars == 0 && push!(alge_eqs, eq)
-    empty!(vars)
-  end
-
-  for (var, order) in var_order
-    for o in (order - 1):-1:1
-      lvar = Symbolics.lower_varname(var, iv, o - 1)
-      rvar = Symbolics.lower_varname(var, iv, o)
-      push!(diff_vars, lvar)
-
-      rhs = rvar
-      eq = Differential(iv)(lvar) ~ rhs
-      push!(diff_eqs, eq)
-    end
-  end
-
-  return ([diff_eqs; substitute.(eqs, (subs,))],
-          vcat(collect(diff_vars), setdiff(unknown_vars, diff_vars)))
-end
-
 function getStatesAsSymbols(odeFunc::ODEFunction)
   odeFunc.sys === nothing && return Symbol[]
   local states = ModelingToolkit.get_unknowns(odeFunc.sys)
@@ -3448,31 +3350,34 @@ unknowns as they were while the condition looked them up (the same system,
 the same solution).
 """
 function namedStateLookups(ex, simCode::SC.SIM_CODE)::Vector{String}
-  local names = OrderedSet{String}()
-  local walk
-  walk = function (e)
-    e isa Expr || return nothing
-    if e.head == :call && length(e.args) == 3 && e.args[1] == :(OMBackend.CodeGeneration.WhenCondition) &&
-       e.args[2] isa Vector{String}
-      union!(names, Iterators.filter(n -> !SC.isScalarParameter(last(simCode.stringToSimVarHT[n])), e.args[2]))
-    end
-    local key = if e.head == :ref && length(e.args) == 2 && e.args[1] === :lookuptableStates
-      e.args[2]
-    elseif e.head == :call && length(e.args) == 3 && e.args[1] in (:getindex, getindex) && e.args[2] === :lookuptableStates
-      e.args[3]
-    else
-      nothing
-    end
-    if key isa Expr && key.head == :call && length(key.args) == 2 && key.args[1] === :Symbol && key.args[2] isa String
-      push!(names, key.args[2])
-    elseif key isa QuoteNode && key.value isa Symbol
-      push!(names, string(key.value))
-    end
-    foreach(walk, e.args)
-    return nothing
-  end
-  walk(ex)
+  local names::OrderedSet{String} = OrderedSet{String}()
+  _namedStateLookups!(names, ex, simCode)
   return collect(names)
+end
+
+"`namedStateLookups` of the expression `e` (its subexpressions too) onto `names`."
+function _namedStateLookups!(names::OrderedSet{String}, @nospecialize(e), simCode::SC.SIM_CODE)::Nothing
+  e isa Expr || return nothing
+  if e.head == :call && length(e.args) == 3 && e.args[1] == :(OMBackend.CodeGeneration.WhenCondition) &&
+     e.args[2] isa Vector{String}
+    union!(names, Iterators.filter(n -> !SC.isScalarParameter(last(simCode.stringToSimVarHT[n])), e.args[2]))
+  end
+  local key = if e.head == :ref && length(e.args) == 2 && e.args[1] === :lookuptableStates
+    e.args[2]
+  elseif e.head == :call && length(e.args) == 3 && e.args[1] in (:getindex, getindex) && e.args[2] === :lookuptableStates
+    e.args[3]
+  else
+    nothing
+  end
+  if key isa Expr && key.head == :call && length(key.args) == 2 && key.args[1] === :Symbol && key.args[2] isa String
+    push!(names, key.args[2])
+  elseif key isa QuoteNode && key.value isa Symbol
+    push!(names, string(key.value))
+  end
+  for a in e.args
+    _namedStateLookups!(names, a, simCode)
+  end
+  return nothing
 end
 
 """
