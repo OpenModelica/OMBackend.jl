@@ -357,6 +357,8 @@ mutable struct Gen
      explicit transition's switch `(:transition, mode, :none)`, a recompilation `(:recompilation, component, type)`, the
      type of its new value (`:Real`, `:Integer`, `:Boolean`) =#
   structuralChanges::Vector{Tuple{Symbol, String, Symbol}}
+  #= the functions called as impure (MLS 12.3; `_allOutputsCallIRx`): each call evaluated, none shared (`_shareCalls`) =#
+  impure::Set{String}
 end
 
 "A relation of a template by its expression and scope (the iterators' slots, the element-wise dimensions)."

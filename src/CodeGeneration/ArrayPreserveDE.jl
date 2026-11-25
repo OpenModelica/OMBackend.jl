@@ -124,6 +124,7 @@ _noCrossings(z::CrossingOut)::Bool = z.z === nothing
 
 include("arrayBlockSolve.jl")
 include("arrayInitialBlocks.jl")
+include("arraySharedCalls.jl")
 
 """
 The array model's ODE `prob` (mass matrix I: its algebraic loops are solved in the right-hand side) as the problem
@@ -1588,7 +1589,7 @@ function _rollRuns(stmts::Vector{Any})::Vector{Any}
 end
 
 """
-    _splitStatements(name, args, passed, paramLocals, stmts; fired) -> (defs, stmts)
+    _splitStatements(name, args, passed, paramLocals, stmts; fired, pure) -> (defs, stmts)
 
 A generated function's statements (run under @inbounds) in functions of about `CHUNK_NODES` expression nodes each
 (`name_chunk1`, ...), called in order, where they are at least twice that: Julia's compilation of one function grows
@@ -1596,12 +1597,14 @@ faster than its size. MSL EngineV6's module (917k nodes, equations! 445k) took 5
 split at 20k nodes 24 s and 3.8 GB, the right-hand side as fast (at 5k nodes 17 % slower). The statements write only
 to the arrays. Each part takes the function's arguments `args` and its locals `passed`, declares the parameter views
 it reads (of `paramLocals`) and returns its `_fired` (an algorithm's when-statement fired), which the calls OR into
-the caller's where it has one (`fired`). No definitions and the statements as they are below the size.
+the caller's where it has one (`fired`). No definitions below the size. The calls of the pure functions `pure` each
+part (or the whole) makes more than once with the same arguments made once (`_shareCalls`).
 """
 function _splitStatements(name::Symbol, args::Vector{Symbol}, passed::Vector{Symbol}, paramLocals::Vector{Any},
-                          stmts::Vector{Any}; fired::Bool)::Tuple{Vector{Expr}, Vector{Any}}
+                          stmts::Vector{Any}; fired::Bool, pure::Set{Symbol})::Tuple{Vector{Expr}, Vector{Any}}
   local limit::Int = CHUNK_NODES[]
-  sum(_nodeCount, stmts; init = 0) < 2 * limit && return (Expr[], stmts)
+  local counter::Base.RefValue{Int} = Base.RefValue{Int}(0)
+  sum(_nodeCount, stmts; init = 0) < 2 * limit && return (Expr[], _shareCalls(stmts, pure, counter))
   local parts::Vector{Vector{Any}} = Vector{Any}[Any[]]
   local size::Int = 0
   for st in stmts
@@ -1614,8 +1617,9 @@ function _splitStatements(name::Symbol, args::Vector{Symbol}, passed::Vector{Sym
   isempty(last(parts)) && pop!(parts)
   local defs::Vector{Expr} = Expr[]
   local calls::Vector{Any} = Any[]
-  for (k, part) in enumerate(parts)
+  for (k, whole) in enumerate(parts)
     local partName::Symbol = Symbol(name, "_chunk", k)
+    local part::Vector{Any} = _shareCalls(whole, pure, counter)
     local views::Vector{Any} = _usedLocals(paramLocals, Expr(:block, part...))
     push!(defs, :(function $partName($(args...), $(passed...))
                     $(views...)
@@ -2983,20 +2987,25 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
   #= a terminate() at the initialization: the problem ends at its start =#
   local endsAtStart::Union{Nothing, Expr} = hasTerminate ?
     :(p.state.terminated === nothing || return (ODEProblem(f, u0, (tspan[1], tspan[1]), p), cb)) : nothing
-  #= the large functions' statements in functions of bounded size (_splitStatements) =#
+  #= the large functions' statements in functions of bounded size (_splitStatements), the calls of the functions not
+     called as impure shared in each (`_shareCalls`) =#
+  local pure::Set{Symbol} = Set{Symbol}(Symbol(nm) for nm::String in keys(g.functions) if !(nm in g.impure))
   local (eqDefs::Vector{Expr}, eqStmts::Vector{Any}) =
-    _splitStatements(:equations!, Symbol[:du, :a, :u, :p, :t, :z, :mode, :fire], Symbol[], paramLocals, _rollRuns(body); fired = true)
+    _splitStatements(:equations!, Symbol[:du, :a, :u, :p, :t, :z, :mode, :fire], Symbol[], paramLocals, _rollRuns(body);
+                     fired = true, pure)
   local (rhsDefs::Vector{Expr}, rhsStmts::Vector{Any}) =
-    _splitStatements(:RHS!, Symbol[:du, :u, :p, :t], Symbol[:a, :z, :mode, :fire], paramLocals, rhsBody; fired = true)
+    _splitStatements(:RHS!, Symbol[:du, :u, :p, :t], Symbol[:a, :z, :mode, :fire], paramLocals, rhsBody; fired = true, pure)
   local (condDefs::Vector{Expr}, condStmts::Vector{Any}) =
-    _splitStatements(:crossings!, Symbol[:du, :a, :u, :p, :t, :z, :mode], Symbol[:fire], paramLocals, condBody; fired = true)
+    _splitStatements(:crossings!, Symbol[:du, :a, :u, :p, :t, :z, :mode], Symbol[:fire], paramLocals, condBody; fired = true,
+                     pure)
   local (invDefs::Vector{Expr}, invStmts::Vector{Any}) =
-    _splitStatements(:invariants!, Symbol[:a, :p], Symbol[], paramLocals, _rollRuns(invariantBody); fired = false)
+    _splitStatements(:invariants!, Symbol[:a, :p], Symbol[], paramLocals, _rollRuns(invariantBody); fired = false, pure)
   local (assertRowDefs::Vector{Expr}, assertRowStmts::Vector{Any}) =
-    _splitStatements(:assertRows!, Symbol[:du, :a, :u, :p, :t], Symbol[:z, :mode, :fire], paramLocals, assertRowBody; fired = true)
+    _splitStatements(:assertRows!, Symbol[:du, :a, :u, :p, :t], Symbol[:z, :mode, :fire], paramLocals, assertRowBody;
+                     fired = true, pure)
   local blockSplits::Vector{Tuple{Vector{Expr}, Vector{Any}}} =
     Tuple{Vector{Expr}, Vector{Any}}[_splitStatements(Symbol("BLOCK_", k, "!"), Symbol[:res, :y, :du, :a, :u, :p, :t, :z, :mode, :fire],
-                                                      Symbol[], paramLocals, code.args; fired = false)
+                                                      Symbol[], paramLocals, code.args; fired = false, pure)
                                      for (k, code) in enumerate(blockBodies)]
   local splitDefs::Vector{Expr} = vcat(rhsDefs, condDefs, Expr[d for (defs, _) in blockSplits for d in defs])
   #= equations! and invariants! with their parts: the model module's submodule ColdCode =#

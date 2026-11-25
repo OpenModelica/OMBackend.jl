@@ -1090,6 +1090,7 @@ end
 
 "A call of a Modelica function of the model (`_isFunctionCall`) with its arguments' values (`_argumentsIRx!`): all its outputs, as returned."
 function _allOutputsCallIRx(g::Gen, e::SC.CALL, ctx::Ctx)::IR
+  e.kind === SC.CALL_IMPURE_FUNCTION && push!(g.impure, String(e.name))
   local callArgs::Vector{IR} = IR[]
   for a in e.args
     _argumentsIRx!(callArgs, g, a, ctx)
@@ -2534,7 +2535,7 @@ function domainSystem(sc::SC.SIM_CODE)::DomainSystem
                 EqClass[], EqClass[], AlgClass[], Tuple{String, String, Bool}[], WhenClass[], AssertClass[], 0, 0, 0, 0,
                 -1000, false, Dict{Int, Int}(), AlgClass[], String[], AssertClass[], functionOutputs, Dict{String, String}(),
                 Set{String}(), Tuple{String, String}[], ObjectSlot[], false, DelaySite[], false,
-                Dict{String, SC.RECORD}(), Tuple{Symbol, String, Symbol}[])
+                Dict{String, SC.RECORD}(), Tuple{Symbol, String, Symbol}[], Set{String}())
   local stateNamesOrdered::Vector{String} = String[]; local algNamesOrdered::Vector{String} = String[]
   local discreteNamesOrdered::Vector{String} = String[]
   local u0::Vector{Float64} = Float64[]; local d0::Vector{Float64} = Float64[]; local a0::Vector{Float64} = Float64[]
