@@ -59,7 +59,8 @@
       rejected, so an error within one step is not bounded, only the next
       steps are).
    2. The algebraic unknowns at the step end are projected onto their
-      equations (Newton with the Jacobian of step 1). A Rodas step starts from
+      equations (Newton with the Jacobian of step 1; where that does not
+      converge, with the Jacobian at each iterate). A Rodas step starts from
       the state alone (no FSAL derivative, no history), so this needs no
       restart.
    3. Before a step is accepted (the solve's `isoutofdomain`,
@@ -162,8 +163,9 @@ _conditionFunction(@nospecialize(c))::Any =
    like dt^4. Limits of the factor on the next step, as a step-size
    controller's. Where in the step the dense output is checked (its error
    peaks near 0.8 of a Rodas5P step, not at the midpoint). The projection's
-   Newton iterations (with the check's Jacobian, so they converge linearly)
-   stop below this fraction of the tolerance, near a nonlinear solver's
+   Newton iterations (with the check's Jacobian, so they converge linearly;
+   then with the Jacobian at each iterate) stop below this fraction of the
+   tolerance, near a nonlinear solver's
    accuracy: a relation or assert at a threshold must not see the step's
    error; or where the correction is round-off. =#
 const _ALGEBRAIC_ERROR_ORDER = 4
@@ -331,37 +333,89 @@ function _algebraicError!(w::AlgebraicWork, rows::Vector{Int}, integrator)
 end
 
 """
-Newton on the algebraic rows at the step end, differential unknowns kept.
-Kept only if it converges; the state is left as it was otherwise.
+Newton on the algebraic rows at the step end, differential unknowns kept:
+first with the Jacobian of the step's midpoint (step 1's factorization `F`),
+then, where that does not converge, again from the step end with the Jacobian
+at each iterate. Kept only if one of them converges; the state is left as it
+was otherwise.
+
+The midpoint's Jacobian converges only linearly, and not within
+`_PROJECTION_ITERATIONS` where the algebraic Jacobian changes much over the
+step. MSL RevoluteConstraint: at reltol 1e-6 the body's w_a[1] (omc: 0)
+reached 6.0e-7, outside its validation tube (~4e-7); 1.1e-8 with the second
+Newton. At reltol 1e-3, 4 of its 51 step ends stayed unprojected (an algebraic
+residual up to 1e-2).
 """
 function _projectStepEnd!(w::AlgebraicWork, rows::Vector{Int}, F, integrator)
   F === nothing && return nothing
   local u = integrator.u
   copyto!(w.u, u)
+  local converged::Bool = false
   for _ in 1:_PROJECTION_ITERATIONS
-    try
-      LinearAlgebra.ldiv!(w.correction, F, _algebraicResidual!(w, rows, integrator, integrator.t))
-    catch err
-      #= The model's residual threw (a singular factorization is `nothing`): no projection. =#
-      OMBackend._fallback(err, :algebraicProjection)
-      return nothing
-    end
-    local correction = w.correction
-    local roundoff = true
-    for (i, k) in enumerate(rows)
-      w.u[k] -= correction[i]
-      roundoff &= abs(correction[i]) <= 16 * eps(max(abs(w.u[k]), 1.0))
-    end
-    local step = _scaledNorm(rows, integrator, correction, w.u)
-    isfinite(step) || return nothing
-    if step < _PROJECTION_TOLERANCE || roundoff
-      for k in rows
-        u[k] = w.u[k]
-      end
-      return nothing
-    end
+    local step = _projectionStep!(w, rows, F, integrator)
+    isfinite(step) || break
+    converged = step < _PROJECTION_TOLERANCE
+    converged && break
+  end
+  if !converged
+    copyto!(w.u, u)
+    converged = _newtonFromStepEnd!(w, rows, integrator)
+  end
+  converged || return nothing
+  for k in rows
+    u[k] = w.u[k]
   end
   return nothing
+end
+
+"""
+Newton on the algebraic rows from w.u (the step end), with the Jacobian at
+each iterate. Whether it converged; w.u then holds the projection. It stops
+where the correction does not shrink, so a step end it cannot reach costs two
+Jacobians, not `_PROJECTION_ITERATIONS`.
+"""
+function _newtonFromStepEnd!(w::AlgebraicWork, rows::Vector{Int}, integrator)::Bool
+  local previous = zero(real(eltype(w.u)))
+  for iteration in 1:_PROJECTION_ITERATIONS
+    local J = try
+      _algebraicJacobian!(w, rows, integrator, integrator.t)
+    catch err
+      #= The model's right-hand side threw at the iterate. =#
+      OMBackend._fallback(err, :algebraicProjection)
+      return false
+    end
+    J === nothing && return false
+    local step = _projectionStep!(w, rows, J, integrator)
+    isfinite(step) || return false
+    step < _PROJECTION_TOLERANCE && return true
+    (iteration == 1 || step < previous) || return false
+    previous = step
+  end
+  return false
+end
+
+"""
+One Newton iteration on the algebraic rows at (w.u, integrator.t) with the
+factorization `F`: w.u corrected. The correction's norm scaled by the
+tolerances (`_scaledNorm`); zero where it is round-off, NaN where the
+model's residual threw.
+"""
+function _projectionStep!(w::AlgebraicWork, rows::Vector{Int}, F, integrator)
+  try
+    LinearAlgebra.ldiv!(w.correction, F, _algebraicResidual!(w, rows, integrator, integrator.t))
+  catch err
+    #= The model's residual threw (a singular factorization is `nothing`). =#
+    OMBackend._fallback(err, :algebraicProjection)
+    return convert(real(eltype(w.u)), NaN)
+  end
+  local correction = w.correction
+  local roundoff::Bool = true
+  for (i, k) in enumerate(rows)
+    w.u[k] -= correction[i]
+    roundoff &= abs(correction[i]) <= 16 * eps(max(abs(w.u[k]), 1.0))
+  end
+  local step = _scaledNorm(rows, integrator, correction, w.u)
+  return roundoff ? zero(step) : step
 end
 
 """

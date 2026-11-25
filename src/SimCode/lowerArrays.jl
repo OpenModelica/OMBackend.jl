@@ -115,12 +115,13 @@ function lowerArraySystem(model::IR.Model)::SIM_CODE
 end
 
 """
-    ElementValues(names, startGiven, starts, fixed, fixedEvaluates, values)
+    ElementValues(names, startGiven, starts, fixed, fixedEvaluates, values, startExps, nominals)
 
 What the lowering evaluates of a variable per element (`elementValues`), row-major: its elements' names; whether an
 element has a start; their starts (`0.0` for none; `nothing` where one does not evaluate); their fixed attributes
 (`nothing` for none) and whether every one given evaluates; a parameter's values (typed as its elements; `nothing` where
-one does not evaluate, or of another type).
+one does not evaluate, or of another type); the element starts as written, where one reads a parameter; their nominal
+values (`_nominalValue`; `nothing` where no element has one).
 """
 struct ElementValues
   names::Vector{Symbol}
@@ -129,7 +130,19 @@ struct ElementValues
   fixed::Vector{Union{Nothing, Bool}}
   fixedEvaluates::Bool
   values::Union{Nothing, Vector{Any}}
-  startExps::Union{Nothing, Vector{IR.Expression}}   #= the element starts as written, where one reads a parameter =#
+  startExps::Union{Nothing, Vector{IR.Expression}}
+  nominals::Union{Nothing, Vector{Float64}}
+end
+
+"""
+The nominal value of an element from its nominal attribute evaluated (`value`): its size; 1 where it has none, it does
+not evaluate, or it is zero or not finite. The scale of the unknown's differences and steps in the loop solves
+(`blockSolve!`, `loopFamilySolve!`), as omc's max(|x|, nominal). A nominal that reads a parameter evaluates at the
+translation: an override of the parameter does not reach it.
+"""
+function _nominalValue(value::Union{Nothing, Float64})::Float64
+  (value === nothing || !isfinite(value) || iszero(value)) && return 1.0
+  return abs(value)
 end
 
 """
@@ -178,9 +191,14 @@ function elementValues(variables::IR.VariableSet, E::Passes.IndexReduction.Eleme
       all((x::Union{Nothing, Float64}) -> x !== nothing, vals) &&
         (paramValues = Any[vtype == :int ? round(Int, x) : vtype == :bool ? x != 0 : x for x in vals])
     end
+    #= the nominal values: of the unknowns only (the loop solves' scale) =#
+    local nominalGiven::Vector{Union{Nothing, IR.Expression}} =
+      known ? Union{Nothing, IR.Expression}[] : Union{Nothing, IR.Expression}[attribute(x, :nominal) for x in names]
+    local nominals::Union{Nothing, Vector{Float64}} = all(isnothing, nominalGiven) ? nothing :
+      Float64[_nominalValue(x === nothing ? nothing : Passes.Evaluation.evaluate(x, values)) for x in nominalGiven]
     out[v.name] = ElementValues(names, startGiven,
                                 all((x::Union{Nothing, Float64}) -> x !== nothing, starts) ? Float64[x for x in starts] : nothing,
-                                fixed, fixedEvaluates, paramValues, (readsParameter && !known) ? startExprs : nothing)
+                                fixed, fixedEvaluates, paramValues, (readsParameter && !known) ? startExprs : nothing, nominals)
   end
   return out
 end
@@ -193,10 +211,12 @@ has one and every element's evaluates (an array's the array literal of them; a m
 the default, `true` of a parameter, else `false`), a parameter's value (`PARAMETER.value`); a numeric constant's too, a
 `PARAMETER` of its value then (the array code takes a constant as a parameter). An attribute given on the elements that
 does not evaluate, the variable's own being none (a rolled component's start): a String constant saying so, which the
-array code refuses as no value. The element starts that read a parameter as written too (`startExps`).
+array code refuses as no value. The element starts that read a parameter as written too (`startExps`); the nominal
+values as constants where an element has one (`ElementValues.nominals`).
 """
 function evaluatedVariable(sv::SIMVAR, e::ElementValues, names::Names)::SIMVAR
   local a::SimVarAttributes = sv.attributes
+  local nominal::Union{Nothing, Exp} = e.nominals === nothing ? a.nominal : constantExp(Any[x for x in e.nominals], sv.dims)
   local notEvaluated::Function = (what::String, x::Union{Nothing, Exp}) -> x === nothing ? SCONST("the $(what) does not evaluate") : x
   local start::Union{Nothing, Exp} = !e.startGiven ? a.start : e.starts === nothing ? notEvaluated("start", a.start) :
     constantExp(Any[x for x in e.starts], sv.dims)
@@ -207,7 +227,7 @@ function evaluatedVariable(sv::SIMVAR, e::ElementValues, names::Names)::SIMVAR
   #= a constant's value too: the array code takes it as a parameter's =#
   kind isa Union{PARAMETER, DATA_STRUCTURE} && e.values !== nothing && (kind = PARAMETER(kind.bindExp, constantExp(e.values, sv.dims)))
   local startExps::Union{Nothing, Vector{Exp}} = e.startExps === nothing ? nothing : Exp[simExp(names, x) for x in e.startExps]
-  return withKind(withAttributes(sv, SimVarAttributes(start, fixed, a.nominal, a.min, a.max, a.unit, a.displayUnit, a.quantity,
+  return withKind(withAttributes(sv, SimVarAttributes(start, fixed, nominal, a.min, a.max, a.unit, a.displayUnit, a.quantity,
                                                       a.stateSelect, a.isProtected, startExps)), kind)
 end
 

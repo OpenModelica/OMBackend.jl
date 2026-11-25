@@ -106,7 +106,10 @@ end
 """
 A callable object's module is its type's; a type's (a constructor) its own.
 """
-_isOwnFunction(@nospecialize(f))::Bool = parentmodule(f isa Union{DataType, UnionAll} ? f : typeof(f)) in SOURCE_MODULES
+function _isOwnFunction(@nospecialize(f))::Bool
+  local m::Module = parentmodule(f isa Union{DataType, UnionAll} ? f : typeof(f))
+  return m in SOURCE_MODULES
+end
 
 """
 The first frame outside Base and Core (its throw helpers) is in our source.

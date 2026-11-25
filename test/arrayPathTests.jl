@@ -1101,6 +1101,215 @@ end DivideInLoop;
     @test isapprox(varied.x, [5.0, 0.0]; atol = 1e-8)
   end
 
+  @testset "A small loop stationary at its start values: varied as OpenModelica, no least-squares non-solution" begin
+    #= omc's testsuite tearing/Tearing9: x1 alone from x1*x1 - x3 + 2 = 0 (a loop family of one unknown), x1 without
+       a start value. At x1 = 0 the Jacobian is [0]; the least-norm step was zero and counted as converged: x1 = 0,
+       the residual -1, the run a Success. From the start values varied by 0.1 (OpenModelica: x += 0.1 nominal) the
+       positive root, omc's values (1, 2, 3, 4, 5) =#
+    local program = Modelica"""
+      model Tearing9
+        Real x1;
+        Real x2(start = 0);
+        Real x3;
+        Real x4;
+        Real x5(start = 0);
+        parameter Real X = 2;
+        parameter Real Y = 6;
+      equation
+        x1 + x4 - 5 = 0;
+        X * x3 - Y = 0;
+        x2 - 2 * x4 + x5 + 1 = 0;
+        x1 * x1 - x3 + 2 = 0;
+        x1 - x2 * x2 + x5 - 2 = 0;
+      end Tearing9;
+      """
+    local name::String = _translateProgram(program, "Tearing9"; scalarized = false)
+    @test _arrayPathTaken(name)
+    local sol = OMBackend.simulate(name; tspan = (0.0, 1.0))
+    @test sol.retcode == ReturnCode.Success
+    @test length(sol.prob.p.loops) == 2
+    @test isapprox(_values(sol, ["x1", "x2", "x3", "x4", "x5"]), [1.0, 2.0, 3.0, 4.0, 5.0]; atol = 1e-8)
+    #= the criterion of a least-squares iterate: a row without a derivative has to be zero =#
+    local generation::Module = OMBackend.CodeGeneration.ArrayPreserveDE
+    @test !generation._consistentResiduals([-1.0], zeros(1, 1), [0.0], [1.0])
+    @test generation._consistentResiduals([1.0e-12, 0.0], [2.0 0.0; 0.0 0.0], [1.0, 0.0], [1.0, 1.0])
+    #= the unknowns' size at least their nominal value =#
+    @test !generation._consistentResiduals([1.0e-7], ones(1, 1), [1.0], [1.0])
+    @test generation._consistentResiduals([1.0e-7], ones(1, 1), [1.0], [1.0e2])
+  end
+
+  @testset "A loop of unknowns of a large nominal value: differences and steps scaled by it" begin
+    #= omc's testsuite daemode/testDAEModeNominal: x^2 + y^2 = 2 VBase^2 and x - y = time from x = y = 1, nominal
+       VBase = 230940. A difference step of 1.5e-8 at x = 1 lost the residual's change at 1e11: the Jacobian singular,
+       the least-squares step zero (refused since a non-solution is no solution), the run DtNaN. Scaled by the nominal
+       values (as omc's max(|x|, nominal)) the positive root, x(t) = t/2 + sqrt(VBase^2 - t^2/4) =#
+    local program = Modelica"""
+      model DAEModeNominal
+        parameter Real UNom = 400e3;
+        final parameter Real VBase = UNom/sqrt(3);
+        Real x(start = 1, nominal = VBase);
+        Real y(start = 1, nominal = VBase);
+        Real z(start = 1, nominal = VBase);
+      equation
+        x^2 + y^2 = 2*VBase^2;
+        x - y = time;
+        der(z) = x - z;
+      end DAEModeNominal;
+      """
+    local name::String = _translateProgram(program, "DAEModeNominal"; scalarized = false)
+    @test _arrayPathTaken(name)
+    local sol = OMBackend.simulate(name; tspan = (0.0, 0.1))
+    @test sol.retcode == ReturnCode.Success
+    local vBase::Float64 = 400e3 / sqrt(3)
+    local exact(t::Float64)::Float64 = t / 2 + sqrt(vBase^2 - t^2 / 4)
+    @test isapprox(OMBackend.variableValues(sol, "x")[1], vBase; rtol = 1e-10)
+    @test isapprox(_values(sol, ["x", "y"]), [exact(0.1), exact(0.1) - 0.1]; rtol = 1e-10)
+    #= the same equations as a block (`blockSolve!`): with the nominal values its root at 52 Jacobians without them
+       (4e-11 off), exact at 23 =#
+    local AG::Module = OMBackend.CodeGeneration.ArrayPreserveDE
+    local SA::Module = OMBackend.CodeGeneration.Symbolics.SparseArrays
+    local S::SA.SparseMatrixCSC{Float64, Int} = SA.sparse(ones(2, 2))
+    local residual!(r, y, du, a, u, p, t, z, mode, fire) =
+      (a .= y; r[1] = y[1]^2 + y[2]^2 - 2 * vBase^2; r[2] = y[1] - y[2]; nothing)
+    local solved::Vector{Tuple{Vector{Float64}, Int}} = Tuple{Vector{Float64}, Int}[]
+    for nominal in ([1.0, 1.0], [vBase, vBase])
+      local s::AG.BlockSolver = AG.BlockSolver(S, AG.columnColors(S), [1.0, 1.0]; nominal)
+      local (du::Vector{Float64}, a::Vector{Float64}) = (zeros(2), zeros(2))
+      AG.blockSolve!(s, residual!, du, a, Float64[], nothing, 0.0, AG.NO_CROSSINGS, false, false)
+      push!(solved, (a, s.jacobians))
+    end
+    @test isapprox(solved[2][1], [vBase, vBase]; rtol = 1e-14)
+    @test solved[2][2] < solved[1][2]
+    #= a block of the model's (10 unknowns, above NEWTON_BLOCK_SIZE; torn to 1 iteration variable): the attribute
+       reaches its solver; without it x[1](0) is 4e-11 off (158 Jacobians, 119 with it) =#
+    local block = Modelica"""
+      model NominalBlock
+        parameter Real VBase = 400e3/sqrt(3);
+        Real x[10](each start = 1, each nominal = VBase);
+        Real z(start = 1);
+      equation
+        for i in 1:9 loop
+          x[i + 1] - x[i] = time;
+        end for;
+        sum(x[i]^2 for i in 1:10) = 10*VBase^2;
+        der(z) = x[1] - z;
+      end NominalBlock;
+      """
+    name = _translateProgram(block, "NominalBlock"; scalarized = false)
+    @test _arrayPathTaken(name)
+    sol = OMBackend.simulate(name; tspan = (0.0, 0.1))
+    @test sol.retcode == ReturnCode.Success
+    @test !isempty(only(sol.prob.p.blocks).nominal) && all(==(vBase), only(sol.prob.p.blocks).nominal)
+    #= 10 x1^2 + 90 t x1 + 285 t^2 = 10 VBase^2 =#
+    local x1(t::Float64)::Float64 = (-90t + sqrt(8100t^2 - 40 * (285t^2 - 10vBase^2))) / 20
+    @test isapprox(OMBackend.variableValues(sol, "x[1]")[1], vBase; rtol = 1e-13)
+    @test isapprox(_values(sol, ["x[1]", "x[10]"]), [x1(0.1), x1(0.1) + 0.9]; rtol = 1e-13)
+  end
+
+  @testset "A small loop whose varied start values meet a domain error: the trial point rejected, not thrown" begin
+    #= omc's testsuite tearing/Tearing19 (run with -lv=-LOG_ASSERT): past t = 0.713 no attempt reaches a root; from
+       the start values varied by 0.1 a damped step's trial point gave log() a negative argument, and the DomainError
+       went out of the outputs' evaluation (`variableValues`) on a grid of 500 intervals. Such a point counts as one
+       where the residuals are not finite (`_loopResidual!`), as OpenModelica rejects it. omc's values at t = 0 =#
+    local program = Modelica"""
+      model Tearing19
+        Real x0(start = 0.2);
+        Real x1(start = 3.0);
+        Real x2(start = -1.5);
+        Real x3(start = 3.6);
+        Real x4(start = -2.5);
+        Real x5(start = -2.1);
+      equation
+        -min(abs(x0), 1/2) = sin(x1);
+        min(abs(x0), 1/2) = cos(x2);
+        x1^2 + x2^2 = x3^2;
+        x0^3 + x4 + x3 = 1.0;
+        x5^5 + x4^4 + x0*x1*x2 = 1;
+        0.0 = log(x0 + x1 + x2 + x3 + x4 + x5 + time^2);
+      end Tearing19;
+      """
+    local name::String = _translateProgram(program, "Tearing19"; scalarized = false)
+    @test _arrayPathTaken(name)
+    local sol = OMBackend.simulate(name; tspan = (0.0, 1.0), saveat = 0.0:0.002:1.0, reltol = 1e-6)
+    @test sol.retcode == ReturnCode.Success
+    local values::Vector{Vector{Float64}} = [OMBackend.variableValues(sol, n) for n in ["x0", "x1", "x2", "x3", "x4", "x5"]]
+    @test all(v::Vector{Float64} -> length(v) == 501 && all(isfinite, v), values)
+    @test isapprox(first.(values), [0.191205944245536, 3.333983265654047, -1.378405714730643, 3.607692715581985,
+                                    -2.614683150049451, -2.139793060701474]; atol = 1e-8)
+  end
+
+  @testset "Rolled components of opposite orientation: their hidden linear constraint in place of a for-equation's element" begin
+    #= omc's testsuite resolveLoops/Circuit1x: two capacitors in parallel, one turned (Cgd.p at Cds.n), rolled into
+       one array. Its constraint Cgd.v + Cds.v = 0 combines an element of the rolled `v[i] = p.v[i] - n.v[i]`; it was
+       left out, both elements states, the loop of their currents singular and inconsistent: a least-squares step
+       accepted, v = -3.7e16 at t = 10 with retcode Success. The for-equation unrolled, the constraint in its
+       element's place: one state, v = 2 (1 - exp(-t / 4)) (2 F through 2 Ohm from 2 V) =#
+    local program = Modelica"""
+      model ParallelCapacitors
+        connector Pin
+          Real v;
+          flow Real i;
+        end Pin;
+        model Capacitor
+          parameter Real C = 1;
+          Pin p;
+          Pin n;
+          Real v(start = 0);
+          Real i;
+        equation
+          v = p.v - n.v;
+          0 = p.i + n.i;
+          i = p.i;
+          i = C * der(v);
+        end Capacitor;
+        model Resistor
+          parameter Real R = 1;
+          Pin p;
+          Pin n;
+          Real v;
+          Real i;
+        equation
+          v = p.v - n.v;
+          0 = p.i + n.i;
+          i = p.i;
+          v = R * i;
+        end Resistor;
+        model Ground
+          Pin p;
+        equation
+          p.v = 0;
+        end Ground;
+        model ConstantVoltage
+          parameter Real V = 2;
+          Pin p;
+          Pin n;
+        equation
+          V = p.v - n.v;
+          0 = p.i + n.i;
+        end ConstantVoltage;
+        Capacitor Cgd;
+        Capacitor Cds;
+        Resistor RLoad;
+        Resistor RSource;
+        ConstantVoltage source;
+        Ground ground;
+      equation
+        connect(RLoad.n, ground.p);
+        connect(Cds.n, RLoad.p);
+        connect(Cgd.n, Cds.p);
+        connect(RSource.p, Cds.p);
+        connect(ground.p, source.n);
+        connect(source.p, RSource.n);
+        connect(Cgd.p, Cds.n);
+      end ParallelCapacitors;
+      """
+    local (sv::Vector{Float64}, av::Vector{Float64}, _) =
+      _bothWaysOf(program, "ParallelCapacitors", ["Cds.v", "Cgd.v"]; tspan = (0.0, 10.0), reltol = 1e-8, abstol = 1e-8)
+    local v10::Float64 = 2.0 * (1.0 - exp(-2.5))
+    @test isapprox(av, [v10, -v10]; rtol = 1e-6)
+    @test maximum(abs.(sv .- av)) < 1e-6
+  end
+
   @testset "A large loop through a limiter of high gain: differences over the unknowns' own size" begin
     #= a current of 1.6 mA into a limiter of gain 1e9 (an op-amp's V0 times a resistance), its solution 0.1 below
        the limit of 10: the standard difference's step, sqrt(eps) of at least 1, moves the limiter's input by 15 and
@@ -2491,8 +2700,9 @@ end DivideInLoop;
     local reads::Vector{Vector{Tuple{Int, Int}}} = [[(1, 1), (2, 1)], [(2, 1), (3, 1)], [(1, 1), (2, 1), (3, 1)]]
     local readers::Vector{Vector{Int}} = [[1, 3], [1, 2, 3], [2, 3]]
     local known::BitVector = falses(3); local used::BitVector = falses(3); local open::Vector{Int} = [2, 2, 3]
-    @test D._tearCascade(1, known, used, open, reads, readers, (e::Int, v::Int, access::Int) -> true) == 3
-    @test D._tearCascade(1, known, used, open, reads, readers, (e::Int, v::Int, access::Int) -> e != 1) == 1
+    local noOuts::Vector{Vector{Int}} = [Int[] for _ in 1:3]   #= equations only: no algorithm's outputs =#
+    @test D._tearCascade(1, known, used, open, reads, readers, noOuts, (e::Int, v::Int, access::Int) -> true) == 3
+    @test D._tearCascade(1, known, used, open, reads, readers, noOuts, (e::Int, v::Int, access::Int) -> e != 1) == 1
     @test known == falses(3) && used == falses(3) && open == [2, 2, 3]
   end
 
@@ -2503,9 +2713,20 @@ end DivideInLoop;
     local reads::Vector{Vector{Tuple{Int, Int}}} = [[(1, 1), (2, 1)], [(2, 1), (3, 1)], [(1, 1), (2, 1), (3, 1)]]
     local readers::Vector{Vector{Int}} = [[1, 3], [1, 2, 3], [2, 3]]
     local all3::Function = (e::Int, v::Int, access::Int) -> true
-    local (order, tears, used) = D._tearOrder(reads, readers, all3, 1)
+    local noOuts::Vector{Vector{Int}} = [Int[] for _ in 1:3]
+    local (order, tears, used) = D._tearOrder(reads, readers, noOuts, all3, 1)
     @test order == [(1, 1, 1), (2, 3, 1)] && tears == [2] && used == BitVector([true, true, false])
-    @test D._tearOrder(reads, readers, all3, 3)[2] == [2]
+    @test D._tearOrder(reads, readers, noOuts, all3, 3)[2] == [2]
+    #= an algorithm: e2 reads v1 and assigns v2 (`outs`), e1 reads v1 and v2. v1 is torn (v2, an algorithm's output,
+       never is), e2 runs once v1 is known (0 unknowns left; an equation is solved at 1), e1 is the residual. Two
+       algorithms that read each other's outputs leave nothing to tear: NotSupported =#
+    local notV2::Function = (e::Int, v::Int, access::Int) -> v != 2
+    for lookahead in (1, 3)
+      local (aOrder, aTears, aUsed) = D._tearOrder([[(1, 1), (2, 1)], [(1, 1)]], [[1, 2], [1]], [Int[], [2]], notV2,
+                                                    lookahead)
+      @test aOrder == [(2, 0, 0)] && aTears == [1] && aUsed == BitVector([false, true])
+    end
+    @test_throws D.NotSupported D._tearOrder([[(2, 1)], [(1, 1)]], [[2], [1]], [[1], [2]], all3, 1)
     #= piecewise in the unknowns (x), with which `_tearBlock` tears greedily only (MSL DifferentialAmplifier's
        op-amp limiter): an if-expression whose condition reads x under noEvent, abs of x. Not piecewise in them: a
        smooth function, an if-expression on a mode held through the solve (a thyristor's `off`), a relation with
@@ -3955,5 +4176,120 @@ end DivideInLoop;
       local sol = OMBackend.simulate(name; tspan = (0.0, 1.0), reltol = 1e-10, abstol = 1e-12)
       @test _values(sol, ["x[2]", "y[1]", "y[2]", "z[2]"]) ≈ expected rtol = 1e-8
     end
+  end
+
+  #= A tuple call, `(y1, y2) = f(x, k)`, is an algorithm of the array code (its outputs are its own); in an algebraic
+     loop it runs from the loop's iterates, all its outputs at once, as omc's tearing solves an algorithm: in a family's
+     solve (its equations' unknowns iterated, `_loopFamilyCode`) and in a torn block (`_tearBlock`). Declined before
+     ("an algorithm in an algebraic loop": MSL Spice3BenchmarkFourBitBinaryAdder's DIODEs, `(cc, m_dCap) =
+     diodeNoBypassCode(..., {pin, n.v})`). Each loop k x^3 + 4 x = s, der(s) = -x: 1.5 k x^2 + 4 log(x) = C - t =#
+  @testset "An algorithm in an algebraic loop: run from the loop's iterates" begin
+    local loops = Modelica"""
+      package AlgLoop
+        function f
+          input Real x;
+          input Real k;
+          output Real y1;
+          output Real y2;
+        algorithm
+          y1 := k * x^3 + x;
+          y2 := 2 * x;
+        end f;
+        model One
+          Real s(start = 1, fixed = true);
+          Real x(start = 0.5);
+          Real y1, y2;
+        equation
+          der(s) = -x;
+          (y1, y2) = f(x, 1);
+          y1 + y2 + x = s;
+        end One;
+        model Init "s free, x = 0.4 at the start: the initial solve through the loop"
+          Real s(start = 1);
+          Real x(start = 0.5);
+          Real y1, y2;
+        initial equation
+          x = 0.4;
+        equation
+          der(s) = -x;
+          (y1, y2) = f(x, 1);
+          y1 + y2 + x = s;
+        end Init;
+        model Family
+          parameter Integer n = 200;
+          parameter Real k[n] = {1 + i / n for i in 1:n};
+          Real s[n](each start = 1, each fixed = true);
+          Real x[n](each start = 0.5);
+          Real y1[n], y2[n];
+        equation
+          for i in 1:n loop
+            der(s[i]) = -x[i];
+            (y1[i], y2[i]) = f(x[i], k[i]);
+            y1[i] + y2[i] + x[i] = s[i];
+          end for;
+        end Family;
+        model Coupled "one loop through the elements: k x^3 + 4 x = s + 0.1 (x[i - 1] - 2 x[i] + x[i + 1])"
+          parameter Integer n = 10;
+          Real s[n](each start = 1, each fixed = true);
+          Real x[n](each start = 0.5);
+          Real y1[n], y2[n];
+        equation
+          for i in 1:n loop
+            der(s[i]) = -x[i] + 0.05 * i;
+            (y1[i], y2[i]) = f(x[i], 1 + 0.1 * i);
+          end for;
+          y1[1] + y2[1] + x[1] = s[1] + 0.1 * (x[2] - 2 * x[1]);
+          for i in 2:n - 1 loop
+            y1[i] + y2[i] + x[i] = s[i] + 0.1 * (x[i - 1] - 2 * x[i] + x[i + 1]);
+          end for;
+          y1[n] + y2[n] + x[n] = s[n] + 0.1 * (x[n - 1] - 2 * x[n]);
+        end Coupled;
+      end AlgLoop;
+      """
+    #= x at t from x0 at 0 (1.5 k x^2 + 4 log(x) = C - t); x0 from s(0) = 1 (k x0^3 + 4 x0 = 1) =#
+    function loopValue(k::Float64, x0::Float64, t::Float64)::Float64
+      local C::Float64 = 1.5k * x0^2 + 4log(x0)
+      local x::Float64 = x0
+      for _ in 1:50
+        x -= (1.5k * x^2 + 4log(x) - (C - t)) / (3k * x + 4 / x)
+      end
+      return x
+    end
+    function startValue(k::Float64)::Float64
+      local x::Float64 = 0.25
+      for _ in 1:50
+        x -= (k * x^3 + 4x - 1) / (3k * x^2 + 4)
+      end
+      return x
+    end
+    local tight::NamedTuple = (reltol = 1e-10, abstol = 1e-10)
+    local name::String = _translateProgram(loops, "AlgLoop.One"; scalarized = false)
+    @test _arrayPathTaken(name)
+    local sol = OMBackend.simulate(name; tspan = (0.0, 1.0), tight...)
+    @test _values(sol, ["x"])[1] ≈ loopValue(1.0, startValue(1.0), 1.0) rtol = 1e-9
+    #= the initial system holds the loop's iterate (x) and solves s from it: s(0) = 0.4^3 + 1.6 =#
+    name = _translateProgram(loops, "AlgLoop.Init"; scalarized = false)
+    @test _arrayPathTaken(name)
+    sol = OMBackend.simulate(name; tspan = (0.0, 1.0), tight...)
+    @test OMBackend.variableValues(sol, "s")[1] ≈ 1.664 rtol = 1e-9
+    @test _values(sol, ["x"])[1] ≈ loopValue(1.0, 0.4, 1.0) rtol = 1e-9
+    #= one family solve for the 200 loops (its unknowns x[i], the call run from them): no torn block per element =#
+    name = _translateProgram(loops, "AlgLoop.Family"; scalarized = false)
+    @test _arrayPathTaken(name)
+    sol = OMBackend.simulate(name; tspan = (0.0, 1.0), tight...)
+    @test isempty(sol.prob.p.blocks) && size(only(sol.prob.p.loops)) == (1, 200)
+    @test _values(sol, ["x[1]", "x[100]", "x[200]"]) ≈ [loopValue(k, startValue(k), 1.0) for k in (1.005, 1.5, 2.0)] rtol = 1e-8
+    #= the call's outputs at the solution: they were the last Jacobian's, at x + 1.5e-8 (1 + |x|) (y1 off by 1.8e-8,
+       y2 by 3.0e-8) =#
+    local (xEnd::Float64, y1End::Float64, y2End::Float64) = _values(sol, ["x[200]", "y1[200]", "y2[200]"])
+    @test abs(y1End - (2xEnd^3 + xEnd)) < 1e-13 && abs(y2End - 2xEnd) < 1e-13
+    #= a torn block of 20 instances: 10 iteration variables, the calls run from them =#
+    name = _translateProgram(loops, "AlgLoop.Coupled"; scalarized = false)
+    @test _arrayPathTaken(name)
+    sol = OMBackend.simulate(name; tspan = (0.0, 1.0), tight...)
+    @test length(only(sol.prob.p.blocks).y) == 10
+    local x::Vector{Float64} = _values(sol, ["x[$i]" for i in 1:10]); local s::Vector{Float64} = _values(sol, ["s[$i]" for i in 1:10])
+    local coupling::Vector{Float64} = [0.1 * ((i > 1 ? x[i - 1] : 0.0) - 2x[i] + (i < 10 ? x[i + 1] : 0.0)) for i in 1:10]
+    @test maximum(abs.((1 .+ 0.1 .* (1:10)) .* x .^ 3 .+ 4x .- s .- coupling)) < 1e-12
   end
 end

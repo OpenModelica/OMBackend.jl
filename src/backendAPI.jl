@@ -129,6 +129,15 @@ below 7,500 in total.
 const DIRECT_JAC_TREE_NODE_LIMIT = Ref{Int}(20_000)
 
 """
+The generated code of the symbolic Jacobian's nonzeros (`_nonzeroFunctions`) as functions of at most this many Expr
+nodes each: one function compiles in time and memory far beyond linear in its size. MSL
+Spice3BenchmarkFourBitBinaryAdder's 5706 nonzeros (275k nodes) took 149 s and 5.8 GB as one function, past the
+coverage's 8.5 GB per model with the model's 6.7 GB; of its parts 45k nodes compiled in 3.2 s, 63k in 4.3 s, 156k in
+10.6 s.
+"""
+const DIRECT_JAC_FUNCTION_NODE_LIMIT = Ref{Int}(60_000)
+
+"""
 Toggle type erasure of direct-RHS problems via `FunctionWrapperSpecialize`.
 The generated RHS (and symbolic Jacobian) are runtime-generated functions
 whose type is unique per model, so the resulting `ODEProblem` type differs

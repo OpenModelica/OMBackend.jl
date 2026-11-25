@@ -32,6 +32,18 @@ the tolerance and projects the step ends onto the algebraic equations.
   @test projected.retcode == ReturnCode.Success
   @test residual(projected) < 1e-7                   # the step ends to 1e-6 of the tolerance
 
+  #= x' = 1, 0 = y^3 + y - 10 sin(3x): over a step the algebraic Jacobian 3y^2 + 1 changes so much
+     that Newton with the step midpoint's Jacobian does not converge (51 of 332 step ends stayed
+     unprojected, a residual up to 9e-3); Newton from the step end with the Jacobian at each iterate
+     projects them (MSL RevoluteConstraint). =#
+  local cubic!(du, u, p, t) = (du[1] = 1.0; du[2] = u[2]^3 + u[2] - 10 * sin(3 * u[1]); nothing)
+  local prob4 = ODE.ODEProblem(ODE.ODEFunction(cubic!; mass_matrix = mm), [0.0, 0.0], (0.0, 10.0))
+  local cubicResidual(s) = maximum(abs(u[2]^3 + u[2] - 10 * sin(3 * u[1])) for u in s.u)
+  local cubic = ODE.solve(prob4, rodas; reltol = 1e-3, abstol = 1e-4,
+                          callback = CG.withAlgebraicStepControl(nothing, prob4))
+  @test cubic.retcode == ReturnCode.Success
+  @test cubicResidual(cubic) < 1e-7
+
   #= The domain check (the problems' isoutofdomain, see withProblemCallbacks): a step end whose
      algebraic equations are not finite is rejected, so the solver retries smaller (MSL Spice3
      Inverter's first step ran its output node off to 1e232 and was accepted: Rodas's error

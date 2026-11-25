@@ -1914,12 +1914,23 @@ settled at the unstable root of its comparator (v_out = 0, no oscillation), DCPM
 equalled the scalarized route. A smaller loop with an equation that divides by one of its unknowns
 (`_dividesByBlockUnknowns`) is torn too, as omc's strict tearing never solves by dividing by a loop variable: the
 generated Newton starts every unknown at its start value, 0 without one, and MSL HeatingRectifier's diode
-`exp(v / (N * vt_t))` was NaN at vt_t = 0 (torn, vt_t is computed from the temperature).
+`exp(v / (N * vt_t))` was NaN at vt_t = 0 (torn, vt_t is computed from the temperature). A loop's algorithm (MSL
+Spice3's DIODE, `(cc, m_dCap) = diodeNoBypassCode(..., {pin, n.v})` in the loop of its inner node `pin`) runs from
+the iterates, all its outputs at once, as omc's tearing solves an algorithm (`_tearBlock`; a family's,
+`_loopFamilyCode`); not one with a when-statement (the solve would run it at each iterate) or one that assigns a
+discrete unknown.
 """
 function _largeBlocks(g::Gen, loops::LoopBlocks, matchRow::Vector{Int}, el::InstanceTable)::BitVector
   local large::BitVector =
     BitVector(length(b) > NEWTON_BLOCK_SIZE[] || _timeRelationsOnly(g, b, el) || _dividesByBlockUnknowns(g, b, el, matchRow)
               for b in loops.blocks)
+  for rs in loops.blocks, r::Int in rs
+    el.class[r] < 0 || continue
+    local alg::AlgClass = g.algs[-el.class[r]]
+    alg.nwhen == 0 || ns("a when-statement of an algorithm in an algebraic loop: " * first(alg.text, 120))
+    any(u::Int -> u > g.nStates + g.nAlg, el.outs[r]) &&
+      ns("a discrete unknown an algorithm assigns in an algebraic loop: " * first(alg.text, 120))
+  end
   for (b, rs) in enumerate(loops.blocks)
     large[b] || continue
     local k::Union{Nothing, Int} = findfirst(r::Int -> matchRow[r] > g.nStates + g.nAlg, rs)
@@ -2093,35 +2104,48 @@ its greedy score first; 1: the greedy choice alone.
 const TEAR_LOOKAHEAD = Base.RefValue{Int}(4096)
 
 """
-    _tearCascade(v, known, used, open, reads, readers, solves) -> Int
+    _readyOpen(outs) -> Int
+
+The unknowns a torn block's instance has left when it runs (`_tearOrder`): one for an equation (it is solved for it),
+none for an algorithm (`outs`, the unknowns it assigns: it runs once its inputs are known).
+"""
+_readyOpen(outs::Vector{Int})::Int = isempty(outs) ? 1 : 0
+
+"""
+    _tearCascade(v, known, used, open, reads, readers, outs, solves) -> Int
 
 The number of a torn block's unknowns known once `v` is (`_tearBlock`'s state not changed): `v` and those the
-instances then left with one unknown solve explicitly, in turn.
+instances then left with one unknown solve explicitly, or the algorithms whose inputs are then known assign, in turn.
 """
 function _tearCascade(v::Int, known::BitVector, used::BitVector, open::Vector{Int}, reads::Vector{Vector{Tuple{Int, Int}}},
-                      readers::Vector{Vector{Int}}, solves::Function)::Int
+                      readers::Vector{Vector{Int}}, outs::Vector{Vector{Int}}, solves::Function)::Int
   local k::BitVector = copy(known); local u::BitVector = copy(used); local o::Vector{Int} = copy(open)
   local queue::Vector{Int} = Int[]
+  local pending::Vector{Int} = Int[v]
   local learned::Int = 0
-  local next::Int = v
-  while true
+  while !isempty(pending)
+    local next::Int = pop!(pending)
     k[next] = true
     learned += 1
     for e in readers[next]
       o[e] -= 1
-      (o[e] == 1 && !u[e]) && push!(queue, e)
+      (o[e] == _readyOpen(outs[e]) && !u[e]) && push!(queue, e)
     end
-    next = 0
-    while !isempty(queue) && next == 0
+    while !isempty(queue) && isempty(pending)
       local e::Int = popfirst!(queue)
-      (u[e] || o[e] != 1) && continue
+      (u[e] || o[e] != _readyOpen(outs[e])) && continue
+      if !isempty(outs[e])
+        u[e] = true
+        append!(pending, outs[e])
+        continue
+      end
       local (x::Int, access::Int) = reads[e][findfirst(y::Tuple{Int, Int} -> !k[y[1]], reads[e])]
       solves(e, x, access) || continue
       u[e] = true
-      next = x
+      push!(pending, x)
     end
-    next == 0 && return learned
   end
+  return learned
 end
 
 """
@@ -2144,33 +2168,43 @@ function _piecewiseInUnknowns(x::IR, reads::F)::Bool where {F <: Function}
 end
 
 """
-    _tearOrder(reads, readers, solves, lookahead) -> (order, tears, used)
+    _tearOrder(reads, readers, outs, solves, lookahead) -> (order, tears, used)
 
 A block's unknowns (by index) in causal order: while an instance has one unknown left that it solves (`solves(e, v,
-access)`), it is solved for it; when none has, an unknown is torn (an iteration variable): the one whose being known
-lets the most instances be solved so, then the most read; with `lookahead > 1`, of the `lookahead` best so, the one
-that solves the most unknowns in turn (`_tearCascade`). Returns the solved (instance, unknown, access) in order, the
-torn unknowns, and the instances solved.
+access)`), it is solved for it, and an algorithm whose inputs are known (`outs[e]`, the unknowns it assigns; empty for
+an equation) runs, all its outputs known; when none can, an unknown is torn (an iteration variable; not an algorithm's
+output): the one whose being known lets the most instances be solved or run so, then the most read; with
+`lookahead > 1`, of the `lookahead` best so, the one that solves the most unknowns in turn (`_tearCascade`). Returns
+the solved (instance, unknown, access) in order (an algorithm's (instance, 0, 0)), the torn unknowns, and the
+instances solved. NotSupported where only algorithms' outputs are left (algorithms that read each other's outputs).
 """
-function _tearOrder(reads::Vector{Vector{Tuple{Int, Int}}}, readers::Vector{Vector{Int}}, solves::Function,
-                    lookahead::Int)::Tuple{Vector{Tuple{Int, Int, Int}}, Vector{Int}, BitVector}
-  local n::Int = length(reads)
-  local known::BitVector = falses(n); local used::BitVector = falses(n)
-  local open::Vector{Int} = Int[length(reads[e]) for e in 1:n]
+function _tearOrder(reads::Vector{Vector{Tuple{Int, Int}}}, readers::Vector{Vector{Int}}, outs::Vector{Vector{Int}},
+                    solves::Function, lookahead::Int)::Tuple{Vector{Tuple{Int, Int, Int}}, Vector{Int}, BitVector}
+  local nE::Int = length(reads); local nU::Int = length(readers)
+  local known::BitVector = falses(nU); local used::BitVector = falses(nE)
+  local assigned::BitVector = falses(nU)   #= an algorithm's output =#
+  foreach(o::Vector{Int} -> foreach(x::Int -> (assigned[x] = true), o), outs)
+  local open::Vector{Int} = Int[length(reads[e]) for e in 1:nE]
   local order::Vector{Tuple{Int, Int, Int}} = Tuple{Int, Int, Int}[]
   local tears::Vector{Int} = Int[]
-  local queue::Vector{Int} = Int[e for e in 1:n if open[e] == 1]
+  local queue::Vector{Int} = Int[e for e in 1:nE if open[e] == _readyOpen(outs[e])]
   local learn!::Function = function (v::Int)
     known[v] = true
     for e in readers[v]
       open[e] -= 1
-      (open[e] == 1 && !used[e]) && push!(queue, e)
+      (open[e] == _readyOpen(outs[e]) && !used[e]) && push!(queue, e)
     end
   end
   while true
     while !isempty(queue)
       local e::Int = popfirst!(queue)
-      (used[e] || open[e] != 1) && continue
+      (used[e] || open[e] != _readyOpen(outs[e])) && continue
+      if !isempty(outs[e])
+        used[e] = true
+        push!(order, (e, 0, 0))
+        foreach(learn!, outs[e])
+        continue
+      end
       local (v::Int, access::Int) = reads[e][findfirst(x::Tuple{Int, Int} -> !known[x[1]], reads[e])]
       solves(e, v, access) || continue
       used[e] = true
@@ -2179,15 +2213,18 @@ function _tearOrder(reads::Vector{Vector{Tuple{Int, Int}}}, readers::Vector{Vect
     end
     all(known) && break
     local scored::Vector{Tuple{Tuple{Int, Int}, Int}} = Tuple{Tuple{Int, Int}, Int}[]
-    for v in 1:n
-      known[v] && continue
+    for v in 1:nU
+      (known[v] || assigned[v]) && continue
       local unlocks::Function = function (e::Int)
-        (used[e] || open[e] != 2) && return false
+        used[e] && return false
+        isempty(outs[e]) || return open[e] == 1
+        open[e] == 2 || return false
         local other::Union{Nothing, Int} = findfirst(x::Tuple{Int, Int} -> !known[x[1]] && x[1] != v, reads[e])
         return other !== nothing && solves(e, reads[e][other]...)
       end
       push!(scored, ((count(unlocks, readers[v]), count(e::Int -> !used[e], readers[v])), v))
     end
+    isempty(scored) && ns("algorithms in an algebraic loop that read each other's outputs")
     sort!(scored; by = first, rev = true)
     local best::Int = scored[1][2]
     if lookahead > 1
@@ -2195,7 +2232,7 @@ function _tearOrder(reads::Vector{Vector{Tuple{Int, Int}}}, readers::Vector{Vect
       for (score, v) in first(scored, lookahead)
         #= one that unlocks no instance solves none in turn: its cascade is itself =#
         score[1] == 0 && break
-        local c::Int = _tearCascade(v, known, used, open, reads, readers, solves)
+        local c::Int = _tearCascade(v, known, used, open, reads, readers, outs, solves)
         c > bestCascade && ((best, bestCascade) = (v, c))
       end
     end
@@ -2220,15 +2257,34 @@ DifferentialAmplifier's op-amp limiter, torn by the cascade in two currents (4 g
 sources with a gain of 1e9: each step's guess, the last solution, was saturated at the next time, and Newton jumped
 between the supplies. A branch on a mode held through the solve is not piecewise in the unknowns: MSL
 ThyristorBridge2mPulse_DC_Drive's thyristors (`if off[i]`), 6 iteration variables by cascades, 12 greedily, whose
-events at the start did not settle. The instances left are the residuals. Batches by level (an instance after those
-it reads), then (class, access).
+events at the start did not settle. An algorithm of the block runs once its inputs are known, all its outputs at
+once (`_tearOrder`; they are not iteration variables, and no equation is solved for one): MSL Spice3's DIODE, its
+inner node's voltage torn, `(cc, m_dCap) = diodeNoBypassCode(..., {pin, n.v})` computed from it. The instances
+left are the residuals. Batches by level (an instance after those it reads), then (class, access); an algorithm's
+(its negated index, 0).
 """
 function _tearBlock(g::Gen, el::InstanceTable, block::Vector{Int}, matchRow::Vector{Int})::TornBlock
   local n::Int = length(block)
-  local index::Dict{Int, Int} = Dict{Int, Int}(matchRow[r] => k for (k, r) in enumerate(block))
-  #= each instance's unknowns of the block (by index) and the access of each =#
+  #= the block's unknowns (by index): each equation's matched one, each algorithm's outputs (`outs`, by instance) =#
+  local unknownIds::Vector{Int} = Int[]
+  local outs::Vector{Vector{Int}} = Vector{Int}[Int[] for _ in 1:n]
+  for (e, r) in enumerate(block)
+    if el.class[r] > 0
+      push!(unknownIds, matchRow[r])
+      continue
+    end
+    for u::Int in el.outs[r]
+      push!(unknownIds, u)
+      push!(outs[e], length(unknownIds))
+    end
+  end
+  local nU::Int = length(unknownIds)
+  local index::Dict{Int, Int} = Dict{Int, Int}(u => k for (k, u) in enumerate(unknownIds))
+  local assigned::BitVector = falses(nU)   #= an algorithm's output =#
+  foreach(o::Vector{Int} -> foreach(x::Int -> (assigned[x] = true), o), outs)
+  #= each instance's unknowns of the block (by index) and the access of each (0 for an algorithm's inputs) =#
   local reads::Vector{Vector{Tuple{Int, Int}}} = Vector{Tuple{Int, Int}}[Tuple{Int, Int}[] for _ in 1:n]
-  local readers::Vector{Vector{Int}} = Vector{Int}[Int[] for _ in 1:n]
+  local readers::Vector{Vector{Int}} = Vector{Int}[Int[] for _ in 1:nU]
   for (e, r) in enumerate(block), i in el.uptr[r]:(el.uptr[r + 1] - 1)
     local v::Int = get(index, el.uid[i], 0)
     (v == 0 || any(x::Tuple{Int, Int} -> x[1] == v, reads[e])) && continue
@@ -2238,8 +2294,9 @@ function _tearBlock(g::Gen, el::InstanceTable, block::Vector{Int}, matchRow::Vec
   local divisors::Dict{Tuple{Int, Int}, Union{Nothing, Vector{IR}}} = Dict{Tuple{Int, Int}, Union{Nothing, Vector{IR}}}()
   local accessesOf::Dict{Int, Vector{Ref}} = Dict{Int, Vector{Ref}}()
   local solves::Function = function (e::Int, v::Int, access::Int)
+    assigned[v] && return false
     local r::Int = block[e]
-    (r, matchRow[block[v]]) in el.aliased && return false
+    (r, unknownIds[v]) in el.aliased && return false
     local c::EqClass = g.classes[el.class[r]]
     local ds::Union{Nothing, Vector{IR}} = get!(() -> _explicitDivisors(g, c.lhs, c.rhs, access), divisors, (el.class[r], access))
     (ds !== nothing && _nonzeroDivisors(g, ds, c, el.col[r])) || return false
@@ -2247,36 +2304,51 @@ function _tearBlock(g::Gen, el::InstanceTable, block::Vector{Int}, matchRow::Vec
     return _largestCoefficient(g, c, el.col[r], acc, access, Int[x[2] for x in reads[e] if x[1] != v])
   end
   #= (instance, unknown, access) in causal order, the iteration variables, the instances solved =#
-  local (order::Vector{Tuple{Int, Int, Int}}, tears::Vector{Int}, used::BitVector) = _tearOrder(reads, readers, solves, 1)
-  local unknowns::Set{Tuple{String, Bool}} = _unknownVariables(g, Int[matchRow[r] for r in block])
+  local (order::Vector{Tuple{Int, Int, Int}}, tears::Vector{Int}, used::BitVector) = _tearOrder(reads, readers, outs, solves, 1)
+  local unknowns::Set{Tuple{String, Bool}} = _unknownVariables(g, unknownIds)
   local readsUnknown::Function = (r::Ref) -> (r.name, r.der) in unknowns
   if TEAR_LOOKAHEAD[] > 1 && !any(ci::Int -> _piecewiseInUnknowns(g.classes[ci].lhs, readsUnknown) ||
                                              _piecewiseInUnknowns(g.classes[ci].rhs, readsUnknown),
-                                  Set{Int}(el.class[r] for r in block))
-    local cascaded::Tuple{Vector{Tuple{Int, Int, Int}}, Vector{Int}, BitVector} = _tearOrder(reads, readers, solves, TEAR_LOOKAHEAD[])
+                                  Set{Int}(el.class[r] for r in block if el.class[r] > 0))
+    local cascaded::Tuple{Vector{Tuple{Int, Int, Int}}, Vector{Int}, BitVector} =
+      _tearOrder(reads, readers, outs, solves, TEAR_LOOKAHEAD[])
     length(cascaded[2]) < length(tears) && ((order, tears, used) = cascaded)
   end
   local residuals::Vector{Int} = Int[]
   for e in 1:n
     used[e] || push!(residuals, e)
   end
-  #= as many as iteration variables: each instance solved determines one unknown, each other unknown is torn =#
+  #= as many as iteration variables: each equation solved determines one unknown, each other unknown an equation
+     determines is torn =#
   #= levels: an instance after the instances that solve what it reads =#
-  local level::Vector{Int} = zeros(Int, n)   #= by unknown: 0 for an iteration variable =#
+  local level::Vector{Int} = zeros(Int, nU)   #= by unknown: 0 for an iteration variable =#
   local byKey::Dict{Tuple{Int, Int, Int}, Vector{Int}} = Dict{Tuple{Int, Int, Int}, Vector{Int}}()
   for (e, v, access) in order
-    level[v] = 1 + maximum((level[x] for (x, _) in reads[e] if x != v); init = 0)
-    push!(get!(() -> Int[], byKey, (level[v], el.class[block[e]], access)), e)
+    local at::Int = 1 + maximum((level[x] for (x, _) in reads[e] if x != v); init = 0)
+    if v == 0
+      foreach(o::Int -> (level[o] = at), outs[e])
+    else
+      level[v] = at
+    end
+    push!(get!(() -> Int[], byKey, (at, el.class[block[e]], access)), e)
   end
   local batches::Vector{Tuple{Tuple{Int, Int}, Vector{Int}}} =
     Tuple{Tuple{Int, Int}, Vector{Int}}[((k[2], k[3]), byKey[k]) for k in sort!(collect(keys(byKey)))]
   #= the residuals' sparsity: the iteration variables each reads, directly or through the instances solved before =#
-  local dep::Vector{BitSet} = BitSet[BitSet() for _ in 1:n]
+  local dep::Vector{BitSet} = BitSet[BitSet() for _ in 1:nU]
   for (t, v) in enumerate(tears)
     push!(dep[v], t)
   end
-  for (e, v, _) in order, (x, _) in reads[e]
-    x == v || union!(dep[v], dep[x])
+  for (e, v, _) in order
+    if v == 0
+      for o::Int in outs[e], (x, _) in reads[e]
+        union!(dep[o], dep[x])
+      end
+    else
+      for (x, _) in reads[e]
+        x == v || union!(dep[v], dep[x])
+      end
+    end
   end
   local I::Vector{Int} = Int[]; local J::Vector{Int} = Int[]
   for (t, e) in enumerate(residuals)
@@ -2286,7 +2358,7 @@ function _tearBlock(g::Gen, el::InstanceTable, block::Vector{Int}, matchRow::Vec
       push!(I, t); push!(J, j)
     end
   end
-  return TornBlock(Int[matchRow[block[v]] for v in tears], residuals, batches, (I, J))
+  return TornBlock(Int[unknownIds[v] for v in tears], residuals, batches, (I, J))
 end
 
 "The family of each block of `loops` (by its template)."
@@ -2369,8 +2441,9 @@ end
 """
 The schedule of a model with algebraic loops (`_schedule`'s, where Kahn's algorithm leaves instances in cycles): the
 strongly connected sets of instances blocks (`LoopBlocks`), each solved as one; the blocks of a template batched by
-family (key (0, family), the batch listing block numbers), the other instances as `_schedule` batches them. Not an
-algorithm in a loop. A loop through a discrete unknown the event iteration settles (`settled`: its equation reads the
+family (key (0, family), the batch listing block numbers), the other instances as `_schedule` batches them. A
+block's algorithm runs from its iterates (`_largeBlocks`). A loop through a discrete unknown the event iteration
+settles (`settled`: its equation reads the
 continuous variables through relations only, an ideal diode's `off = s < 0`) is cut at that unknown: its readers in the
 loop read its last value (it does not change between events; at an event the sweeps repeat until it stays, as
 OpenModelica's mixed systems), its own instance comes after the loop, which is of the continuous unknowns.
@@ -2399,7 +2472,6 @@ function _scheduleWithLoops(el::InstanceTable, matchRow::Vector{Int}, producer::
   for c in sort!(collect(keys(members)))
     local rs::Vector{Int} = members[c]
     length(rs) > 1 || continue
-    any(r::Int -> el.class[r] < 0, rs) && ns("an algorithm in an algebraic loop")
     sort!(rs; by = r::Int -> (el.class[r], pos[r], el.col[r]))
     push!(blocks, rs)
     foreach(r::Int -> (blockOf[r] = length(blocks)), rs)

@@ -210,6 +210,7 @@ function causalSchedule!(g::Gen; keepsArrays::Bool, full::Bool, fixedMask::Vecto
         local t::TornBlock = _tearBlock(g, el, loops.blocks[b], matchRow)
         torn[b] = t
         for ((tci, tp), _) in t.batches
+          tci > 0 || continue   #= an algorithm: its statements =#
           local c::EqClass = g.classes[tci]
           get!(() -> _solveFor(c.lhs, c.rhs, tp, c.text), solutions, (tci, tp))
         end
@@ -527,12 +528,23 @@ function _initialReads(g::Gen, c::EqClass, j::Int,
 end
 
 """
+    _blockIterates(block, torn, el, matchRow) -> Vector{Int}
+
+The unknowns a loop block's solve iterates: a torn block's iteration variables (`torn`), a family member's equations'
+unknowns (an algorithm's outputs are computed from them, `_loopFamilyCode`).
+"""
+_blockIterates(block::Vector{Int}, ::Nothing, el::InstanceTable, matchRow::Vector{Int})::Vector{Int} =
+  Int[matchRow[r] for r in block if el.class[r] > 0]
+_blockIterates(::Vector{Int}, torn::TornBlock, ::InstanceTable, ::Vector{Int})::Vector{Int} = torn.tears
+
+"""
     _initialSystem(g, el, matchRow, batches, producer, loops, large, torn, solutions, initial) -> InitialSystem
 
 The initial system with the algebraic loops the initial equations reach (`InitialSystem`): those loop blocks (a large
-block by its iteration variables and residuals, `TornBlock`) and the instances solved alone, in schedule order; each
-row's reads in the solve's unknowns, an unknown solved explicitly read through what its row reads (a large block's
-non-iteration unknowns through all the block reads). Empty for a model without initial equations.
+block by its iteration variables and residuals, `TornBlock`; a family member by its equations, `_blockIterates`) and
+the instances solved alone, in schedule order; each row's reads in the solve's unknowns, an unknown solved explicitly
+read through what its row reads (a large block's non-iteration unknowns, a family member's algorithm's outputs,
+through all the block reads). Empty for a model without initial equations.
 """
 function _initialSystem(g::Gen, el::InstanceTable, matchRow::Vector{Int},
                         batches::Vector{Tuple{Tuple{Int, Int}, Vector{Int}}}, producer::Vector{Int}, loops::LoopBlocks,
@@ -600,11 +612,11 @@ function _initialSystem(g::Gen, el::InstanceTable, matchRow::Vector{Int},
         reached[loops.blocks[b][1]] || continue
         blockBase[b] = nLoop
         local t::Union{Nothing, TornBlock} = torn[b]
-        local ids::Vector{Int} = large[b] ? t.tears : Int[matchRow[r] for r in loops.blocks[b]]
-        for u::Int in ids
+        for u::Int in _blockIterates(loops.blocks[b], t, el, matchRow)
           loopCol[u] = nz + (nLoop += 1)
         end
-        append!(residualRows, large[b] ? Int[loops.blocks[b][k] for k in t.residuals] : loops.blocks[b])
+        append!(residualRows, t === nothing ? Int[r for r in loops.blocks[b] if el.class[r] > 0] :
+                                              Int[loops.blocks[b][k] for k in t.residuals])
       end
     elseif ci > 0
       for r::Int in batch
@@ -646,9 +658,10 @@ function _initialSystem(g::Gen, el::InstanceTable, matchRow::Vector{Int},
       for b::Int in batch
         local rs::Vector{Int} = loops.blocks[b]
         reached[rs[1]] || continue
-        if large[b]
-          #= the iteration variables, and what the block reads from outside =#
-          local s::Set{Int} = Set{Int}(loopCol[u] for u in torn[b].tears)
+        if large[b] || any(r::Int -> el.class[r] < 0, rs)
+          #= the iteration variables, and what the block reads from outside (a family's algorithm: its outputs from
+             the iterates) =#
+          local s::Set{Int} = Set{Int}(loopCol[u] for u in _blockIterates(rs, torn[b], el, matchRow))
           for r::Int in rs
             own!(s, r)
             readsOf!(s, el.uid[el.uptr[r]:(el.uptr[r + 1] - 1)], (q::Int) -> loops.blockOf[q] == b)
