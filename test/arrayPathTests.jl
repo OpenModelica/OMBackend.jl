@@ -1233,9 +1233,57 @@ end DivideInLoop;
     local sol = OMBackend.simulate(name; tspan = (0.0, 1.0), saveat = 0.0:0.002:1.0, reltol = 1e-6)
     @test sol.retcode == ReturnCode.Success
     local values::Vector{Vector{Float64}} = [OMBackend.variableValues(sol, n) for n in ["x0", "x1", "x2", "x3", "x4", "x5"]]
-    @test all(v::Vector{Float64} -> length(v) == 501 && all(isfinite, v), values)
+    #= NaN from t = 0.714 to 0.962, where no attempt converges (the first attempt's last iterate went there, residuals
+       up to 0.97). omc finds roots there, one branch of cos per output interval (x2 = pi/3 + 2 pi k): not unique =#
+    @test all(v::Vector{Float64} -> length(v) == 501 && findall(isnan, v) == 358:482, values)
     @test isapprox(first.(values), [0.191205944245536, 3.333983265654047, -1.378405714730643, 3.607692715581985,
                                     -2.614683150049451, -2.139793060701474]; atol = 1e-8)
+  end
+
+  @testset "A loop whose real root ends: NaN past it, not a non-solution" begin
+    #= x + y = 1, x*y = time: x = (1 + sqrt(1 - 4 time))/2 while time <= 1/4, no real root after. Where no attempt
+       converged, the first attempt's last iterate went into the outputs (24 of the 25 points from t = 0.26: |x*y -
+       time| up to 0.18) and, with a state reading y, into the derivatives: a run to t = 0.5 with retcode Success.
+       omc stops at t = 0.25 =#
+    local program = Modelica"""
+      model NoRealRoot
+        Real x(start = 1);
+        Real y(start = 0);
+      equation
+        x + y = 1;
+        x * y = time;
+      end NoRealRoot;
+      """
+    local name::String = _translateProgram(program, "NoRealRoot"; scalarized = false)
+    @test _arrayPathTaken(name)
+    local sol = OMBackend.simulate(name; tspan = (0.0, 0.5), saveat = 0.0:0.01:0.5)
+    @test sol.retcode == ReturnCode.Success && length(sol.prob.p.loops) == 1
+    local t::Vector{Float64} = sol.t
+    local x::Vector{Float64} = OMBackend.variableValues(sol, "x")
+    local y::Vector{Float64} = OMBackend.variableValues(sol, "y")
+    local before::Vector{Int} = findall(<=(0.24), t)
+    local after::Vector{Int} = findall(>=(0.26), t)
+    @test length(before) == 25 && length(after) == 25
+    @test isapprox(x[before], (1 .+ sqrt.(1 .- 4 .* t[before])) ./ 2; atol = 1e-12)
+    @test all(i::Int -> isnan(x[i]) && isnan(y[i]), after)
+    #= with a state that reads y: the solver's steps past t = 1/4 rejected until the run ends there (Unstable), not a
+       Success to t = 0.5; s = the integral of (1 - sqrt(1 - 4t))/2 to 1/4 = 1/24 =#
+    local withState = Modelica"""
+      model NoRealRootState
+        Real x(start = 1);
+        Real y(start = 0);
+        Real s(start = 0, fixed = true);
+      equation
+        x + y = 1;
+        x * y = time;
+        der(s) = y;
+      end NoRealRootState;
+      """
+    local stateName::String = _translateProgram(withState, "NoRealRootState"; scalarized = false)
+    local stateSol = OMBackend.simulate(stateName; tspan = (0.0, 0.5))
+    @test stateSol.retcode != ReturnCode.Success
+    @test 0.24 < stateSol.t[end] < 0.26
+    @test isapprox(OMBackend.variableValues(stateSol, "s")[end], 1 / 24; rtol = 1e-3)
   end
 
   @testset "Rolled components of opposite orientation: their hidden linear constraint in place of a for-equation's element" begin
