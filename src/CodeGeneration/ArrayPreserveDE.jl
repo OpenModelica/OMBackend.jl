@@ -503,8 +503,9 @@ families, `LOOPRES!`, a branch per family: this solve is compiled once per model
 18 families: 75 ms each), the unknowns of member `m` at `ids[:, m]` (a state derivative in du up to `nS`, an
 algebraic variable in a after), the Jacobian by forward differences; the last solution kept as the next guess in
 `p.loops[f]` (in Float64 solves); residuals or a Jacobian not finite, or a singular Jacobian, make the unknowns NaN
-(the solver rejects the step); a solve that does not converge is made again with damped steps, from the last solution
-and then from the start values `start`. Relations in the loop (`relations`) hold their values in Newton's iterations
+(the solver rejects the step); a solve that does not converge is made again with damped steps, from the last solution,
+from the start values `start` and from those varied by 0.1 of their size. A least-squares step (a singular Jacobian)
+converges only at residuals zero to round-off (`_consistentResiduals`). Relations in the loop (`relations`) hold their values in Newton's iterations
 (MLS 8.5: a relation changes at events only; no crossing written, no relation changed); the residuals once more at the
 solution write the crossings and, at an event, the relations, whose change the event iteration sweeps again
 (`_settle!`; a combination of relations `_searchRelations!` tries is solved with, not replaced by the relations at the
@@ -581,15 +582,18 @@ function loopFamilySolve!(residual!::R, f::Int, ids::Matrix{Int}, start::Matrix{
       end
     end
     #= from the last solution; where that does not converge, again with the step damped (halved until the residuals
-       decrease), then so from the start values. A piecewise equation's Newton step from a solution on another piece
-       can cycle between two points that are no solutions (MSL IdealizedOpAmpLimited: from the saturated output,
-       reached in an event's sweep, back to the linear range; the last iterate went into the equations as the
-       solution), an exponential's can overflow (a Zener diode's) =#
-    for attempt::Int in 1:3
+       decrease), then so from the start values, then from the start values varied by 0.1 of their size. A piecewise
+       equation's Newton step from a solution on another piece can cycle between two points that are no solutions
+       (MSL IdealizedOpAmpLimited: from the saturated output, reached in an event's sweep, back to the linear range;
+       the last iterate went into the equations as the solution), an exponential's can overflow (a Zener diode's).
+       Start values at which the residuals are stationary in an unknown leave no step (omc's testsuite Tearing9,
+       x1*x1 - x3 + 2 = 0 from x1 = 0: the Jacobian [0], the least-norm step zero); varied as OpenModelica varies
+       them (nonlinearSolverHybrd.c: x += 0.1 nominal; `blockSolve!` for a block), the positive root =#
+    for attempt::Int in 1:4
       converged && break
       for j::Int in 1:k
         attempt == 2 && (xs[j] = x[j])
-        x[j] = attempt == 3 ? start[j, m] : G[j, m]
+        x[j] = attempt <= 2 ? G[j, m] : attempt == 3 ? start[j, m] : start[j, m] + 0.1 * max(1.0, abs(start[j, m]))
       end
       for _ in 1:50
         _setLoopUnknowns!(du, a, x, ids, m, nS)
@@ -612,12 +616,14 @@ function loopFamilySolve!(residual!::R, f::Int, ids::Matrix{Int}, start::Matrix{
           fill!(x, NaN)
           break
         end
+        local leastSquares::Bool = false
         if _luFactor!(copyto!(F, J), w.pivots)
           _luSolve!(dx, F, w.pivots, r)
         elseif attempt > 1 && T === Float64
           #= singular where two unknowns whose product the equations take are both zero (`v = R_actual * i` at the
              starts, MSL's resistor with a heat port): the least-squares step of the smallest norm =#
           copyto!(dx, _LINALG.pinv(J; rtol = RANK_TOLERANCE) * r)
+          leastSquares = true
         else
           fill!(x, NaN)
           break
@@ -641,18 +647,21 @@ function loopFamilySolve!(residual!::R, f::Int, ids::Matrix{Int}, start::Matrix{
             x[j] = r2[j]
           end
         end
-        #= converged by the whole step of Newton's method, damped or not =#
+        #= converged by the whole step of Newton's method, damped or not; a least-squares step's iterate only at
+           residuals zero to round-off (there, after the damping, `r`): its step also vanishes where the residuals
+           are only stationary, and that point went into the equations as the solution (Tearing9: x1 = 0, the
+           residual -1, the run a Success) =#
         local step::T = zero(T)
         for j::Int in 1:k
           x[j] -= scale * dx[j]
           step = max(step, abs(dx[j]) / (1.0 + abs(x[j])))
         end
-        converged = step <= 1.0e-8
+        converged = step <= 1.0e-8 && (!leastSquares || _consistentResiduals(r, J, x))
         step <= 1.0e-12 && break
       end
       converged && break
       #= no attempt converged: the first one's last iterate (NaN where it was not finite: the step is rejected) =#
-      if attempt == 3
+      if attempt == 4
         for j::Int in 1:k
           x[j] = xs[j]
         end

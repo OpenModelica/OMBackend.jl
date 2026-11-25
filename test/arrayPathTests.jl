@@ -1101,6 +1101,40 @@ end DivideInLoop;
     @test isapprox(varied.x, [5.0, 0.0]; atol = 1e-8)
   end
 
+  @testset "A small loop stationary at its start values: varied as OpenModelica, no least-squares non-solution" begin
+    #= omc's testsuite tearing/Tearing9: x1 alone from x1*x1 - x3 + 2 = 0 (a loop family of one unknown), x1 without
+       a start value. At x1 = 0 the Jacobian is [0]; the least-norm step was zero and counted as converged: x1 = 0,
+       the residual -1, the run a Success. From the start values varied by 0.1 (OpenModelica: x += 0.1 nominal) the
+       positive root, omc's values (1, 2, 3, 4, 5) =#
+    local program = Modelica"""
+      model Tearing9
+        Real x1;
+        Real x2(start = 0);
+        Real x3;
+        Real x4;
+        Real x5(start = 0);
+        parameter Real X = 2;
+        parameter Real Y = 6;
+      equation
+        x1 + x4 - 5 = 0;
+        X * x3 - Y = 0;
+        x2 - 2 * x4 + x5 + 1 = 0;
+        x1 * x1 - x3 + 2 = 0;
+        x1 - x2 * x2 + x5 - 2 = 0;
+      end Tearing9;
+      """
+    local name::String = _translateProgram(program, "Tearing9"; scalarized = false)
+    @test _arrayPathTaken(name)
+    local sol = OMBackend.simulate(name; tspan = (0.0, 1.0))
+    @test sol.retcode == ReturnCode.Success
+    @test length(sol.prob.p.loops) == 2
+    @test isapprox(_values(sol, ["x1", "x2", "x3", "x4", "x5"]), [1.0, 2.0, 3.0, 4.0, 5.0]; atol = 1e-8)
+    #= the criterion of a least-squares iterate: a row without a derivative has to be zero =#
+    local generation::Module = OMBackend.CodeGeneration.ArrayPreserveDE
+    @test !generation._consistentResiduals([-1.0], zeros(1, 1), [0.0])
+    @test generation._consistentResiduals([1.0e-12, 0.0], [2.0 0.0; 0.0 0.0], [1.0, 0.0])
+  end
+
   @testset "A large loop through a limiter of high gain: differences over the unknowns' own size" begin
     #= a current of 1.6 mA into a limiter of gain 1e9 (an op-amp's V0 times a resistance), its solution 0.1 below
        the limit of 10: the standard difference's step, sqrt(eps) of at least 1, moves the limiter's input by 15 and

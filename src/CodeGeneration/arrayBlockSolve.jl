@@ -268,17 +268,37 @@ end
 """
     _consistentIterate(s) -> Bool
 
-Whether the residuals `s.r` at the iterate `s.x` are zero to round-off: each within 1e-8 of what the row's terms move
-by over the unknowns' size (its Jacobian row's entries times the unknowns, at least 1); a row without a derivative has
-to be zero.
+Whether the residuals `s.r` at the iterate `s.x` of the block's Jacobian `s.J` are zero to round-off
+(`_consistentResiduals`).
 """
-function _consistentIterate(s::BlockSolver)::Bool
-  local J::_SPARSE.SparseMatrixCSC{Float64, Int} = s.J
-  local scale::Vector{Float64} = zeros(length(s.r))
+_consistentIterate(s::BlockSolver)::Bool = _consistentResiduals(s.r, s.J, s.x)
+
+"""
+    _consistentResiduals(r, J, x) -> Bool
+
+Whether the residuals `r` at the iterate `x` are zero to round-off: each within 1e-8 of what the row's terms move by
+over the unknowns' size (its Jacobian row's entries times the unknowns, at least 1); a row without a derivative has to
+be zero. The test of an iterate of least-norm steps (a singular Jacobian), whose step goes to zero where the residuals
+are only stationary: `blockSolve!`'s (`_consistentIterate`) and `loopFamilySolve!`'s.
+"""
+function _consistentResiduals(r::Vector{Float64}, J::_SPARSE.SparseMatrixCSC{Float64, Int}, x::Vector{Float64})::Bool
+  local scale::Vector{Float64} = zeros(length(r))
   for j in axes(J, 2), k in _SPARSE.nzrange(J, j)
-    scale[J.rowval[k]] += abs(J.nzval[k]) * max(1.0, abs(s.x[j]))
+    scale[J.rowval[k]] += abs(J.nzval[k]) * max(1.0, abs(x[j]))
   end
-  return all(i::Int -> isfinite(s.r[i]) && abs(s.r[i]) <= 1.0e-8 * scale[i], eachindex(s.r))
+  return all(i::Int -> isfinite(r[i]) && abs(r[i]) <= 1.0e-8 * scale[i], eachindex(r))
+end
+
+"`_consistentResiduals` of a dense Jacobian (a loop family's, `loopFamilySolve!`)."
+function _consistentResiduals(r::Vector{Float64}, J::Matrix{Float64}, x::Vector{Float64})::Bool
+  for i in eachindex(r)
+    local scale::Float64 = 0.0
+    for j in axes(J, 2)
+      scale += abs(J[i, j]) * max(1.0, abs(x[j]))
+    end
+    (isfinite(r[i]) && abs(r[i]) <= 1.0e-8 * scale) || return false
+  end
+  return true
 end
 
 """
