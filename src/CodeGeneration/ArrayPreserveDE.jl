@@ -495,6 +495,32 @@ in `du` up to `nS`, an algebraic variable in `a` after.
 end
 
 """
+    _loopResidual!(residual!, guarded, f, r, du, a, u, p, t, z, mode, fire, m) -> Nothing
+
+The residuals of the loop family `f`'s member `m` into `r` (`loopFamilySolve!`). `guarded` (the attempts after the
+first): an error of the equations at the point (a domain error, `log` of a negative number; a function's assert:
+`_RHS_STEP_ERRORS`) makes the residuals NaN, so the point is rejected as one where they are not finite: a damped
+step shortened, an attempt failed. OpenModelica rejects such trial points too (omc's testsuite Tearing19, run with
+`-lv=-LOG_ASSERT`: `log(x0 + ... + x5 + time^2)`, from the varied start values a damped step's sum below zero). The
+first attempt, in every right-hand side, has no handler.
+"""
+function _loopResidual!(residual!::R, guarded::Bool, f::Int, r::AbstractVector, du::AbstractVector, a::AbstractVector,
+                        u::AbstractVector, p::ArrayModelParameters, t::Real, z::CrossingOut, mode::Bool, fire::Bool,
+                        m::Int)::Nothing where {R <: Function}
+  if !guarded
+    residual!(f, r, du, a, u, p, t, z, mode, fire, m)
+    return nothing
+  end
+  try
+    residual!(f, r, du, a, u, p, t, z, mode, fire, m)
+  catch err
+    err isa _OMBACKEND.CodeGeneration._RHS_STEP_ERRORS || rethrow()
+    fill!(r, NaN)
+  end
+  return nothing
+end
+
+"""
     loopFamilySolve!(residual!, f, ids, start, initial, nS, linear, relations, du, a, u, p, t, z, mode, fire, members)
 
 The solve of the loop family `f` for its members `members` (`_loopFamilyCode`), each by Newton's method on the
@@ -597,13 +623,13 @@ function loopFamilySolve!(residual!::R, f::Int, ids::Matrix{Int}, start::Matrix{
       end
       for _ in 1:50
         _setLoopUnknowns!(du, a, x, ids, m, nS)
-        residual!(f, r, du, a, u, p, t, zHeld, modeHeld, fire, m)
+        _loopResidual!(residual!, attempt > 1, f, r, du, a, u, p, t, zHeld, modeHeld, fire, m)
         for j::Int in 1:k
           local xj::T = x[j]
           local h::T = 1.4901161193847656e-8 * max(one(xj), abs(xj))
           x[j] = xj + h
           _setLoopUnknowns!(du, a, x, ids, m, nS)
-          residual!(f, r2, du, a, u, p, t, zHeld, modeHeld, fire, m)
+          _loopResidual!(residual!, attempt > 1, f, r2, du, a, u, p, t, zHeld, modeHeld, fire, m)
           for i::Int in 1:k
             J[i, j] = (r2[i] - r[i]) / h
           end
@@ -639,7 +665,7 @@ function loopFamilySolve!(residual!::R, f::Int, ids::Matrix{Int}, start::Matrix{
               x[j] = r2[j] - scale * dx[j]
             end
             _setLoopUnknowns!(du, a, x, ids, m, nS)
-            residual!(f, r, du, a, u, p, t, zHeld, modeHeld, fire, m)
+            _loopResidual!(residual!, true, f, r, du, a, u, p, t, zHeld, modeHeld, fire, m)
             (sum(abs2, r) <= norm || scale < 1.0e-3) && break
             scale *= 0.5
           end

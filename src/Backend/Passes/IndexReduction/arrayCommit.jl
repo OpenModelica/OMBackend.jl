@@ -1038,27 +1038,50 @@ function initialDummyDerivatives(eq::IR.Equation, variables::IR.VariableSet)::IR
 end
 
 """
-    exposeArrayLinearConstraints!(model, view) -> Bool
+    exposeArrayLinearConstraints!(model, view; cache) -> Bool
 
 `exposeLinearConstraints!` for an arrays-kept model: the hidden linear constraints of its element view `view`
-(`linearConstraints`) written into `model`, each in place of the equation it combines, where that one is a scalar
-equation of `model` (the constraint's elements as references into their arrays: `arrayEquation`). Whether one was
-written. A star point of a polyphase winding that is not grounded: its current balance and a zero-sequence inductor's
-`i0 = sum(i) / m` give `i0 = 0`; as written, of index 1 with i0 a state, the algebraic loop of the winding's voltages
-was singular (MSL FundamentalWave's polyphase machines: "the initialization cannot hold"). A constraint in place of
-an element of a for- or array equation is left: one element of an array equation cannot be replaced in array form.
+(`linearConstraints`) written into `model`, each in place of the equation it combines (the constraint's elements as
+references into their arrays: `arrayEquation`). Whether `model` changed. A star point of a polyphase winding that is
+not grounded: its current balance and a zero-sequence inductor's `i0 = sum(i) / m` give `i0 = 0`; as written, of
+index 1 with i0 a state, the algebraic loop of the winding's voltages was singular (MSL FundamentalWave's polyphase
+machines: "the initialization cannot hold"). One element of a for- or array equation cannot be replaced in array
+form: where a constraint combines one, that equation is unrolled first (its elements scalar equations of `model`, the
+arrays kept: `splitEquations`) and the constraints found again. Left out, the plan took the constrained elements as
+states and the loop of their derivatives was singular and inconsistent (omc's testsuite resolveLoops Circuit1x: two
+capacitors in parallel, of opposite orientation, rolled into one array; `Cgd.v + Cds.v = 0` in place of an element
+of `v[i] = p.v[i] - n.v[i]`; the run a Success at v = -3.7e16, its loop's least-squares step accepted).
 """
-function exposeArrayLinearConstraints!(model::IR.Model, view::Scalarized)::Bool
+function exposeArrayLinearConstraints!(model::IR.Model, view::Scalarized; cache::ScalarCache)::Bool
   envSwitch("OMBACKEND_LINEAR_CONSTRAINTS") || return false
-  local equations::Vector{IR.Equation} = model.continuous[1].equations
-  local written::Bool = false
-  for (i::Int, constraint::IR.SCALAR_EQUATION) in linearConstraints(view.model, view.model.continuous[1])
-    local origin::EquationOrigin = view.origins[i]
-    (isempty(origin.path) && isempty(origin.element) && equations[origin.equation] isa IR.SCALAR_EQUATION) || continue
-    equations[origin.equation] = arrayEquation(constraint, view.elements, model.variables)
-    written = true
+  local partition::IR.Partition = model.continuous[1]
+  local constraints::Vector{Tuple{Int, IR.SCALAR_EQUATION}} = linearConstraints(view.model, view.model.continuous[1])
+  local changed::Bool = false
+  #= each round unrolls at least one equation: as many rounds as the partition has equations at most =#
+  for _ in 1:length(partition.equations)
+    local unroll::Set{Int} = Set{Int}()
+    for (i::Int, _) in constraints
+      local origin::EquationOrigin = view.origins[i]
+      (isempty(origin.path) && isempty(origin.element) && partition.equations[origin.equation] isa IR.SCALAR_EQUATION) ||
+        push!(unroll, origin.equation)
+    end
+    isempty(unroll) && break
+    local unrolled::Vector{IR.Equation} = splitEquations(partition.equations, view.elements, Set{Symbol}(), unroll,
+                                                         model.variables)
+    empty!(partition.equations)
+    append!(partition.equations, unrolled)
+    changed = true
+    view = scalarizeArrays(model; cache)
+    constraints = linearConstraints(view.model, view.model.continuous[1])
   end
-  return written
+  for (i::Int, constraint::IR.SCALAR_EQUATION) in constraints
+    local origin::EquationOrigin = view.origins[i]
+    (isempty(origin.path) && isempty(origin.element) && partition.equations[origin.equation] isa IR.SCALAR_EQUATION) ||
+      continue
+    partition.equations[origin.equation] = arrayEquation(constraint, view.elements, model.variables)
+    changed = true
+  end
+  return changed
 end
 
 "The elements of the continuous arrays of `model` that the element view `view` lists."
@@ -1092,7 +1115,7 @@ function reduceIndexArrays!(model::IR.Model; arrays::Bool = true)::Bool
   local view::Scalarized = scalarizeArrays(model; cache)
   #= the equations as the plan's structure reads them (the terms of parameters known as zero) =#
   dropKnownZeroTerms!(model, view) && (view = scalarizeArrays(model; cache))
-  exposeArrayLinearConstraints!(model, view) && (view = scalarizeArrays(model; cache))
+  exposeArrayLinearConstraints!(model, view; cache) && (view = scalarizeArrays(model; cache))
   local partition::IR.Partition = view.model.continuous[1]
   #= the arrays of aliases read through representatives (`arrayAliasPlan`) where the plan differentiates anything
      (`differentiates`): MSL EngineV6 differentiates 4974 element rows instead of 7132, translated and first simulated

@@ -1135,6 +1135,110 @@ end DivideInLoop;
     @test generation._consistentResiduals([1.0e-12, 0.0], [2.0 0.0; 0.0 0.0], [1.0, 0.0])
   end
 
+  @testset "A small loop whose varied start values meet a domain error: the trial point rejected, not thrown" begin
+    #= omc's testsuite tearing/Tearing19 (run with -lv=-LOG_ASSERT): past t = 0.713 no attempt reaches a root; from
+       the start values varied by 0.1 a damped step's trial point gave log() a negative argument, and the DomainError
+       went out of the outputs' evaluation (`variableValues`) on a grid of 500 intervals. Such a point counts as one
+       where the residuals are not finite (`_loopResidual!`), as OpenModelica rejects it. omc's values at t = 0 =#
+    local program = Modelica"""
+      model Tearing19
+        Real x0(start = 0.2);
+        Real x1(start = 3.0);
+        Real x2(start = -1.5);
+        Real x3(start = 3.6);
+        Real x4(start = -2.5);
+        Real x5(start = -2.1);
+      equation
+        -min(abs(x0), 1/2) = sin(x1);
+        min(abs(x0), 1/2) = cos(x2);
+        x1^2 + x2^2 = x3^2;
+        x0^3 + x4 + x3 = 1.0;
+        x5^5 + x4^4 + x0*x1*x2 = 1;
+        0.0 = log(x0 + x1 + x2 + x3 + x4 + x5 + time^2);
+      end Tearing19;
+      """
+    local name::String = _translateProgram(program, "Tearing19"; scalarized = false)
+    @test _arrayPathTaken(name)
+    local sol = OMBackend.simulate(name; tspan = (0.0, 1.0), saveat = 0.0:0.002:1.0, reltol = 1e-6)
+    @test sol.retcode == ReturnCode.Success
+    local values::Vector{Vector{Float64}} = [OMBackend.variableValues(sol, n) for n in ["x0", "x1", "x2", "x3", "x4", "x5"]]
+    @test all(v::Vector{Float64} -> length(v) == 501 && all(isfinite, v), values)
+    @test isapprox(first.(values), [0.191205944245536, 3.333983265654047, -1.378405714730643, 3.607692715581985,
+                                    -2.614683150049451, -2.139793060701474]; atol = 1e-8)
+  end
+
+  @testset "Rolled components of opposite orientation: their hidden linear constraint in place of a for-equation's element" begin
+    #= omc's testsuite resolveLoops/Circuit1x: two capacitors in parallel, one turned (Cgd.p at Cds.n), rolled into
+       one array. Its constraint Cgd.v + Cds.v = 0 combines an element of the rolled `v[i] = p.v[i] - n.v[i]`; it was
+       left out, both elements states, the loop of their currents singular and inconsistent: a least-squares step
+       accepted, v = -3.7e16 at t = 10 with retcode Success. The for-equation unrolled, the constraint in its
+       element's place: one state, v = 2 (1 - exp(-t / 4)) (2 F through 2 Ohm from 2 V) =#
+    local program = Modelica"""
+      model ParallelCapacitors
+        connector Pin
+          Real v;
+          flow Real i;
+        end Pin;
+        model Capacitor
+          parameter Real C = 1;
+          Pin p;
+          Pin n;
+          Real v(start = 0);
+          Real i;
+        equation
+          v = p.v - n.v;
+          0 = p.i + n.i;
+          i = p.i;
+          i = C * der(v);
+        end Capacitor;
+        model Resistor
+          parameter Real R = 1;
+          Pin p;
+          Pin n;
+          Real v;
+          Real i;
+        equation
+          v = p.v - n.v;
+          0 = p.i + n.i;
+          i = p.i;
+          v = R * i;
+        end Resistor;
+        model Ground
+          Pin p;
+        equation
+          p.v = 0;
+        end Ground;
+        model ConstantVoltage
+          parameter Real V = 2;
+          Pin p;
+          Pin n;
+        equation
+          V = p.v - n.v;
+          0 = p.i + n.i;
+        end ConstantVoltage;
+        Capacitor Cgd;
+        Capacitor Cds;
+        Resistor RLoad;
+        Resistor RSource;
+        ConstantVoltage source;
+        Ground ground;
+      equation
+        connect(RLoad.n, ground.p);
+        connect(Cds.n, RLoad.p);
+        connect(Cgd.n, Cds.p);
+        connect(RSource.p, Cds.p);
+        connect(ground.p, source.n);
+        connect(source.p, RSource.n);
+        connect(Cgd.p, Cds.n);
+      end ParallelCapacitors;
+      """
+    local (sv::Vector{Float64}, av::Vector{Float64}, _) =
+      _bothWaysOf(program, "ParallelCapacitors", ["Cds.v", "Cgd.v"]; tspan = (0.0, 10.0), reltol = 1e-8, abstol = 1e-8)
+    local v10::Float64 = 2.0 * (1.0 - exp(-2.5))
+    @test isapprox(av, [v10, -v10]; rtol = 1e-6)
+    @test maximum(abs.(sv .- av)) < 1e-6
+  end
+
   @testset "A large loop through a limiter of high gain: differences over the unknowns' own size" begin
     #= a current of 1.6 mA into a limiter of gain 1e9 (an op-amp's V0 times a resistance), its solution 0.1 below
        the limit of 10: the standard difference's step, sqrt(eps) of at least 1, moves the limiter's input by 15 and
