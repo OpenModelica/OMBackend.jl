@@ -1131,8 +1131,55 @@ end DivideInLoop;
     @test isapprox(_values(sol, ["x1", "x2", "x3", "x4", "x5"]), [1.0, 2.0, 3.0, 4.0, 5.0]; atol = 1e-8)
     #= the criterion of a least-squares iterate: a row without a derivative has to be zero =#
     local generation::Module = OMBackend.CodeGeneration.ArrayPreserveDE
-    @test !generation._consistentResiduals([-1.0], zeros(1, 1), [0.0])
-    @test generation._consistentResiduals([1.0e-12, 0.0], [2.0 0.0; 0.0 0.0], [1.0, 0.0])
+    @test !generation._consistentResiduals([-1.0], zeros(1, 1), [0.0], [1.0])
+    @test generation._consistentResiduals([1.0e-12, 0.0], [2.0 0.0; 0.0 0.0], [1.0, 0.0], [1.0, 1.0])
+    #= the unknowns' size at least their nominal value =#
+    @test !generation._consistentResiduals([1.0e-7], ones(1, 1), [1.0], [1.0])
+    @test generation._consistentResiduals([1.0e-7], ones(1, 1), [1.0], [1.0e2])
+  end
+
+  @testset "A loop of unknowns of a large nominal value: differences and steps scaled by it" begin
+    #= omc's testsuite daemode/testDAEModeNominal: x^2 + y^2 = 2 VBase^2 and x - y = time from x = y = 1, nominal
+       VBase = 230940. A difference step of 1.5e-8 at x = 1 lost the residual's change at 1e11: the Jacobian singular,
+       the least-squares step zero (refused since a non-solution is no solution), the run DtNaN. Scaled by the nominal
+       values (as omc's max(|x|, nominal)) the positive root, x(t) = t/2 + sqrt(VBase^2 - t^2/4) =#
+    local program = Modelica"""
+      model DAEModeNominal
+        parameter Real UNom = 400e3;
+        final parameter Real VBase = UNom/sqrt(3);
+        Real x(start = 1, nominal = VBase);
+        Real y(start = 1, nominal = VBase);
+        Real z(start = 1, nominal = VBase);
+      equation
+        x^2 + y^2 = 2*VBase^2;
+        x - y = time;
+        der(z) = x - z;
+      end DAEModeNominal;
+      """
+    local name::String = _translateProgram(program, "DAEModeNominal"; scalarized = false)
+    @test _arrayPathTaken(name)
+    local sol = OMBackend.simulate(name; tspan = (0.0, 0.1))
+    @test sol.retcode == ReturnCode.Success
+    local vBase::Float64 = 400e3 / sqrt(3)
+    local exact(t::Float64)::Float64 = t / 2 + sqrt(vBase^2 - t^2 / 4)
+    @test isapprox(OMBackend.variableValues(sol, "x")[1], vBase; rtol = 1e-10)
+    @test isapprox(_values(sol, ["x", "y"]), [exact(0.1), exact(0.1) - 0.1]; rtol = 1e-10)
+    #= the same equations as a block (`blockSolve!`): with the nominal values its root at 52 Jacobians without them
+       (4e-11 off), exact at 23 =#
+    local AG::Module = OMBackend.CodeGeneration.ArrayPreserveDE
+    local SA::Module = OMBackend.CodeGeneration.Symbolics.SparseArrays
+    local S::SA.SparseMatrixCSC{Float64, Int} = SA.sparse(ones(2, 2))
+    local residual!(r, y, du, a, u, p, t, z, mode, fire) =
+      (a .= y; r[1] = y[1]^2 + y[2]^2 - 2 * vBase^2; r[2] = y[1] - y[2]; nothing)
+    local solved::Vector{Tuple{Vector{Float64}, Int}} = Tuple{Vector{Float64}, Int}[]
+    for nominal in ([1.0, 1.0], [vBase, vBase])
+      local s::AG.BlockSolver = AG.BlockSolver(S, AG.columnColors(S), [1.0, 1.0]; nominal)
+      local (du::Vector{Float64}, a::Vector{Float64}) = (zeros(2), zeros(2))
+      AG.blockSolve!(s, residual!, du, a, Float64[], nothing, 0.0, AG.NO_CROSSINGS, false, false)
+      push!(solved, (a, s.jacobians))
+    end
+    @test isapprox(solved[2][1], [vBase, vBase]; rtol = 1e-14)
+    @test solved[2][2] < solved[1][2]
   end
 
   @testset "A small loop whose varied start values meet a domain error: the trial point rejected, not thrown" begin

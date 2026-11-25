@@ -2440,11 +2440,12 @@ function _attributeValues(a::Union{Nothing, SC.Exp}, n::Int, default::Any, what:
 end
 
 """
-    DomainSystem(g, u0, d0, a0, fixedMask, stateNames, algebraicNames, discreteNames, keepsArrays, startRules,
+    DomainSystem(g, u0, d0, a0, aNominal, fixedMask, stateNames, algebraicNames, discreteNames, keepsArrays, startRules,
                  startFixed, placeholderStarts)
 
 The domain level of the simulation code of a model with its arrays kept (`domainSystem`): its variables and classes
-(`g`), the initial values of the states, discrete and algebraic variables (row-major), the states' fixed attributes,
+(`g`), the initial values of the states, discrete and algebraic variables (row-major), the algebraic variables' nominal
+values (1 for none: the loop solves' scale, `SimCode._nominalValue`), the states' fixed attributes,
 the element names of each buffer, whether it keeps arrays an algebraic loop may go through (its own, or rolled
 components of a reduced model). `startRules`: the starts of states (`:u`) and discrete variables (`:d`) that read a
 parameter, by their index in the buffer, as expressions the array code computes again from overridden parameters;
@@ -2457,6 +2458,7 @@ struct DomainSystem
   u0::Vector{Float64}
   d0::Vector{Float64}
   a0::Vector{Float64}
+  aNominal::Vector{Float64}
   fixedMask::Vector{Bool}
   stateNames::Vector{String}
   algebraicNames::Vector{String}
@@ -2523,6 +2525,7 @@ function domainSystem(sc::SC.SIM_CODE)::DomainSystem
   local stateNamesOrdered::Vector{String} = String[]; local algNamesOrdered::Vector{String} = String[]
   local discreteNamesOrdered::Vector{String} = String[]
   local u0::Vector{Float64} = Float64[]; local d0::Vector{Float64} = Float64[]; local a0::Vector{Float64} = Float64[]
+  local aNominal::Vector{Float64} = Float64[]
   local fixedMask::Vector{Bool} = Bool[]
   local fixedNonStates::Vector{Tuple{String, Vector{Any}, Vector{Any}}} = Tuple{String, Vector{Any}, Vector{Any}}[]
   #= the variables whose starts read a parameter (their buffer, offset), translated once all variables are known =#
@@ -2625,6 +2628,7 @@ function domainSystem(sc::SC.SIM_CODE)::DomainSystem
       g.vars[nm] = VarInfo(:alg, dims, perPart, g.nAlg, :real, SimVariable(sv, elementNames, nothing))
       g.nAlg += n
       append!(a0, algStarts)
+      append!(aNominal, Float64[Float64(x) for x in _attributeValues(sv.attributes.nominal, n, 1.0, "nominal", elementNames[1])])
       append!(algNamesOrdered, elementNames)
     else
       ns("the variable $(nm) of kind $(SC.irKindName(sv))")
@@ -2681,6 +2685,6 @@ function domainSystem(sc::SC.SIM_CODE)::DomainSystem
      components of a model of index 1 are rolled for nothing it keeps (its loops the scalar path's) =#
   local keepsArrays::Bool = sc.indexReduced || any(((_, (_, v)),) -> SC.isOwnArray(v), sc.stringToSimVarHT)
   domainPasses!(g)
-  return DomainSystem(g, u0, d0, a0, fixedMask, stateNamesOrdered, algNamesOrdered, discreteNamesOrdered, keepsArrays,
-                      startRules, sort!(collect(startFixed)), !isempty(placeholders))
+  return DomainSystem(g, u0, d0, a0, aNominal, fixedMask, stateNamesOrdered, algNamesOrdered, discreteNamesOrdered,
+                      keepsArrays, startRules, sort!(collect(startFixed)), !isempty(placeholders))
 end
