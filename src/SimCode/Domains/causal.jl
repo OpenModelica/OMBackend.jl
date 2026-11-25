@@ -533,9 +533,9 @@ end
 The unknowns a loop block's solve iterates: a torn block's iteration variables (`torn`), a family member's equations'
 unknowns (an algorithm's outputs are computed from them, `_loopFamilyCode`).
 """
-_blockIterates(block::Vector{Int}, torn::Nothing, el::InstanceTable, matchRow::Vector{Int})::Vector{Int} =
+_blockIterates(block::Vector{Int}, ::Nothing, el::InstanceTable, matchRow::Vector{Int})::Vector{Int} =
   Int[matchRow[r] for r in block if el.class[r] > 0]
-_blockIterates(block::Vector{Int}, torn::TornBlock, el::InstanceTable, matchRow::Vector{Int})::Vector{Int} = torn.tears
+_blockIterates(::Vector{Int}, torn::TornBlock, ::InstanceTable, ::Vector{Int})::Vector{Int} = torn.tears
 
 """
     _initialSystem(g, el, matchRow, batches, producer, loops, large, torn, solutions, initial) -> InitialSystem
