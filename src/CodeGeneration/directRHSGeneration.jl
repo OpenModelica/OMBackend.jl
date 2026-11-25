@@ -1738,14 +1738,14 @@ function _buildSparseJacobian(rhs_list, states, params, iv, u0, p_vec, t0)
        matrix (MSL Engine1b_analytic's 12 nonzeros: over 50 million Expr
        nodes and 10 GB; as a vector 14,123 nodes). The solver's Jacobian has
        the prototype's structure, so they are its nzval. =#
-    local nzSym = collect(Symbolics.SparseArrays.nonzeros(jacSym))
+    local nzSym::AbstractVector = collect(Symbolics.SparseArrays.nonzeros(jacSym))
     local nzFuncs::Vector{Tuple{UnitRange{Int}, Function}} = _nonzeroFunctions(nzSym, states, params, iv)
-    local jacProto = similar(jacSym, Float64)
+    local jacProto::Symbolics.SparseArrays.SparseMatrixCSC{Float64, Int} = similar(jacSym, Float64)
     jacProto.nzval .= 0.0
-    local nnz0 = length(nzSym)
+    local nnz0::Int = length(nzSym)
     #= The generated code writes by position, without bounds checks. =#
-    local jacFunc = if length(nzFuncs) == 1
-      local nzFunc = nzFuncs[1][2]
+    local jacFunc::Function = if length(nzFuncs) == 1
+      local nzFunc::Function = nzFuncs[1][2]
       (J, u, p, t) -> begin
         local nz = Symbolics.SparseArrays.nonzeros(J)
         length(nz) == nnz0 || throw(DimensionMismatch("Jacobian with $(length(nz)) stored entries, not $(nnz0)"))
@@ -1762,7 +1762,7 @@ function _buildSparseJacobian(rhs_list, states, params, iv, u0, p_vec, t0)
         nothing
       end
     end
-    local probe = copy(jacProto)
+    local probe::Symbolics.SparseArrays.SparseMatrixCSC{Float64, Int} = copy(jacProto)
     jacFunc(probe, u0, p_vec, t0)
     @debug "DirectRHS: symbolic sparse Jacobian with $(length(jacProto.nzval)) structural nonzeros"
     return (jacFunc, jacProto)

@@ -4208,6 +4208,10 @@ end DivideInLoop;
     sol = OMBackend.simulate(name; tspan = (0.0, 1.0), tight...)
     @test isempty(sol.prob.p.blocks) && size(only(sol.prob.p.loops)) == (1, 200)
     @test _values(sol, ["x[1]", "x[100]", "x[200]"]) ≈ [loopValue(k, startValue(k), 1.0) for k in (1.005, 1.5, 2.0)] rtol = 1e-8
+    #= the call's outputs at the solution: they were the last Jacobian's, at x + 1.5e-8 (1 + |x|) (y1 off by 1.8e-8,
+       y2 by 3.0e-8) =#
+    local (xEnd::Float64, y1End::Float64, y2End::Float64) = _values(sol, ["x[200]", "y1[200]", "y2[200]"])
+    @test abs(y1End - (2xEnd^3 + xEnd)) < 1e-13 && abs(y2End - 2xEnd) < 1e-13
     #= a torn block of 20 instances: 10 iteration variables, the calls run from them =#
     name = _translateProgram(loops, "AlgLoop.Coupled"; scalarized = false)
     @test _arrayPathTaken(name)

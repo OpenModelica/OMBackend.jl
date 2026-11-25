@@ -92,4 +92,11 @@ end
       OMBackend.DIRECT_JAC_FUNCTION_NODE_LIMIT[] = limit
     end
   end
+  #= the function and its extractors out of the registries: a later test in the process sees only its own =#
+  delete!(CG.MODELICA_FUNCTION_IMPLS, :omjlPartialWhole)
+  for (i, f) in enumerate(fields)
+    delete!(CG.ELEM_FUNC_CACHE, (:omjlPartialWhole, (i,), 3))
+    delete!(CG.EXTRACTOR_INFO, f)
+    delete!(CG.CALL_RGFS, f)
+  end
 end

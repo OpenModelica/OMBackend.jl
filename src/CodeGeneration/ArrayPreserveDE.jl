@@ -521,7 +521,8 @@ function _loopResidual!(residual!::R, guarded::Bool, f::Int, r::AbstractVector, 
 end
 
 """
-    loopFamilySolve!(residual!, f, ids, start, initial, nS, linear, relations, du, a, u, p, t, z, mode, fire, members)
+    loopFamilySolve!(residual!, f, ids, start, initial, nS, linear, relations, outputs, du, a, u, p, t, z, mode, fire,
+                     members)
 
 The solve of the loop family `f` for its members `members` (`_loopFamilyCode`), each by Newton's method on the
 residuals of its instances, `residual!(f, rv, du, a, u, p, t, z, mode, fire, m)` (the model's one function over its
@@ -536,16 +537,18 @@ converges only at residuals zero to round-off (`_consistentResiduals`). Relation
 solution write the crossings and, at an event, the relations, whose change the event iteration sweeps again
 (`_settle!`; a combination of relations `_searchRelations!` tries is solved with, not replaced by the relations at the
 point a solve starts from). MSL's FluxTubes hysteresis, `\$DER.ifEq_tmp1 = if core.Hstat < -650.0 then ...`; a
-comparator in an op-amp's loop. In the initial solve (`p.pass.on`) a member the initial system holds (`initial`: its
-unknowns' offset there, -1 for none) takes its unknowns from it and gives it its residuals (`InitialPass`).
-A family whose residuals are affine in its unknowns (`linear`, `_affineIn`) is solved by one Jacobian, by differences
+comparator in an op-amp's loop. Algorithms in the loop (`outputs`) assign their outputs in the residuals: these once
+more at the solution leave the outputs at it, not at the last Jacobian's perturbed point (a step of 1.5e-8 relative to
+an unknown: a diode's exp(v/Vt) off by 6e-7, the size of reltol 1e-6). In the initial solve (`p.pass.on`) a member
+the initial system holds (`initial`: its unknowns' offset there, -1 for none) takes its unknowns from it and gives it
+its residuals (`InitialPass`). A family whose residuals are affine in its unknowns (`linear`, `_affineIn`) is solved by one Jacobian, by differences
 over the unknowns' size (exact for an affine residual), and one LU: one step from the last solution and one more at
 the residuals there; Newton's method as above where that fails. The work arrays are the parameters' (`LoopWork`) in a
 Float64 solve.
 """
 function loopFamilySolve!(residual!::R, f::Int, ids::Matrix{Int}, start::Matrix{Float64}, initial::Vector{Int}, nS::Int,
-                          linear::Bool, relations::Bool, du::AbstractVector, a::AbstractVector{T}, u::AbstractVector,
-                          p::ArrayModelParameters, t::Real, z::CrossingOut, mode::Bool, fire::Bool,
+                          linear::Bool, relations::Bool, outputs::Bool, du::AbstractVector, a::AbstractVector{T},
+                          u::AbstractVector, p::ArrayModelParameters, t::Real, z::CrossingOut, mode::Bool, fire::Bool,
                           members::Vector{Int})::Nothing where {R <: Function, T}
   local k::Int = size(ids, 1)
   #= the work arrays: the parameters' on Float64 (no allocation in a right-hand side), else of the number type =#
@@ -694,8 +697,8 @@ function loopFamilySolve!(residual!::R, f::Int, ids::Matrix{Int}, start::Matrix{
       end
     end
     _setLoopUnknowns!(du, a, x, ids, m, nS)
-    #= the relations at the solution: their crossings, at an event their values =#
-    relations && residual!(f, r, du, a, u, p, t, z, mode, fire, m)
+    #= the relations at the solution: their crossings, at an event their values; the algorithms' outputs at it =#
+    (relations || outputs) && residual!(f, r, du, a, u, p, t, z, mode, fire, m)
     #= the solution as the next guess: not a failed solve's NaN, nor the last iterate of a solve that did not converge
        (unknowns that hold no solution, as a state set's selection read with the other side's states: the next solve
        went to another root from there) =#
@@ -1822,8 +1825,9 @@ function _loopFamilyCode(g::Gen, f::Int, template::Vector{Tuple{Int, Int}}, bloc
     println("[arraycode] loop family ", f, ": ", k, " unknowns, ", M, " members, ", linear ? "linear" : "nonlinear",
             " (", join(String[_unknownLabel(g, u) for u in view(ids, :, 1)], ", "), ")",
             join(String["\n[arraycode]   " * first(ci > 0 ? g.classes[ci].text : g.algs[-ci].text, 1200) for (ci, _) in template]))
-  local call::Expr = :($(loopFamilySolve!)(LOOPRES!, $f, $I, $G, $B, $nS, $linear, $hasRelations, du, a, u, p, t, z, mode,
-                                           fire))
+  local hasAlgorithms::Bool = any(((ci, _),) -> ci < 0, template)
+  local call::Expr = :($(loopFamilySolve!)(LOOPRES!, $f, $I, $G, $B, $nS, $linear, $hasRelations, $hasAlgorithms, du, a, u,
+                                           p, t, z, mode, fire))
   return (Any[:(const $C = $cols), :(const $I = $ids), :(const $G = $guess), :(const $B = $bases)], call, residualBody)
 end
 
