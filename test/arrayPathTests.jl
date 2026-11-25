@@ -1180,6 +1180,30 @@ end DivideInLoop;
     end
     @test isapprox(solved[2][1], [vBase, vBase]; rtol = 1e-14)
     @test solved[2][2] < solved[1][2]
+    #= a block of the model's (10 unknowns, above NEWTON_BLOCK_SIZE; torn to 1 iteration variable): the attribute
+       reaches its solver; without it x[1](0) is 4e-11 off (158 Jacobians, 119 with it) =#
+    local block = Modelica"""
+      model NominalBlock
+        parameter Real VBase = 400e3/sqrt(3);
+        Real x[10](each start = 1, each nominal = VBase);
+        Real z(start = 1);
+      equation
+        for i in 1:9 loop
+          x[i + 1] - x[i] = time;
+        end for;
+        sum(x[i]^2 for i in 1:10) = 10*VBase^2;
+        der(z) = x[1] - z;
+      end NominalBlock;
+      """
+    name = _translateProgram(block, "NominalBlock"; scalarized = false)
+    @test _arrayPathTaken(name)
+    sol = OMBackend.simulate(name; tspan = (0.0, 0.1))
+    @test sol.retcode == ReturnCode.Success
+    @test !isempty(only(sol.prob.p.blocks).nominal) && all(==(vBase), only(sol.prob.p.blocks).nominal)
+    #= 10 x1^2 + 90 t x1 + 285 t^2 = 10 VBase^2 =#
+    local x1(t::Float64)::Float64 = (-90t + sqrt(8100t^2 - 40 * (285t^2 - 10vBase^2))) / 20
+    @test isapprox(OMBackend.variableValues(sol, "x[1]")[1], vBase; rtol = 1e-13)
+    @test isapprox(_values(sol, ["x[1]", "x[10]"]), [x1(0.1), x1(0.1) + 0.9]; rtol = 1e-13)
   end
 
   @testset "A small loop whose varied start values meet a domain error: the trial point rejected, not thrown" begin
