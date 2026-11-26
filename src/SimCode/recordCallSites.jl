@@ -110,7 +110,7 @@ mapValues(g::G, s::TERMINATE) where {G} = TERMINATE(g(s.message), s.source)
 mapValues(g::G, s::REINIT) where {G} = REINIT(s.stateVar, g(s.value), s.source, Exp[g(x) for x in s.subscripts])
 mapValues(g::G, s::NORETCALL) where {G} = NORETCALL(g(s.exp), s.source)
 mapValues(g::G, s::RECOMPILATION) where {G} = RECOMPILATION(s.componentToChange, g(s.newValue))
-mapValues(::G, s::Union{RETURN, BREAK, AGENTIC_RECOMPILATION}) where {G} = s
+mapValues(::G, s::Union{RETURN, BREAK, AGENTIC_RECOMPILATION, TRANSITION}) where {G} = s
 
 """
     splitTupleResidual(e)

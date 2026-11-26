@@ -90,6 +90,9 @@ function exportModel(path::String, modelName::String, format::Executable)::Strin
   local name::String = canonicalName(modelName)
   (name in ARRAY_PRESERVE_DE_MODELS && haskey(COMPILED_MODELS_ARRAY_PRESERVE_DE, name)) ||
     error("exportModel: an Executable needs the array code (translate with scalarize = false); $(name) has none")
+  #= a variable structure system's module of modes has no problem of one module (`specializedProblem`) =#
+  _definesFunction(_generatedModule(name), :specializedProblem) ||
+    error("exportModel: an Executable of a variable structure system (structural modes) is not supported")
   #= the directory without a trailing separator (`pkg/`): its parent is where it is staged =#
   local target::String = dirname(joinpath(normpath(abspath(path)), ""))
   (ispath(target) && !(isdir(target) && isempty(readdir(target)))) &&
@@ -156,6 +159,21 @@ function _generatedModule(name::String)::Expr
     COMPILED_MODELS_ARRAY_PRESERVE_DE[name][1] : getCompiledModel(name)
   code.head === :module || error("exportModel: the generated code of $(name) is not a module")
   return code
+end
+
+"Whether the module `m` defines the function `f` at its top level (not in a submodule)."
+function _definesFunction(m::Expr, f::Symbol)::Bool
+  local todo::Vector{Any} = Any[m.args[3]]
+  while !isempty(todo)
+    local s::Any = pop!(todo)
+    s isa Expr || continue
+    if s.head === :block
+      append!(todo, s.args)
+    elseif s.head === :function && s.args[1] isa Expr && (s.args[1]::Expr).head === :call
+      (s.args[1]::Expr).args[1] === f && return true
+    end
+  end
+  return false
 end
 
 """

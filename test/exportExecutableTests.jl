@@ -87,6 +87,16 @@ end
   finally
     OMBackend.forgetModel(name)
   end
+  #= a variable structure system: a module of modes =#
+  name = exportTranslate("ExportVSS", OMFrontend.translateToSCode(EXPORT_VSS_PROGRAM); scalarize = false)
+  try
+    @test name in OMBackend.ARRAY_PRESERVE_DE_MODELS
+    local dir::String = joinpath(mktempdir(), "pkg")
+    @test_throws ErrorException OMBackend.exportModel(dir, name, OMBackend.Executable())
+    @test !ispath(dir)
+  finally
+    OMBackend.forgetModel(name)
+  end
 end
 
 @testset "exportModel: an Executable's directory (a trailing separator, its mode)" begin

@@ -122,17 +122,34 @@ function eventIteration!(u::AbstractVector, p::ArrayModelParameters, t::Real, fi
 end
 
 """
+    _structuralChange!(p, k, value) -> Nothing
+
+OMJL's structural change `k` (the module's STRUCTURAL_CHANGES) reached in a when body, with its new value `value` (a
+recompilation's; 0 for an explicit transition): the run ends after the event (`_terminateReached!`), and the model's
+modes go on from there (`simulateModes`). The first change of the event is the one taken.
+"""
+function _structuralChange!(p::ArrayModelParameters, k::Int, value::Real)::Nothing
+  first(p.state.structural) == 0 && (p.state.structural = (k, Float64(value)))
+  return nothing
+end
+
+"""
     _terminateReached!(integrator) -> Bool
 
-After an event: a terminate() reached (its message, p.state.terminated) ends the run.
+After an event: a structural change reached (`_structuralChange!`) ends the mode's run (Success: the model goes on in
+the next mode), a terminate() reached (its message, p.state.terminated) the run. Whether the run goes on.
 """
 function _terminateReached!(integrator::DiffEqBase.DEIntegrator)::Bool
+  if first(integrator.p.state.structural) != 0
+    DiffEqBase.terminate!(integrator, DiffEqBase.SciMLBase.ReturnCode.Success)
+    return false
+  end
   local message::Union{Nothing, String} = integrator.p.state.terminated
   message === nothing && return true
   integrator.p.state.terminated = nothing
   @info "Modelica terminate() reached" message time = integrator.t
   DiffEqBase.terminate!(integrator)
-  return true
+  return false
 end
 
 """
@@ -141,7 +158,8 @@ end
 The event iteration at an event during the solve: a model that does not settle (relations switching back and forth)
 stops the simulation, as OpenModelica. After an event that changed the equations the next step starts small
 (`_restartStep!`): a relation's crossing changed them; a sample instant did where a relation, a discrete variable or the
-state changed.
+state changed. Whether the run goes on: not after a terminate() or a structural change (`_terminateReached!`), nor where
+the event iteration did not settle.
 """
 function _eventAt!(integrator::DiffEqBase.DEIntegrator, sampleInstant::Bool = false;
                   left::Bool = true)::Bool
@@ -154,7 +172,7 @@ function _eventAt!(integrator::DiffEqBase.DEIntegrator, sampleInstant::Bool = fa
   if eventIteration!(integrator.u, p, integrator.t, true, sampleInstant; left)
     (!sampleInstant || relBefore != p.rel || dBefore != p.d || p.state.leftLimit[2] != integrator.u) &&
       _restartStep!(integrator)
-    return p.code.hasTerminate ? _terminateReached!(integrator) : true
+    return (p.code.hasTerminate || p.code.hasStructural) ? _terminateReached!(integrator) : true
   end
   @error string("[events] the event iteration did not settle at t = ", integrator.t,
                 " (relations switching back and forth: a chattering model); the simulation stops")
@@ -333,18 +351,20 @@ function affectSample!(integrator::DiffEqBase.DEIntegrator)::Nothing
   end
   local hyst::Float64 = p.hyst[1]
   p.hyst[1] = 0.0
+  local goesOn::Bool = false
   try
-    _eventAt!(integrator, true)
+    goesOn = _eventAt!(integrator, true)
   finally
     p.hyst[1] = hyst
   end
   fill!(p.sampleActive, false)
   _logDiscretes!(p, t)
   DiffEqBase.derivative_discontinuity!(integrator, true)
-  #= the stop after this one =#
+  #= the stop after this one; none after a terminate() or a structural change at the instant (a stop added after
+     terminate! went on to it) =#
   stops[1] = t
   stops[2] = next
-  next < tspan[2] && DiffEqBase.add_tstop!(integrator, next)
+  (goesOn && next < tspan[2]) && DiffEqBase.add_tstop!(integrator, next)
   return nothing
 end
 
@@ -402,7 +422,8 @@ end
 """
     _sampleStart!(cb, u, t, integrator)
 
-The samples' stops as a callback: the first stop at the start of a solve (a tick at the start time handled there), then
+The samples' stops as a callback: the first stop at the start of a solve (a tick at the start time handled there; not
+for a mode entered at a structural change, `ArrayRuntimeState.entered`: the mode before took that instant's ticks), then
 each from the one before (affectSample!), a solver stop where within tspan.
 """
 function _sampleStart!(::DiffEqBase.SciMLBase.DECallback, ::AbstractVector, t::Real,
@@ -411,7 +432,7 @@ function _sampleStart!(::DiffEqBase.SciMLBase.DECallback, ::AbstractVector, t::R
   local tspan::Tuple{Real, Real} = integrator.sol.prob.tspan
   resize!(stops, 2)
   stops[1] = -Inf
-  stops[2] = _nextSampleStop(integrator.p, NaN, tspan)
+  stops[2] = _nextSampleStop(integrator.p, integrator.p.state.entered ? Float64(tspan[1]) : NaN, tspan)
   if stops[2] == t
     affectSample!(integrator)
   elseif stops[2] < tspan[2]

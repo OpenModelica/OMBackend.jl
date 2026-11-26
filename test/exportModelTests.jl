@@ -139,10 +139,10 @@ end
   @test sol.u[end] ≈ expected.u[end] rtol = 1e-8
 end
 
-#= on the arrays-kept route the backend scalarizes it (no array code): ModelingToolkit's code, one solution per mode =#
+#= the array code of its modes, one solution per mode =#
 @testset "exportModel: a variable structure system" begin
   local name::String = exportTranslate("ExportVSS", OMFrontend.translateToSCode(EXPORT_VSS_PROGRAM); scalarize = false)
-  @test name in OMBackend.BACKEND_SCALARIZED_MODELS
+  @test name in OMBackend.ARRAY_PRESERVE_DE_MODELS
   local (expected, sols, m) = exportRoundTrip(name)
   @test throughOMBackend(m)
   @test length(sols) == length(expected) == 2

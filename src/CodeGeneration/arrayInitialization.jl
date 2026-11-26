@@ -227,3 +227,28 @@ file): its own code and the callbacks it builds call them by these names.
 _driverBindings()::Vector{Expr} =
   Expr[:(const $n = $(getfield(@__MODULE__, n)))
        for n in (_EVENT_FUNCTIONS..., _ASSERT_FUNCTIONS..., _INITIALIZATION_FUNCTIONS...)]
+
+"""
+    _enterMode!(u0, p, starts) -> Nothing
+
+The start of a mode entered at a structural change (`simulateModes`), in the place of its initialization: the states
+and discrete variables named in `starts` (the values at the change, by the mode's names) take them, the states' pre()
+and reinit buffers and the discrete variables' pre() with them; the others keep their start values. The run starts
+after the change's event (`ArrayRuntimeState.entered`).
+"""
+function _enterMode!(u0::AbstractVector{Float64}, p::ArrayModelParameters, starts::AbstractDict{String, Float64})::Nothing
+  local stateIndex::Dict{String, Int} = p.model.STATE_INDEX
+  local discreteIndex::Dict{String, Int} = p.model.DISCRETE_INDEX
+  for (name::String, value::Float64) in starts
+    local i::Int = get(stateIndex, name, 0)
+    if i > 0
+      u0[i] = value
+      continue
+    end
+    local k::Int = get(discreteIndex, name, 0)
+    k > 0 && (p.d[k] = value; p.dpre[k] = value)
+  end
+  p.upre .= u0; p.ureinit .= u0
+  p.state.entered = true
+  return nothing
+end
