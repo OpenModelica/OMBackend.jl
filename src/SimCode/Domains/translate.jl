@@ -322,9 +322,9 @@ function toIR(g::Gen, e::SC.Exp, ctx::Ctx)::IR
     e.op == SC.OP_UMINUS || ns("unary operator $(e.op)")
     return Op(:neg, IR[toIR(g, e.exp, ctx)])
   elseif e isa SC.BINARY
-    _isString(e) && return Op(:string, IR[toIR(g, e.exp1, ctx), toIR(g, e.exp2, ctx)])
-    e.op == SC.OP_SCALAR_PRODUCT && ns("a scalar product of $(_str(e))")
-    return Op(_binaryOp(e.op), IR[toIR(g, e.exp1, ctx), toIR(g, e.exp2, ctx)])
+    local types::Vector{SC.SType} = SC.SType[]
+    _binaryTypes!(types, e)
+    return _binaryIR(g, e, ctx, types, Base.RefValue(0))
   elseif e isa SC.LUNARY
     e.op == SC.OP_NOT || ns("logical operator $(e.op)")
     return Op(:!, IR[toIR(g, e.exp, ctx)])
@@ -1265,12 +1265,12 @@ element types String if both are, Integer if both are, Real if both are numbers 
 an array operand's for the element-wise and the scalar-array operations, a matrix's and a vector's products' by their
 rules, a scalar product's a scalar's.
 """
-function _binaryType(e::SC.BINARY)::SC.SType
-  local t1::SC.SType = _expType(e.exp1)
-  local t2::SC.SType = _expType(e.exp2)
+_binaryType(e::SC.BINARY)::SC.SType = _binaryType(e.op, _expType(e.exp1), _expType(e.exp2))
+
+"The type of a binary operation of `op` on operands of the types `t1` and `t2` (`_binaryType`)."
+function _binaryType(op::SC.OpKind, t1::SC.SType, t2::SC.SType)::SC.SType
   local el1::SC.SType = t1 isa SC.TYPE_ARRAY ? t1.elementType : t1
   local el2::SC.SType = t2 isa SC.TYPE_ARRAY ? t2.elementType : t2
-  local op::SC.OpKind = e.op
   local real::Bool = op in (SC.OP_DIV, SC.OP_DIV_EW, SC.OP_DIV_ARRAY_SCALAR, SC.OP_DIV_SCALAR_ARRAY, SC.OP_POW, SC.OP_POW_EW,
                             SC.OP_POW_SCALAR_ARRAY, SC.OP_POW_ARRAY_SCALAR, SC.OP_POW_MATRIX)
   local el::SC.SType = real ? SC.TYPE_REAL() :
@@ -1290,6 +1290,42 @@ function _binaryType(e::SC.BINARY)::SC.SType
     !isempty(dims1) ? dims1 : dims2
   return isempty(dims) ? el : SC.TYPE_ARRAY(el, dims)
 end
+
+"""
+    _binaryTypes!(types, e) -> SType
+
+The type of the binary operation `e` (`_binaryType`), and those of the binary operations it nests through binary
+operations, into `types` in pre-order (`e`'s first, then its first operand's, then its second's): each computed once,
+from its operands'. `_binaryIR` reads them in the same order.
+"""
+function _binaryTypes!(types::Vector{SC.SType}, e::SC.BINARY)::SC.SType
+  push!(types, SC.TYPE_UNKNOWN())
+  local at::Int = length(types)
+  local t1::SC.SType = e.exp1 isa SC.BINARY ? _binaryTypes!(types, e.exp1) : _expType(e.exp1)
+  local t2::SC.SType = e.exp2 isa SC.BINARY ? _binaryTypes!(types, e.exp2) : _expType(e.exp2)
+  types[at] = _binaryType(e.op, t1, t2)
+  return types[at]
+end
+
+"""
+    _binaryIR(g, e, ctx, types, pos) -> IR
+
+A binary operation's IR (`toIR`), and of the binary operations it nests through binary operations: a String one's the
+concatenation, its type the next of `types` (`_binaryTypes!`, `pos` the position read last). The type of each nested
+operation computed again from all below it (`_isString`) was O(N^2) for a sum of N terms: the ladder's ground node of
+3200 cells, `toIR` 0.23 s.
+"""
+function _binaryIR(g::Gen, e::SC.BINARY, ctx::Ctx, types::Vector{SC.SType}, pos::Base.RefValue{Int})::IR
+  if types[pos[] += 1] isa SC.TYPE_STRING
+    return Op(:string, IR[_operandIR(g, e.exp1, ctx, types, pos), _operandIR(g, e.exp2, ctx, types, pos)])
+  end
+  e.op == SC.OP_SCALAR_PRODUCT && ns("a scalar product of $(_str(e))")
+  return Op(_binaryOp(e.op), IR[_operandIR(g, e.exp1, ctx, types, pos), _operandIR(g, e.exp2, ctx, types, pos)])
+end
+
+"An operand's IR: a binary operation's by `_binaryIR` (its type the next of `types`), another's by `toIR`."
+_operandIR(g::Gen, x::SC.Exp, ctx::Ctx, types::Vector{SC.SType}, pos::Base.RefValue{Int})::IR =
+  x isa SC.BINARY ? _binaryIR(g, x, ctx, types, pos) : toIR(g, x, ctx)
 
 "The size of dimension `k` of `dims`, `-1` (unknown) where it has none."
 _dimension(dims::Vector{Int}, k::Int)::Int = k <= length(dims) ? dims[k] : -1

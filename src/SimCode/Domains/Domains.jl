@@ -56,6 +56,7 @@ module Domains
 
 import ..SimCode
 import ...Passes
+import DataStructures
 
 const SC = SimCode
 const _OMBACKEND = parentmodule(parentmodule(@__MODULE__))
