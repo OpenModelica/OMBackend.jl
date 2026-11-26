@@ -758,7 +758,7 @@ function structuralArrayTargetCode(lower::Function, name::String)::Union{Nothing
       push!(modes, (name, code))
     else
       initialMode = something(lowered.initialMode, first(lowered.modes).name)
-      local made::Union{Nothing, String, Vector{Tuple{String, Expr}}} = _modeModules(lowered, name, "Mode")
+      local made::ModeModules = _modeModules(lowered, name, "Mode")
       made === nothing && return nothing
       made isa String && return decline(made)
       append!(modes, made)
@@ -772,13 +772,19 @@ function structuralArrayTargetCode(lower::Function, name::String)::Union{Nothing
 end
 
 """
-    _modeModules(lowered, name, prefix) -> Union{Nothing, String, Vector{Tuple{String, Expr}}}
+The array modules of a model's structural modes (`_modeModules`): each mode's name and module; the reason where a mode
+has no array code; `nothing` where a mode is outside the array form.
+"""
+const ModeModules = Union{Nothing, String, Vector{Tuple{String, Expr}}}
+
+"""
+    _modeModules(lowered, name, prefix) -> ModeModules
 
 The array modules of the structural modes of the lowered model `lowered` of the array model `name` (`Passes.modeModels`),
 each its mode's name and module, named `<prefix>_<k>`: `nothing` where a mode is outside the array form
 (`reducedArrayModel`), the reason where a mode has no array code.
 """
-function _modeModules(lowered::OMJLIR.Model, name::String, prefix::String)::Union{Nothing, String, Vector{Tuple{String, Expr}}}
+function _modeModules(lowered::OMJLIR.Model, name::String, prefix::String)::ModeModules
   local modes::Vector{Tuple{String, Expr}} = Tuple{String, Expr}[]
   for (k::Int, model::OMJLIR.Model) in enumerate(Passes.modeModels(lowered))
     local modeName::String = lowered.modes[k].name
@@ -809,7 +815,7 @@ function recompiledArrayModules(name::String, @nospecialize(frontendModel), elem
   local recorded::Bool = name in ARRAY_REDUCED_MODELS
   try
     if !isempty(lowered.modes)
-      local made::Union{Nothing, String, Vector{Tuple{String, Expr}}} = _modeModules(lowered, name, moduleName)
+      local made::ModeModules = _modeModules(lowered, name, moduleName)
       made === nothing && error(string("array model ", name, ": a mode recompiled with ", change,
                                        " is outside the array form (", scalarizedFallbackReason(name), ")"))
       made isa String && error(string("array model ", name, ": recompiled with ", change, ", ", made))

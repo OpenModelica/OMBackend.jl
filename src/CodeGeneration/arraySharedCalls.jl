@@ -54,16 +54,16 @@ const _SHARED_BUFFERS = (:u, :a, :du, :y, :res)
 const _PLAIN_OPERATIONS = (:round, :Int, :Float64, :Bool, :float, :+, :-, :*, :/, :^, :abs, :!, :(==), :!=, :min, :max)
 
 """
-    _bufferOf(x) -> Union{Nothing, Symbol}
+    _bufferOf(x) -> Symbol
 
-The buffer `x` names (`StateRead`): one of `_SHARED_BUFFERS`, `p.d` as `:pd`, `p.values` as `:pv`; `nothing` for
+The buffer `x` names (`StateRead`): one of `_SHARED_BUFFERS`, `p.d` as `:pd`, `p.values` as `:pv`; `:none` for
 anything else.
 """
-function _bufferOf(@nospecialize(x::Any))::Union{Nothing, Symbol}
-  x isa Symbol && return x in _SHARED_BUFFERS ? x : nothing
-  (x isa Expr && x.head === :. && x.args[1] === :p && x.args[2] isa QuoteNode) || return nothing
+function _bufferOf(@nospecialize(x::Any))::Symbol
+  x isa Symbol && return x in _SHARED_BUFFERS ? x : :none
+  (x isa Expr && x.head === :. && x.args[1] === :p && x.args[2] isa QuoteNode) || return :none
   local field::Any = (x.args[2]::QuoteNode).value
-  return field === :d ? :pd : field === :values ? :pv : nothing
+  return field === :d ? :pd : field === :values ? :pv : :none
 end
 
 """
@@ -83,8 +83,8 @@ function _plainArgument!(reads::Vector{StateRead}, @nospecialize(x::Any))::Bool
   end
   x isa Expr || return false
   if x.head === :ref
-    local buffer::Union{Nothing, Symbol} = _bufferOf(x.args[1])
-    buffer === nothing && return false
+    local buffer::Symbol = _bufferOf(x.args[1])
+    buffer === :none && return false
     all(i::Any -> i isa Int, @view x.args[2:end]) || return false
     push!(reads, (buffer, length(x.args) == 2 ? x.args[2]::Int : 0))
     return true
@@ -103,7 +103,7 @@ end
 "The elements the shared call `call` reads (`_plainArgument!`)."
 function _callReads(call::Expr)::Vector{StateRead}
   local reads::Vector{StateRead} = StateRead[]
-  for a in @view call.args[2:end]
+  for a::Any in @view call.args[2:end]
     _plainArgument!(reads, a)
   end
   return reads
@@ -116,23 +116,23 @@ function _countSharedCalls!(counts::Dict{Expr, Int}, @nospecialize(x::Any), pure
     counts[x] = get(counts, x, 0) + 1
     return nothing
   end
-  for a in x.args
+  for a::Any in x.args
     _countSharedCalls!(counts, a, pure)
   end
   return nothing
 end
 
 """
-Whether the call head `f` may write what a shared call reads: a mutating function (`!`), except the relations', event
-functions', delays' and asserts' helpers (they write the run state, `p.rel`, `p.evv`, the histories).
+Whether the call head `f` may write what a shared call reads: a mutating function (`!`). The relations', event
+functions' and index checks' helpers (`_rel`, `_timeRel`, `_evfn`, `_checkedIndex`) write at most the run state
+(`p.rel`, `p.evv`), not what a shared call reads, and have no `!`.
 """
 function _mayWriteState(@nospecialize(f::Any), pure::Set{Symbol})::Bool
   if f isa Symbol
     f in pure && return false
     return endswith(String(f), "!")
   end
-  f isa Function && return !(f === _rel || f === _timeRel || f === _evfn || f === _checkedIndex) &&
-                           endswith(String(nameof(f)), "!")
+  f isa Function && return endswith(String(nameof(f)), "!")
   f isa Expr && f.head === :. && f.args[end] isa QuoteNode && return endswith(String((f.args[end]::QuoteNode).value), "!")
   return true
 end
@@ -140,11 +140,11 @@ end
 "The element an assignment to `lhs` writes onto `writes` (`StateRead`): `(:all, 0)` where it is not a buffer element."
 function _assignmentWrites!(writes::Vector{StateRead}, @nospecialize(lhs::Any))::Nothing
   if lhs isa Expr && lhs.head === :ref
-    local buffer::Union{Nothing, Symbol} = _bufferOf(lhs.args[1])
-    buffer === nothing && (push!(writes, (:all, 0)); return nothing)
+    local buffer::Symbol = _bufferOf(lhs.args[1])
+    buffer === :none && (push!(writes, (:all, 0)); return nothing)
     push!(writes, (buffer, length(lhs.args) == 2 && lhs.args[2] isa Int ? lhs.args[2]::Int : 0))
   elseif lhs isa Expr && lhs.head === :tuple
-    for x in lhs.args
+    for x::Any in lhs.args
       _assignmentWrites!(writes, x)
     end
   elseif lhs isa Symbol
@@ -165,7 +165,7 @@ function _stateWrites!(writes::Vector{StateRead}, @nospecialize(x::Any), pure::S
   elseif x.head === :call && _mayWriteState(x.args[1], pure)
     push!(writes, (:all, 0))
   end
-  for a in x.args
+  for a::Any in x.args
     #= a local's definition: its name is no write =#
     (x.head === :local && a isa Expr && a.head === :(=) && a.args[1] isa Symbol) && (_stateWrites!(writes, a.args[2], pure); continue)
     _stateWrites!(writes, a, pure)
@@ -198,7 +198,7 @@ parameter local or a shared value.
 """
 function _letShadows(x::Expr)::Bool
   local bindings::Vector{Any} = x.args[1] isa Expr && x.args[1].head === :block ? x.args[1].args : Any[x.args[1]]
-  for b in bindings
+  for b::Any in bindings
     b isa LineNumberNode && continue
     local name::Any = b isa Expr && b.head === :(=) ? b.args[1] : b
     name isa Symbol || return true
@@ -222,7 +222,7 @@ function _unconditionalCalls!(found::Vector{Expr}, @nospecialize(x::Any), pure::
       (get(counts, x, 0) > 1 && !(x in found)) && push!(found, x)
       return nothing
     end
-    for a in @view x.args[2:end]
+    for a::Any in @view x.args[2:end]
       _unconditionalCalls!(found, a, pure, counts)
     end
   elseif h in (:if, :elseif, :&&, :||)
@@ -230,7 +230,7 @@ function _unconditionalCalls!(found::Vector{Expr}, @nospecialize(x::Any), pure::
   elseif h in (:(=), :(+=), :(-=), :(*=), :(/=))
     _unconditionalCalls!(found, x.args[2], pure, counts)
   elseif h in (:block, :ref, :vect, :tuple, :local, :...) || (h === :let && !_letShadows(x))
-    for a in x.args
+    for a::Any in x.args
       _unconditionalCalls!(found, a, pure, counts)
     end
   end
@@ -245,7 +245,7 @@ function _replaceShared(@nospecialize(x::Any), shared::Dict{Expr, Tuple{Symbol, 
     local entry::Union{Nothing, Tuple{Symbol, Vector{StateRead}}} = get(shared, x, nothing)
     entry === nothing || return entry[1]
   end
-  return Expr(x.head, Any[_replaceShared(a, shared, pure) for a in x.args]...)
+  return Expr(x.head, Any[_replaceShared(a, shared, pure) for a::Any in x.args]...)
 end
 
 """
@@ -261,7 +261,7 @@ or leaves early shares none of its own. A pure function's value is the same for 
 function _shareCalls(stmts::Vector{Any}, pure::Set{Symbol}, counter::Base.RefValue{Int})::Vector{Any}
   isempty(pure) && return stmts
   local counts::Dict{Expr, Int} = Dict{Expr, Int}()
-  for st in stmts
+  for st::Any in stmts
     _countSharedCalls!(counts, st, pure)
   end
   any(n::Int -> n > 1, values(counts)) || return stmts
@@ -269,15 +269,16 @@ function _shareCalls(stmts::Vector{Any}, pure::Set{Symbol}, counter::Base.RefVal
   local out::Vector{Any} = Any[]
   local writes::Vector{StateRead} = StateRead[]
   local found::Vector{Expr} = Expr[]
-  for st in stmts
+  for st::Any in stmts
     empty!(writes)
     _stateWrites!(writes, st, pure)
-    isempty(writes) || filter!(kv -> !_readsWritten(kv[2][2], writes), shared)
+    isempty(writes) ||
+      filter!(kv::Pair{Expr, Tuple{Symbol, Vector{StateRead}}} -> !_readsWritten(kv[2][2], writes), shared)
     local current::Any = isempty(shared) ? st : _replaceShared(st, shared, pure)
     empty!(found)
     _exitsEarly(current) || _unconditionalCalls!(found, current, pure, counts)
     local added::Bool = false
-    for call in found
+    for call::Expr in found
       local reads::Vector{StateRead} = _callReads(call)
       _readsWritten(reads, writes) && continue
       counter[] += 1

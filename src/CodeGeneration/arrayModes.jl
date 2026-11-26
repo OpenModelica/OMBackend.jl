@@ -207,7 +207,7 @@ function _recompiledMode(model::Module, origin::Module, modeName::String, elemen
   local family::Dict{String, Module} = model.FAMILIES[origin]
   local key::Tuple{UInt, String, Float64} = (objectid(family), element, Float64(value))
   local cached::Union{Nothing, Dict{String, Module}} = get(model.RECOMPILED, key, nothing)
-  cached === nothing || return cached[modeName]
+  cached === nothing || return _familyMode(model, cached, modeName, element, value)
   local frontendModel::Any = get(model.FRONTEND_MODELS, origin, nothing)
   frontendModel === nothing &&
     error(string("array model ", model.MODEL_NAME, ": a recompilation of ", element, " in a mode without its frontend model"))
@@ -224,7 +224,20 @@ function _recompiledMode(model::Module, origin::Module, modeName::String, elemen
     model.FRONTEND_MODELS[m] = changed
   end
   model.RECOMPILED[key] = recompiled
-  return recompiled[modeName]
+  return _familyMode(model, recompiled, modeName, element, value)
+end
+
+"""
+    _familyMode(model, family, modeName, element, value) -> Module
+
+The mode `modeName` of the recompiled family `family` (`_recompiledMode`); an error where the recompilation with
+`element` = `value` has no mode of that name (its modes differ from those of the family it was recompiled from).
+"""
+function _familyMode(model::Module, family::Dict{String, Module}, modeName::String, element::String,
+                     value::Union{Bool, Int, Float64})::Module
+  haskey(family, modeName) && return family[modeName]
+  error(string("array model ", model.MODEL_NAME, ": recompiled with ", element, " = ", value, ", it has no mode ",
+               modeName, " (its modes: ", join(sort!(collect(keys(family))), ", "), ")"))
 end
 
 "Whether the array module `mode` has the parameter or parameter element `name` (Modelica's or canonical)."

@@ -206,6 +206,23 @@ end
   end
 end
 
+#= A value a module and its submodule (the cold-code module, which imports its parent's names) hold is one constant,
+   the parent's, as it is one object in OMBackend (CoupledLoopEvents' NO_CROSSINGS was one in each); an equal value
+   that is another object has its own. =#
+@testset "exportModel: a value of a module and its submodule is one constant" begin
+  local v::Vector{Float64} = [1.0, 2.0]
+  local w::Vector{Float64} = copy(v)
+  local m::Expr = Expr(:module, true, :M, Expr(:block, :(f() = $v),
+                                                Expr(:module, true, :C, Expr(:block, :(g() = $v), :(h() = $w)))))
+  local hoisted::Expr = Base.remove_linenums!(OMBackend._hoistedConstants(m))
+  local plain(e::Expr)::Expr = Base.remove_linenums!(e)
+  local parent::Vector{Any} = hoisted.args[3].args
+  local child::Vector{Any} = only(filter(s::Any -> s isa Expr && s.head === :module, parent)).args[3].args
+  @test parent[1] == Expr(:const, Expr(:(=), :_EXPORTED_1, v)) && parent[2] == plain(:(f() = _EXPORTED_1))
+  @test child[1] == Expr(:const, Expr(:(=), :_EXPORTED_2, w))
+  @test child[2] == plain(:(g() = _EXPORTED_1)) && child[3] == plain(:(h() = _EXPORTED_2))
+end
+
 #= The file's external objects (tables) are registered under a key of their own: including it freed the translated
    model's tables, and forgetting the translated model freed the file's. =#
 @testset "exportModel: the file's external objects are its own" begin

@@ -1,10 +1,12 @@
-#= Events of the array code (Author: John Tinnerholm): coincident ones, the step after one, their buffers. Relations crossing within an event's instant
-   after it change in that event (ArrayPreserveDE._coincidentCrossings): the root finder reports only the crossings at
-   its earliest root, and coincident ones, found 7e-13 s apart at reltol 1e-6, were an event each (MSL EngineV6's
-   cylinders at dead center: 651 events, 326 merged). After an event whose right-hand side changes slowly over the step
-   proposed before it, that step is kept (ArrayPreserveDE._slowAfterEvent; EngineV6: 4876 steps to 2951). The event
-   code evaluates the equations into the parameters' buffers (ArrayPreserveDE._eventBuffers; EngineV6: 168 to 45 MiB
-   in its event steps). =#
+#= Author: John Tinnerholm
+
+   Events of the array code: coincident ones, the step after one, their buffers. Relations crossing within an event's
+   instant after it change in that event (ArrayPreserveDE._coincidentCrossings): the root finder reports only the
+   crossings at its earliest root, and coincident ones, found 7e-13 s apart at reltol 1e-6, were an event each (MSL
+   EngineV6's cylinders at dead center: 651 events, 326 merged). After an event whose right-hand side changes slowly
+   over the step proposed before it, that step is kept (ArrayPreserveDE._slowAfterEvent; EngineV6: 4876 steps to 2951).
+   The event code evaluates the equations into the parameters' buffers (ArrayPreserveDE._eventBuffers; EngineV6: 168 to
+   45 MiB in its event steps). =#
 using Test
 import OMBackend
 import OMFrontend
@@ -74,6 +76,18 @@ end
     @test (proposed[1] <= 1e-6) == small
     @test sol(0.75)[1] ≈ x075 atol = 1e-8
   end
+  #= an error at the probe's point (off the solution, `StepRejectingRHS`) is not kept as the run's (`LAST_RHS_ERROR`):
+     a run that failed later reported it as its cause =#
+  local probeErrors::Base.RefValue{Int} = Base.RefValue{Int}(0)
+  local guarded!(du::Vector{Float64}, u::Vector{Float64}, p::Any, t::Float64)::Nothing =
+    (u[1] > 1.5 && (probeErrors[] += 1; throw(DomainError(u[1], "off the solution"))); du[1] = 1.0; nothing)
+  local integ = ODE.init(ODE.ODEProblem(ODE.ODEFunction(APDE.StepRejectingRHS(guarded!)), [1.0], (0.0, 1.0)), rodas;
+                         dt = 0.1, adaptive = false)
+  ODE.step!(integ)
+  OMBackend.CodeGeneration._resetRHSError!()
+  @test !APDE._slowAfterEvent(integ, 0.1, 1.0)
+  @test probeErrors[] == 1
+  @test OMBackend.CodeGeneration.LAST_RHS_ERROR[] === nothing
 end
 
 "The bytes one evaluation of the relations' and when-conditions' crossing functions allocates at the integrator's point."

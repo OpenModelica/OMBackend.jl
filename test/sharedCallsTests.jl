@@ -1,4 +1,6 @@
-#= The array code's calls of the model's pure functions with the same arguments made once in a generated function
+#= Author: John Tinnerholm
+
+   The array code's calls of the model's pure functions with the same arguments made once in a generated function
    (ArrayPreserveDE._shareCalls): a record-valued call is one call per field read. MSL BatchPlant_StandardWater's
    right-hand side made 988 calls of IF97's waterBaseProp_ph with 10 different arguments (solve 2.08 -> 1.40 s,
    rebuild 11.0 -> 7.8 s, results bit-identical). A write of what a call reads, or a mutating call, ends its share;
@@ -19,7 +21,7 @@ function _runStatements(stmts::Vector{Any})::Tuple{Vector{Float64}, Int}
                                            $(stmts...)
                                            a
                                          end))
-  local a::Vector{Float64} = Base.invokelatest(fn, zeros(6), [1.0, 2.0], (d = [3.0],), f, g!)
+  local a::Vector{Float64} = Base.invokelatest(fn, zeros(6), [1.0, 2.0], (d = [3.0], values = [4.0]), f, g!)
   return (a, calls[])
 end
 
@@ -41,6 +43,21 @@ end
   @test (plainCalls, sharedCalls) == (8, 6)
   #= f impure (not among the pure functions): every call kept =#
   @test APDE._shareCalls(stmts, Set{Symbol}(), Base.RefValue{Int}(0)) == stmts
+  #= a nested call, a `let` that binds an argument's name, a statement that leaves early, a write of `p.values` =#
+  local more::Vector{Any} = Any[
+    :(a[1] = f(f(u[1])) + f(f(u[1]))),       #= the inner call shared: f(u[1]) once, the outer f twice =#
+    :(a[2] = let u = [5.0]; f(u[1]) end),    #= its own u: stays; a binding of a buffer's name ends every share =#
+    :(if f(u[2]) > 100.0; return a; end),    #= leaves early: shares none of its own =#
+    :(a[3] = f(u[2]) + f(u[2]) + f(u[1])),   #= both shared from here =#
+    :(a[4] = f(p.values[1])),                #= shared from here =#
+    :(p.values[1] = 5.0),                    #= a write of what f(p.values[1]) reads: evaluated again after it =#
+    :(a[5] = f(p.values[1]) + f(p.values[1]))]
+  local sharedMore::Vector{Any} = APDE._shareCalls(more, Set{Symbol}([:f]), Base.RefValue{Int}(0))
+  @test more[2] in sharedMore && more[3] in sharedMore
+  local (plainMoreA::Vector{Float64}, plainMoreCalls::Int) = _runStatements(more)
+  local (sharedMoreA::Vector{Float64}, sharedMoreCalls::Int) = _runStatements(sharedMore)
+  @test sharedMoreA == plainMoreA
+  @test (plainMoreCalls, sharedMoreCalls) == (12, 9)
 
   #= a model: a record bound by a call, read by its fields, and a function called in several equations =#
   local program = OMFrontend.OpenModelicaParser.Modelica"""

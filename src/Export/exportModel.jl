@@ -423,19 +423,22 @@ The standalone module `m` (`_standaloneModule`) with the values its functions ho
 module constants. In OMBackend a function holds the object itself; printed, the value is a literal, a new object at
 each evaluation (CoupledLoopEvents: 464 B per right-hand side in memory, 70 KB exported). A value a top-level
 constant binds goes by that constant's name, as the functions share it in OMBackend; another by `_EXPORTED_<k>`,
-defined after the module's imports. A submodule gets its own constants, numbered on from its parent's (`count`): the
-cold-code module imports its parent's names. Values in quoted expressions stay.
+defined after the module's imports. A submodule (the cold-code module, which imports its parent's names) reads a value
+its parent names before it by that name (`inherited`): the same object, as in OMBackend; another gets a constant of
+its own, numbered on from its parent's (`count`). Values in quoted expressions stay.
 """
-_hoistedConstants(m::Expr)::Expr = _hoistedConstants(m, Ref(0))
+_hoistedConstants(m::Expr)::Expr = _hoistedConstants(m, Ref(0), IdDict{Any, Symbol}())
 
-function _hoistedConstants(m::Expr, count::Base.RefValue{Int})::Expr
+function _hoistedConstants(m::Expr, count::Base.RefValue{Int}, inherited::IdDict{Any, Symbol})::Expr
   local statements::Vector{Any} = Any[]
   _topLevelStatements!(statements, m.args[3]::Expr)
-  local names::IdDict{Any, Symbol} = IdDict{Any, Symbol}()
-  for s::Any in statements
+  local names::IdDict{Any, Symbol} = copy(inherited)
+  #= the statement of a value's top-level constant: a submodule before it does not see the name =#
+  local boundAt::IdDict{Any, Int} = IdDict{Any, Int}()
+  for (i::Int, s::Any) in enumerate(statements)
     s isa Expr && s.head === :const && s.args[1] isa Expr && (s.args[1]::Expr).head === :(=) || continue
     local (lhs::Any, rhs::Any) = ((s.args[1]::Expr).args[1], (s.args[1]::Expr).args[2])
-    lhs isa Symbol && _hoistable(rhs) && !haskey(names, rhs) && (names[rhs] = lhs)
+    lhs isa Symbol && _hoistable(rhs) && !haskey(names, rhs) && (names[rhs] = lhs; boundAt[rhs] = i)
   end
   #= the values in the order the functions are visited: the same names each time =#
   local inFunctions::Vector{Any} = Any[]
@@ -454,14 +457,27 @@ function _hoistedConstants(m::Expr, count::Base.RefValue{Int})::Expr
     names[v] = nm
     push!(definitions, Expr(:const, Expr(:(=), nm, v)))
   end
-  local hoist::Function = v -> v isa Expr || !(v in hoisted) ? v : names[v]
-  local body::Vector{Any} = Any[s isa Expr && s.head === :module ? _hoistedConstants(s, count) :
+  local hoist::Function = (v::Any) -> v isa Expr || !(v in hoisted) ? v : names[v]
+  local body::Vector{Any} = Any[s isa Expr && s.head === :module ?
+                                  _hoistedConstants(s, count, _namesBefore(names, boundAt, i)) :
                                 _bindsValue(s) || !(s isa Expr) ? s :
                                 CodeGeneration.CodeGenerationUtil._iterativePostwalk(hoist, s)
-                                for s::Any in statements]
+                                for (i::Int, s::Any) in enumerate(statements)]
   local k::Int = something(findfirst(s -> !(s isa LineNumberNode || s isa Expr && s.head in (:using, :import)), body),
                            length(body) + 1)
   return Expr(:module, m.args[1], m.args[2], Expr(:block, body[1:k - 1]..., definitions..., body[k:end]...))
+end
+
+"""
+The names of `names` (`_hoistedConstants`) a submodule at the top-level statement `i` sees: all but those of the
+constants after it (`boundAt`); the module's own `_EXPORTED_<k>` are defined after its imports, before any submodule.
+"""
+function _namesBefore(names::IdDict{Any, Symbol}, boundAt::IdDict{Any, Int}, i::Int)::IdDict{Any, Symbol}
+  local visible::IdDict{Any, Symbol} = IdDict{Any, Symbol}()
+  for (v::Any, nm::Symbol) in names
+    get(boundAt, v, 0) < i && (visible[v] = nm)
+  end
+  return visible
 end
 
 "The top-level statements of the module body `body` into `out`, its blocks flattened."
@@ -529,11 +545,13 @@ end
     _withObjectKey(m::Expr, name::String) -> Expr
 
 The module `m` of the model `name` with its external objects (tables) registered and freed under a key of its own
-(`"<name> (exported)"`), not the model's: including the file freed the objects of the translated model (`name`).
+(`"<name> (exported)"`), not the model's: including the file freed the objects of the translated model (`name`). As a
+translated model's module evaluated again, an include of the file frees the objects of the include before it: one
+include of an exported model at a time.
 """
 function _withObjectKey(m::Expr, name::String)::Expr
   local key::String = name * " (exported)"
-  return CodeGeneration.CodeGenerationUtil._iterativePostwalk(m) do e
+  return CodeGeneration.CodeGenerationUtil._iterativePostwalk(m) do (e::Any)
     e isa Expr && e.head === :call && length(e.args) >= 2 && _objectRegistry(e.args[1]) && e.args[end] == name ||
       return e
     return Expr(:call, e.args[1:end - 1]..., key)

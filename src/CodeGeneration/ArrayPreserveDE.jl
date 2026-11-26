@@ -891,7 +891,8 @@ Whether the step after an event can keep the length `step` proposed before it, b
   value. It catches a fast transient started by a continuous change (`ArrayPath.HighGainKink`, a jump of 1e-3).
 Restarted small after each of its 326 events, MSL EngineV6 took 15 steps between two events instead of 9 (3.3 s of
 solve instead of 2.4 s). Only for OrdinaryDiffEq's integrators of an ODE with an identity mass matrix (the right-hand
-side a derivative); a right-hand side that is not finite there restarts the step.
+side a derivative); a right-hand side that is not finite there restarts the step. An error at the probe's point is not
+kept as the run's (`LAST_RHS_ERROR`).
 """
 _slowAfterEvent(::DiffEqBase.DEIntegrator, ::Float64, ::Float64)::Bool = false
 function _slowAfterEvent(integrator::OrdinaryDiffEq.OrdinaryDiffEqCore.ODEIntegrator, step::Float64,
@@ -909,7 +910,10 @@ function _slowAfterEvent(integrator::OrdinaryDiffEq.OrdinaryDiffEqCore.ODEIntegr
   local scale::AbstractVector = opts.abstol .+ abs.(u) .* opts.reltol
   local jump::Float64 = Float64(opts.internalnorm((f0 .- left) ./ scale, t)) * step
   (isfinite(jump) && jump <= 1) || return false
+  #= the probe is off the solution: an error there (StepRejectingRHS) is not the run's =#
+  local runError::Any = LAST_RHS_ERROR[]
   f(f1, u .+ (dir * probe) .* f0, integrator.p, t + dir * probe)
+  LAST_RHS_ERROR[] = runError
   local magnitude::Float64 = Float64(opts.internalnorm(f0 ./ scale, t))
   local change::Float64 = Float64(opts.internalnorm((f1 .- f0) ./ scale, t)) * (step / probe)
   return isfinite(magnitude) && isfinite(change) && change <= _RESTART_CHANGE * magnitude
@@ -947,6 +951,21 @@ function _rootsAt(p::ArrayModelParameters, t::Real, right::Bool)::Vector{Matrix{
     b.y .= y
   end
   return map(copy, entry[2])
+end
+
+"""
+    _solveStart!(integrator)
+
+The start of a solve (its first callback's `initialize`): the parameters as after their initialization
+(`_restoreStart!`); where that reached a structural change, the run ends at its start with Success (`_endRun!`). A
+mode's problem is of zero length then (`endsAtStart`); remade to a longer tspan, it ran on in the mode the change had
+left.
+"""
+function _solveStart!(integrator::DiffEqBase.DEIntegrator)::Nothing
+  local p::ArrayModelParameters = integrator.p
+  _restoreStart!(p)
+  first(p.state.structural) == 0 || _endRun!(integrator, DiffEqBase.SciMLBase.ReturnCode.Success)
+  return nothing
 end
 
 """
@@ -3710,7 +3729,7 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
                                     save_positions = (false, false)))
       end
       pushfirst!(cbs, DiscreteCallback($(_OMBACKEND.CodeGeneration.NotAnEvent)((u, t, integrator) -> false), integrator -> nothing;
-                                       initialize = (c, u, t, integrator) -> $(_restoreStart!)(integrator.p),
+                                       initialize = (c, u, t, integrator) -> $(_solveStart!)(integrator),
                                        save_positions = (false, false)))
       #= the first step, after the other callbacks' initializations: finite (`_finiteFirstStep!`) =#
       push!(cbs, DiscreteCallback($(_OMBACKEND.CodeGeneration.NotAnEvent)((u, t, integrator) -> false), integrator -> nothing;

@@ -308,6 +308,9 @@ _vssValue(sol, name::String)::Float64 = OMBackend.variableValues(sol, name)[end]
     local m::Module = getfield(OMBackend, Symbol(name))
     @test length(m.RECOMPILED) == 1
     @test sols[3].prob.p.model === only(values(m.RECOMPILED))["b"]
+    #= a mode the recompiled family does not have: an error that names it =#
+    @test_throws r"N = 3, it has no mode c \(its modes: a, b\)" Base.invokelatest(
+      OMBackend.CodeGeneration.ArrayPreserveDE._familyMode, m, only(values(m.RECOMPILED)), "c", "N", 3)
   end
 
   #= A structural change the initialization reaches (`when initial()`): kept in the start state (`ArrayStartState`),
@@ -333,5 +336,15 @@ _vssValue(sol, name::String)::Float64 = OMBackend.variableValues(sol, name)[end]
     @test sols[1].t[end] == 0.0 && sols[1].retcode == ReturnCode.Success
     @test length(sols[2].u[end]) == 3
     @test _vssValue(sols[2], "x[3]") ≈ 3 * exp(-1.0) atol = 1e-8
+    #= the mode's problem (of zero length) remade to (0, 1) and solved with its callbacks: it ends at its start too
+       (`_solveStart!`; it ran on to 1 with N = 2) =#
+    local DE::Module = OMBackend.DifferentialEquations
+    local m::Module = Base.invokelatest(getglobal, OMBackend, Symbol(name))
+    local mode::Module = Base.invokelatest(() -> m.MODES[m.INITIAL_MODE])
+    local (ode, cbs) = Base.invokelatest(getglobal(mode, Symbol(nameof(mode), "Model")), (0.0, 1.0))
+    @test ode.tspan == (0.0, 0.0)
+    local remade = Base.invokelatest(() -> DE.solve(DE.remake(ode; tspan = (0.0, 1.0)), OMBackend.defaultSolver();
+                                                    callback = cbs))
+    @test remade.t[end] == 0.0 && remade.retcode == ReturnCode.Success
   end
 end
