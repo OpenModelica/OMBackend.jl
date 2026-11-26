@@ -2269,6 +2269,51 @@ end DivideInLoop;
     @test sf ≈ af rtol = 1e-6
   end
 
+  @testset "a row of a record's array field differentiated, the other rows not: the derivatives of that row only" begin
+    #= a frame Q set row by row by for-equations, as connect() writes a frame's R (MSL Engine1a, Engine1b, FullRobot,
+       EngineV6_analytic): the slide's position reads row 2 of Q, which index reduction differentiates twice; row 1 no
+       differentiated equation reads. The derivative of `Q.T[2, i]` in array form was the whole Q.T's at [2, i], also
+       Q.T[1, 1]'s, which Pantelides' algorithm gives none: the array path refused the model. omc 1.27.1, tolerance
+       1e-11: s(1) = -1.830888753, v(1) = -4.865138546 =#
+    local rows = Modelica"""
+      record Frame
+        Real T[3, 3];
+      end Frame;
+
+      model SlidingMassRows "a mass on a slide turned by phi about z, tilted by a about x"
+        parameter Real g = 9.81;
+        parameter Real a = 0.3;
+        Real phi;
+        Frame R;
+        Frame Q;
+        Real s(start = 1, fixed = true);
+        Real v(start = 0, fixed = true);
+        Real r[3], vr[3], f[3];
+      equation
+        phi = time + 0.5;
+        R.T = {{cos(phi), sin(phi) * cos(a), sin(phi) * sin(a)}, {-sin(phi), cos(phi) * cos(a), cos(phi) * sin(a)},
+               {0, -sin(a), cos(a)}};
+        for i in 1:3 loop
+          Q.T[1, i] = 2 * R.T[1, i];
+        end for;
+        for i in 1:3 loop
+          Q.T[2, i] = 2 * R.T[2, i];
+        end for;
+        for i in 1:3 loop
+          Q.T[3, i] = 2 * R.T[3, i];
+        end for;
+        r = {Q.T[2, 1], Q.T[2, 2], Q.T[2, 3]} * s / 2;
+        v = der(s);
+        der(r) = vr;
+        der(vr) = f + {0, -g, 0};
+        R.T[2, 1] * f[1] + R.T[2, 2] * f[2] + R.T[2, 3] * f[3] = 0;
+      end SlidingMassRows;
+      """
+    local (sr, ar, _) = _bothWaysOf(rows, "SlidingMassRows", ["s", "v"])
+    @test ar ≈ [-1.830888753, -4.865138546] rtol = 2e-6
+    @test sr ≈ ar rtol = 1e-6
+  end
+
   @testset "pre() of an array as an argument, an array output into a row, an element of a negated array" begin
     #= `(r, state) = fibStep(pre(state))` in a when-equation: pre() of the array as the argument (the array of pre()
        of its elements), the array output into the array (MSL's random number generators: "the array state64 as a
