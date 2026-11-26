@@ -81,7 +81,7 @@ module ArrayPreserveDE
 
 import ModelingToolkit
 import ..CodeGeneration: stripBeginBlocks, ModelicaAssertionError, solveStoppedAtStart, _autoDtReset!, _finiteFirstStep!,
-  ode_to_dae
+  ode_to_dae, _instantLength
 import ..CodeGeneration: DelayState, delayedValue, emptyDelayHistories!, startDelayHistories!, recordDelayStepEnd!,
   recordDelayJumps!, delayJumpsDue!
 import ...Passes
@@ -843,18 +843,68 @@ transient of 1e-4 s, `a` 12 for 0). The step is OrdinaryDiffEq's estimate of a f
 1e-6 of the time span and the step proposed before. The estimate alone is not enough: the algebraic variables are
 solved inside the right-hand side, so a state that follows its input through a high gain has a derivative of
 round-off size at the event, and the estimate from it steps far over the transient (MSL OpAmps.Differentiator,
-V0 = 15000: 5e-3 s over a transient of 2e-6 s, the capacitor's voltage 0.02 V behind over the ramp). No step
-follows an event at the last stop. The step is proposed (`dtpropose`): `integrator.dt` stays the length of the step
-that ended at the event, which the assert checks after the event interpolate (`_assertPending!`, `_autoDtReset!`).
+V0 = 15000: 5e-3 s over a transient of 2e-6 s, the capacitor's voltage 0.02 V behind over the ramp). Where the
+right-hand side after the event changes slowly over the step proposed before it (`_slowAfterEvent`), that step is
+kept. No step follows an event at the last stop. The step is proposed (`dtpropose`): `integrator.dt` stays the length
+of the step that ended at the event, which the assert checks after the event interpolate (`_assertPending!`,
+`_autoDtReset!`).
 """
 function _restartStep!(integrator)::Nothing
   isempty(integrator.opts.tstops) && return nothing
   local before::Float64 = abs(integrator.dtpropose)
-  _autoDtReset!(integrator)
   local span::Float64 = abs(integrator.sol.prob.tspan[2] - integrator.sol.prob.tspan[1])
   local cap::Float64 = 1.0e-6 * (isfinite(span) ? span : 1.0)
+  _slowAfterEvent(integrator, before, min(cap, before)) && return nothing
+  _autoDtReset!(integrator)
   integrator.dtpropose = integrator.tdir * min(abs(integrator.dtpropose), cap, before)
   return nothing
+end
+
+"""
+The largest change of the right-hand side over the step after an event, relative to its size, for which the step
+proposed before the event is kept (`_slowAfterEvent`). A transient of time constant τ gives step / τ: at 10 it has
+decayed to 5e-5 within the step, which crosses it at once. At reltol 1e-6 MSL EngineV6's 325 restarts give at most 3.2,
+20 of OpAmps.Differentiator's 40 0.19 to 0.24; the transients the restart is for give 54 (`ArrayPath.StepAfterEvent`),
+6e5 (SlewRateLimiter) and 3e6 (`ArrayPath.HighGainKink`), whose derivatives are continuous at the event.
+"""
+const _RESTART_CHANGE = 10.0
+
+"""
+    _slowAfterEvent(integrator, step, probe) -> Bool
+
+Whether the step after an event can keep the length `step` proposed before it, both in the solver's error norm:
+- the right-hand side's jump across the event, times the step, is within the tolerance. Before the event it is the
+  derivative of the step that ended there (its interpolation, of the relations before the event: OrdinaryDiffEq computed
+  it again for the step cut at the event). MSL EngineV6's dead centers give at most 0.15; the switch from star to
+  delta of MSL IMC_YD 1.6e11: kept there, its first step of 1.6e-4 s crossed the transient and the steps fell to 3e-8 s
+  for 0.1 s (3134 steps instead of 1740), though its probe below gave only 6.
+- the right-hand side after the event changes by at most `_RESTART_CHANGE` times its size over the step: its change over
+  `probe` (1e-6 of the span, at most the step) from the state along its derivative, scaled to the step, against its
+  value. It catches a fast transient started by a continuous change (`ArrayPath.HighGainKink`, a jump of 1e-3).
+Restarted small after each of its 326 events, MSL EngineV6 took 15 steps between two events instead of 9 (3.3 s of
+solve instead of 2.4 s). Only for OrdinaryDiffEq's integrators of an ODE with an identity mass matrix (the right-hand
+side a derivative); a right-hand side that is not finite there restarts the step.
+"""
+_slowAfterEvent(::DiffEqBase.DEIntegrator, ::Float64, ::Float64)::Bool = false
+function _slowAfterEvent(integrator::OrdinaryDiffEq.OrdinaryDiffEqCore.ODEIntegrator, step::Float64,
+                         probe::Float64)::Bool
+  (integrator.f isa DiffEqBase.SciMLBase.ODEFunction && probe > 0 && isfinite(step)) || return false
+  local f::DiffEqBase.SciMLBase.ODEFunction = integrator.f
+  OrdinaryDiffEq.OrdinaryDiffEqCore._is_identity_massmatrix(f.mass_matrix) || return false
+  local u::AbstractVector = integrator.u
+  local t::Float64 = Float64(integrator.t)
+  local dir::Float64 = Float64(integrator.tdir)
+  local left::AbstractVector = integrator(t, Val{1})
+  local f0::AbstractVector = similar(u); local f1::AbstractVector = similar(u)
+  f(f0, u, integrator.p, t)
+  local opts::OrdinaryDiffEq.OrdinaryDiffEqCore.DEOptions = integrator.opts
+  local scale::AbstractVector = opts.abstol .+ abs.(u) .* opts.reltol
+  local jump::Float64 = Float64(opts.internalnorm((f0 .- left) ./ scale, t)) * step
+  (isfinite(jump) && jump <= 1) || return false
+  f(f1, u .+ (dir * probe) .* f0, integrator.p, t + dir * probe)
+  local magnitude::Float64 = Float64(opts.internalnorm(f0 ./ scale, t))
+  local change::Float64 = Float64(opts.internalnorm((f1 .- f0) ./ scale, t)) * (step / probe)
+  return isfinite(magnitude) && isfinite(change) && change <= _RESTART_CHANGE * magnitude
 end
 
 """

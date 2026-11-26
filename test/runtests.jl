@@ -448,6 +448,7 @@ TEST_GROUP == "kept" || @testset "OMBackend" begin
 
   #= ── 20h2. The array code's calls of pure functions shared: one call per function and arguments ── =#
   include("sharedCallsTests.jl")
+  include("coincidentCrossingsTests.jl")
 
   #= ── 20i. Underdetermined initialization: states at their start values ── =#
   include("initFixStatesTests.jl")

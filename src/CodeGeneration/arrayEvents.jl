@@ -268,12 +268,50 @@ function _atSampleInstant(p::ArrayModelParameters, t::Real, tspan::Tuple{Real, R
 end
 
 """
+    _coincidentCrossings(integrator, events, tl, ul) -> Vector{Int8}
+
+The event's crossings (`events`, as the root finder reports them) with those of the relations that cross within the
+event's instant after t (`_instantLength`: 1e-10 * (1 + |t|), the MTK path's coincident time events): their crossing
+functions, continued in a straight line from the left limit (tl, ul) through t, change sign by t + that length. The root
+finder reports only the crossings at its earliest root; coincident ones, found 7e-13 s apart at reltol 1e-6, were an
+event each, with a restart each (MSL EngineV6's cylinders 1 and 6 at dead center: 651 events). Relations of time keep
+their exact times.
+"""
+function _coincidentCrossings(integrator::DiffEqBase.DEIntegrator, events::AbstractVector{Int8}, tl::Float64,
+                              ul::AbstractVector)::Vector{Int8}
+  local fired::Vector{Int8} = Vector{Int8}(events)
+  local c::ArrayModelCode = integrator.p.code
+  local t::Float64 = integrator.t
+  local n::Int = length(events)
+  local open::Bool = false
+  for k::Int in 1:n
+    open |= events[k] == 0 && c.relationSlot[k] && !c.timeSlot[k]
+  end
+  (open && tl < t) || return fired
+  local zl::Vector{Float64} = zeros(n); local z0::Vector{Float64} = zeros(n)
+  conditions!(zl, ul, tl, integrator)
+  conditions!(z0, integrator.u, t, integrator)
+  local r::Float64 = _instantLength(t) / (t - tl)
+  for k::Int in 1:n
+    (events[k] == 0 && c.relationSlot[k] && !c.timeSlot[k]) || continue
+    local z1::Float64 = z0[k] + r * (z0[k] - zl[k])
+    if z0[k] < 0 && z1 >= 0
+      fired[k] = Int8(1)
+    elseif z0[k] > 0 && z1 <= 0
+      fired[k] = Int8(-1)
+    end
+  end
+  return fired
+end
+
+"""
     affectCrossing!(integrator, events)
 
 A crossing: relations and when-conditions first take their values at the left limit (the state just before the event),
 so a when fires exactly when its condition rises across the event; a relation whose crossing the root finder found
-(`events`: +1 its crossing function rose past zero, -1 it fell) changes where that is its change (a true one's rises, a
-false one's falls) and its value at the left limit did not change already; then the event iteration at the event.
+(`events`: +1 its crossing function rose past zero, -1 it fell), or that crosses within the event's instant after it
+(`_coincidentCrossings`), changes where that is its change (a true one's rises, a false one's falls) and its value at
+the left limit did not change already; then the event iteration at the event.
 Re-evaluated there, a hair off its bound, the relation kept its value where an algebraic loop solved inside the
 equations gave its last digits from another guess, and the same crossing was found again in every step (MSL EngineV6's
 piston speed at dead center). A time event (a relation of time and parameters crossed): the event iteration with the
@@ -307,11 +345,12 @@ function affectCrossing!(integrator::DiffEqBase.DEIntegrator, events::AbstractVe
     c.equations!(du, a, integrator.u, p, t, NO_CROSSINGS, false)
     p.aleft .= a
   end
+  local fired::Vector{Int8} = _coincidentCrossings(integrator, events, tl, ul)
   local timed::Bool = false
-  for k::Int in eachindex(events)
-    (events[k] != 0 && c.relationSlot[k] && p.rel[k] == before[k] && p.rel[k] == (events[k] > 0)) &&
+  for k::Int in eachindex(fired)
+    (fired[k] != 0 && c.relationSlot[k] && p.rel[k] == before[k] && p.rel[k] == (fired[k] > 0)) &&
       (p.rel[k] = !p.rel[k])
-    timed |= events[k] != 0 && c.timeSlot[k]
+    timed |= fired[k] != 0 && c.timeSlot[k]
   end
   local hyst::Float64 = p.hyst[1]
   timed && (p.hyst[1] = 0.0)
