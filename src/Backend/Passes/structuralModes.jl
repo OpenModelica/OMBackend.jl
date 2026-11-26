@@ -60,14 +60,14 @@ end
 The models of the structural modes of `model` (OMJL's `structuralmode`), in the modes' order: each the mode's variables
 and system with the top level's (copies: the passes change them in place), named `<model>.<mode>`, without modes.
 The explicit transitions from the mode (`structuralTransition(mode, to, condition)`) are its structural when-equations
-of the switch (`IR.TRANSITION`, `transitionWhen`). A model whose top level is not one continuous partition, or with a
-recompilation besides its modes, is not taken (UnsupportedLowering).
+of the switch (`IR.TRANSITION`, `transitionWhen`); a recompilation of the top level is one of each mode (the model's
+modes recompiled together, `simulateModes`). A model whose top level is not one continuous partition is not taken
+(UnsupportedLowering).
 """
 function modeModels(model::IR.Model)::Vector{IR.Model}
   isempty(model.modes) && throw(ArgumentError("$(model.name): no structural modes"))
   (length(model.continuous) == 1 && isempty(model.clocked)) ||
     unsupported("structural modes in a model of several partitions or clocks", model.name)
-  model.frontendModel === nothing || unsupported("structural modes and a recompilation in one model", model.name)
   local top::IR.Partition = model.continuous[1]
   local names::Set{String} = Set{String}(m.name for m in model.modes)
   for t::IR.StructuralTransition in model.transitions

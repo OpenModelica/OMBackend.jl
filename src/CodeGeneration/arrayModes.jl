@@ -65,10 +65,12 @@ function structuralModesModule(name::String, modes::Vector{Tuple{String, Expr}},
     const MODES = Dict{String, Module}($(pairs...))
     const INITIAL_MODE = $(initialMode)
     const MODEL_NAME = $(name)
-    #= the frontend's model of each mode a recompilation changes, and the modes recompiled during the simulations, by
-       the mode, element and value of their change (`_recompiledMode`) =#
-    const FRONTEND_MODELS = IdDict{Module, Any}(MODES[INITIAL_MODE] => $(QuoteNode(frontendModel)))
-    const RECOMPILED = Dict{Tuple{Module, String, Float64}, Module}()
+    #= of each mode the modes it switches to by name (its family: the model's modes, or those of a recompilation of
+       them) and the frontend's model a recompilation changes; the families recompiled during the simulations, by the
+       family, element and value of their change (`_recompiledMode`) =#
+    const FAMILIES = IdDict{Module, Dict{String, Module}}(m => MODES for m in values(MODES))
+    const FRONTEND_MODELS = IdDict{Module, Any}(m => $(QuoteNode(frontendModel)) for m in values(MODES))
+    const RECOMPILED = Dict{Tuple{UInt, String, Float64}, Dict{String, Module}}()
 
     function $(Symbol(name, "Model"))(tspan = (0.0, 1.0); parameters::AbstractDict = Dict{String, Any}())
       local m::Module = MODES[INITIAL_MODE]
@@ -88,7 +90,8 @@ end
 The simulation of the array model of a variable structure system (`model`, `structuralModesModule`) over `tspan`: its
 initial mode's from the start, then at each structural change (`_structuralChange!`, which ends the mode's run) the
 next mode's from the change to the end, started from the values at the change (`_valuesAtEnd`) by name (`_carried`):
-an explicit transition's target mode, or the mode recompiled with the element's new value (`_recompiledMode`). The
+an explicit transition's target mode of the mode's family (`FAMILIES`), or the mode of that name of the family
+recompiled with the element's new value (`_recompiledMode`). The
 solutions of the modes, in their order. `parameters` reach each mode that has them; the solver options
 (`kwargs`) each mode's run. Modes that change again at the instant they start, `MODE_CHANGES_AT_AN_INSTANT` times, stop
 the simulation (an error: the changes do not settle).
@@ -120,11 +123,11 @@ function simulateModes(model::Module, tspan::Tuple{Real, Real}, solver; paramete
     local changes::Vector{Tuple{Symbol, String, Symbol}} = Base.invokelatest(getglobal, mode, :STRUCTURAL_CHANGES)
     local (kind::Symbol, target::String, valueType::Symbol) = changes[k]
     if kind === :transition
-      local next::Module = model.MODES[target]
+      local next::Module = model.FAMILIES[mode][target]
       starts = Base.invokelatest(_carried, values, next, modeName, target)
       (mode, modeName) = (next, target)
     else
-      mode = _recompiledMode(model, mode, target, _typedValue(value, valueType))
+      mode = _recompiledMode(model, mode, modeName, target, _typedValue(value, valueType))
       starts = Base.invokelatest(_carried, values, mode, modeName, modeName)
     end
     atInstant = sol.t[end] == t0 ? atInstant + 1 : 0
@@ -192,27 +195,36 @@ function _typedValue(value::Float64, valueType::Symbol)::Union{Bool, Int, Float6
 end
 
 """
-    _recompiledMode(model, origin, element, value) -> Module
+    _recompiledMode(model, origin, modeName, element, value) -> Module
 
-The mode the mode `origin` of `model` gives with its element `element` set to `value` (a recompilation): compiled
-before for the same change (`model.RECOMPILED`), or now from the frontend's model of `origin`
-(`OMBackend.recompiledArrayModule`), evaluated into `model`, with its own frontend model for the changes after it.
+The mode `modeName` of the family (`model.FAMILIES`) the family of the mode `origin` of `model` gives with its element
+`element` set to `value` (a recompilation: all its modes, a later transition goes to one of them): compiled before
+for the same change (`model.RECOMPILED`), or now from the frontend's model of `origin`
+(`OMBackend.recompiledArrayModules`), evaluated into `model`, with their own frontend model for the changes after it.
 """
-function _recompiledMode(model::Module, origin::Module, element::String, value::Union{Bool, Int, Float64})::Module
-  local key::Tuple{Module, String, Float64} = (origin, element, Float64(value))
-  local cached::Union{Nothing, Module} = get(model.RECOMPILED, key, nothing)
-  cached === nothing || return cached
+function _recompiledMode(model::Module, origin::Module, modeName::String, element::String,
+                         value::Union{Bool, Int, Float64})::Module
+  local family::Dict{String, Module} = model.FAMILIES[origin]
+  local key::Tuple{UInt, String, Float64} = (objectid(family), element, Float64(value))
+  local cached::Union{Nothing, Dict{String, Module}} = get(model.RECOMPILED, key, nothing)
+  cached === nothing || return cached[modeName]
   local frontendModel::Any = get(model.FRONTEND_MODELS, origin, nothing)
   frontendModel === nothing &&
     error(string("array model ", model.MODEL_NAME, ": a recompilation of ", element, " in a mode without its frontend model"))
   local moduleName::String = string("Recompiled_", length(model.RECOMPILED) + 1)
-  local (code::Expr, changed::Any) =
-    _OMBACKEND.recompiledArrayModule(model.MODEL_NAME, frontendModel, element, value, moduleName)
-  Core.eval(model, code)
-  local recompiled::Module = Base.invokelatest(getglobal, model, Symbol(moduleName))
+  local (codes::Vector{Tuple{String, Expr}}, changed::Any) =
+    _OMBACKEND.recompiledArrayModules(model.MODEL_NAME, frontendModel, element, value, moduleName)
+  local recompiled::Dict{String, Module} = Dict{String, Module}()
+  for (name::String, code::Expr) in codes
+    Core.eval(model, code)
+    recompiled[name] = Base.invokelatest(getglobal, model, code.args[2]::Symbol)
+  end
+  for m::Module in values(recompiled)
+    model.FAMILIES[m] = recompiled
+    model.FRONTEND_MODELS[m] = changed
+  end
   model.RECOMPILED[key] = recompiled
-  model.FRONTEND_MODELS[recompiled] = changed
-  return recompiled
+  return recompiled[modeName]
 end
 
 "Whether the array module `mode` has the parameter or parameter element `name` (Modelica's or canonical)."

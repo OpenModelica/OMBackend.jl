@@ -259,6 +259,47 @@ _vssValue(sol, name::String)::Float64 = OMBackend.variableValues(sol, name)[end]
     @test _vssValue(sols[2], "k") == 4.0
   end
 
+  #= A recompilation in a model of structural modes recompiles all its modes (a family, `simulateModes`): the run goes
+     on in the mode of the same name, a later transition to a mode of the recompiled family. =#
+  @testset "Structural modes and a recompilation in one model" begin
+    local program = OMFrontend.OpenModelicaParser.Modelica"""
+      model VSSModesGrow
+        parameter Integer N = 2;
+        model A
+          parameter Integer n;
+          Real x[n](each start = 1.0);
+        equation
+          der(x) = -x;
+        end A;
+        model B
+          parameter Integer n;
+          Real x[n](each start = 0.0);
+        equation
+          der(x) = ones(n);
+        end B;
+        structuralmode A a(n = N);
+        structuralmode B b(n = N);
+      equation
+        initialStructuralState(a);
+        structuralTransition(a, b, time >= 0.5);
+        when time > 0.25 then
+          recompilation(N, 3);
+        end when;
+      end VSSModesGrow;
+      """
+    local name::String = _vssTranslate(program, "VSSModesGrow")
+    @test name in OMBackend.ARRAY_PRESERVE_DE_MODELS
+    local sols = OMBackend.simulate(name; tspan = (0.0, 1.0), reltol = 1e-10, abstol = 1e-10)
+    #= a with N = 2 to 0.25, a with N = 3 (a.x[3] from its start 1) to 0.5, b with N = 3 =#
+    @test length(sols) == 3
+    @test [length(s.u[end]) for s in sols] == [2, 3, 3]
+    @test sols[3].u[end] ≈ [exp(-0.5) + 0.5, exp(-0.5) + 0.5, exp(-0.25) + 0.5] atol = 1e-8
+    #= one family recompiled, its b the mode the transition took =#
+    local m::Module = getfield(OMBackend, Symbol(name))
+    @test length(m.RECOMPILED) == 1
+    @test sols[3].prob.p.model === only(values(m.RECOMPILED))["b"]
+  end
+
   #= A structural change the initialization reaches (`when initial()`): kept in the start state (`ArrayStartState`),
      which the solve restores (it was reset there and lost), and the mode's run ends at its start. =#
   @testset "A recompilation at the initialization" begin
