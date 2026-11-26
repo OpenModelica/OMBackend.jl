@@ -1,8 +1,7 @@
-#= exportModel's Executable: an array model's package for juliac, its main run in this session and, for one model,
-   built with juliac and run (Author: John Tinnerholm). Needs exportModelTests.jl's models and helpers. =#
+#= exportModel's Executable: an array model's package for juliac, its main run in this session; juliac itself is
+   experimental and not run here (Author: John Tinnerholm). Needs exportModelTests.jl's models and helpers. =#
 using Test
 import OMBackend
-import JuliaC
 import Pkg
 
 "The time points and states of a CSV written by an executable (`time,<names>` and a row per point)."
@@ -90,34 +89,18 @@ end
   end
 end
 
-"""
-    buildExecutable(dir::String) -> String
-
-The executable of the package `dir` built with juliac (JuliaC.jl, the test environment's: OMBackend does not depend on
-it) into `dir/build`, after its environment is instantiated; its path.
-"""
-function buildExecutable(dir::String)::String
-  Pkg.activate(() -> Pkg.instantiate(), dir)
-  cd(dir) do
-    withenv("OMBACKEND_NO_PRECOMPILE_WORKLOAD" => "true") do
-      JuliaC.main(String["--output-exe", "model", "--bundle", joinpath(dir, "build"), "--trim=unsafe-warn",
-                         "--experimental", dir])
-    end
-  end
-  return joinpath(dir, "build", "bin", "model")
-end
-
-@testset "exportModel: an Executable built with juliac" begin
+@testset "exportModel: an Executable's directory (a trailing separator, its mode)" begin
   local name::String = exportTranslate("ExportModel", OMFrontend.translateToSCode(EXPORT_PROGRAM); scalarize = false)
-  local (expected, dir, _) = exportExecutable(name)
-  local exe::String = buildExecutable(dir)
-  @test isfile(exe)
-  local csv::String = joinpath(mktempdir(), "result.csv")
-  @test success(`$exe $csv`)
-  local (names, ts, us) = readResultCSV(csv)
-  @test names == ["x"]
-  @test ts[end] == 1.0
-  @test us[end] ≈ expected.u[end] rtol = 1e-8
-  #= without a file: standard output =#
-  @test readchomp(`$exe`) == chomp(read(csv, String))
+  try
+    local parent::String = mktempdir()
+    local dir::String = joinpath(parent, "pkg") * "/"
+    @test OMBackend.exportModel(dir, name, OMBackend.Executable()) == dir
+    @test isfile(joinpath(dir, "Project.toml"))
+    #= no staging directory left beside it; the mode any new directory gets (the umask's), not 700 =#
+    mkdir(joinpath(parent, "reference"))
+    @test sort(readdir(parent)) == ["pkg", "reference"]
+    @test filemode(joinpath(parent, "pkg")) & 0o777 == filemode(joinpath(parent, "reference")) & 0o777
+  finally
+    OMBackend.forgetModel(name)
+  end
 end

@@ -42,8 +42,11 @@ built with juliac: its directory holds `Project.toml`, `src/<Package>.jl` with t
 the model as [`JuliaSource`](@ref) (`comments`). The executable simulates the model over (`startTime`, `stopTime`)
 with Rodas5P (a named linear solver, KLU or LU), tolerances `reltol` and `abstol`, and writes the time points and
 states as CSV to the file given as its argument, or to standard output. Its problem and integrator are made when
-juliac builds it. Exit code 0 for a successful solve, 1 for a failed one. OMBackend does not depend on juliac
-(JuliaC.jl); with an environment that has it, after `Pkg.instantiate()` in the package's directory `pkg`:
+juliac builds it. Exit code 0 for a successful solve, 1 for a failed one, 2 for other arguments than one file.
+Experimental, as juliac is: OMBackend's tests run the main function in a session, not a juliac build; a model with
+external objects (tables) does not run yet (their C objects are made when juliac builds it). OMBackend does
+not depend on juliac (JuliaC.jl); with an environment that has it, after `Pkg.instantiate()` in the package's
+directory `pkg`:
 
 ```
 julia --project=<env with JuliaC> -e 'using JuliaC; JuliaC.main(ARGS)' -- --output-exe model --bundle build --trim=unsafe-warn --experimental pkg
@@ -87,7 +90,9 @@ function exportModel(path::String, modelName::String, format::Executable)::Strin
   local name::String = canonicalName(modelName)
   (name in ARRAY_PRESERVE_DE_MODELS && haskey(COMPILED_MODELS_ARRAY_PRESERVE_DE, name)) ||
     error("exportModel: an Executable needs the array code (translate with scalarize = false); $(name) has none")
-  (ispath(path) && !(isdir(path) && isempty(readdir(path)))) &&
+  #= the directory without a trailing separator (`pkg/`): its parent is where it is staged =#
+  local target::String = dirname(joinpath(normpath(abspath(path)), ""))
+  (ispath(target) && !(isdir(target) && isempty(readdir(target)))) &&
     error("exportModel: $(path) exists; an Executable is written to a new or empty directory")
   format.startTime < format.stopTime || error("exportModel: the start time is not before the stop time")
   local source::IOBuffer = IOBuffer()
@@ -98,18 +103,20 @@ function exportModel(path::String, modelName::String, format::Executable)::Strin
   local main::Expr = CodeGeneration.ArrayPreserveDE.generateExecutableMain(packageName, modelModule,
     string(modelModule, ".jl"), (format.startTime, format.stopTime); reltol = format.reltol, abstol = format.abstol)
   local mainText::String = _formattedJulia(sprint(print, _sourceCode(main, false); context = :module => _ExportPrint))
-  #= written beside `path`, then moved there: a failed export leaves nothing =#
-  local parent::String = dirname(abspath(path))
+  #= written beside `path`, then moved there: a failed export leaves nothing. `mkdir`, not `mktempdir` (mode 700):
+     the package's mode is the umask's, as any directory's =#
+  local parent::String = dirname(target)
   mkpath(parent)
-  local staging::String = mktempdir(parent; prefix = ".omb-export-")
+  local staging::String = joinpath(parent, ".omb-export-" * basename(tempname(parent; cleanup = false)))
+  mkdir(staging)
   try
     mkpath(joinpath(staging, "src"))
     write(joinpath(staging, "src", string(modelModule, ".jl")), modelText)
     write(joinpath(staging, "src", string(packageName, ".jl")), OSMC_COPYRIGHT_HEADER,
           _executableUsage(name, packageName), mainText, endswith(mainText, "\n") ? "" : "\n")
     write(joinpath(staging, "Project.toml"), _executableProject(packageName, _directImports(modelText)))
-    isdir(path) && rm(path)
-    mv(staging, path)
+    isdir(target) && rm(target)
+    mv(staging, target)
   catch
     rm(staging; force = true, recursive = true)
     rethrow()

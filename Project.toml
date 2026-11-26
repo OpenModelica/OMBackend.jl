@@ -69,7 +69,6 @@ SymbolicUtils = "4"
 Symbolics = "7"
 
 [extras]
-JuliaC = "acedd4c2-ced6-4a15-accc-2607eb759ba2"
 JuliaFormatter = "98e50ef6-434e-11e9-1051-2b60c6c9e899"
 OMFrontend = "b10394b5-f439-4073-a0c5-e09cb00cf46c"
 Pkg = "44cfe95a-1eb2-52ea-b672-e2afdf69b78f"
@@ -79,4 +78,4 @@ SparseArrays = "2f01184e-e22b-5df5-ae63-d93ebab69eaf"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
 [targets]
-test = ["JuliaC", "JuliaFormatter", "OMFrontend", "Pkg", "Plots", "SparseArrays", "Test"]
+test = ["JuliaFormatter", "OMFrontend", "Pkg", "Plots", "SparseArrays", "Test"]

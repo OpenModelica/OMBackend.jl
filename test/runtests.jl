@@ -519,7 +519,7 @@ TEST_GROUP == "kept" || @testset "OMBackend" begin
 
   #= ── 20w2b. A translated model exported as Julia source, loaded from its file and simulated ── =#
   include("exportModelTests.jl")
-  #= an array model's executable: its package, its main, a juliac build =#
+  #= an array model's executable: its package, its main run in this session =#
   include("exportExecutableTests.jl")
 
   #= ── 20w3. The initial value of a state from an alias equation ── =#
