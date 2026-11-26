@@ -61,16 +61,18 @@ include("$CURRENT_DIRECTORY/CodeGeneration/IMTKGen.jl")
 include("backendUtils.jl")
 #= Finally add the API=#
 include("backendAPI.jl")
+include("Export/exportModel.jl")
 using .CodeGeneration: ModelicaAssertionError, isStepControl, isEventCallback
 using .SimCode: EliminationOptions
-#= The public API: these names hold for all of 1.x (docs/src/api.md, test/publicAPITests.jl). Nothing is exported:
+#= The public API: these names hold for all of 1.x (docs/src/api.md, test/publicAPITests.jl; 1.3.0 replaced printModel,
+   modelToString and writeModelToFile with exportModel). Nothing is exported:
    call them as `OMBackend.name`. Every other name is internal and may change in any release. =#
 public translate, BackendMode, IMTK_MODE, MTK_MODE, EliminationOptions, explainIndexReduction,
   scalarizedFallbackReason, canonicalName
 public simulate, resimulate, getMTKProblem, defaultSolver, daeFallbackSolver, variableValues,
   eventCallbacks, isEventCallback, isStepControl, ModelicaAssertionError, plot
 public withTunableParameters, isTunable, pristineParameters, buildId
-public availableModels, printModel, modelToString, writeModelToFile
+public availableModels, exportModel, ExportFormat, JuliaSource
 public clearCaches!, forgetModel
 #= The names 1.0 renamed, kept for 1.x with a deprecation warning: not public. =#
 include("deprecated.jl")

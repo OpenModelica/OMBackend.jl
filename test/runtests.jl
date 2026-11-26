@@ -517,6 +517,9 @@ TEST_GROUP == "kept" || @testset "OMBackend" begin
   #= ── 20w2. What the generated model's variables are (SimCodeKind, IfConditionParameter) ── =#
   include("kindMetadataTests.jl")
 
+  #= ── 20w2b. A translated model exported as Julia source, loaded from its file and simulated ── =#
+  include("exportModelTests.jl")
+
   #= ── 20w3. The initial value of a state from an alias equation ── =#
   include("aliasInitialValueTests.jl")
 

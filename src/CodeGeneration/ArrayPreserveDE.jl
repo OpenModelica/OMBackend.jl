@@ -3604,7 +3604,7 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
       return (ODEProblem(f, u0, tspan, p), cb)
     end
 
-    function simulate(tspan = (0.0, 1.0), solver = Tsit5(); parameters::AbstractDict = Dict{String, Any}(),
+    function simulate(tspan = (0.0, 1.0), solver = OMBackend.defaultSolver(); parameters::AbstractDict = Dict{String, Any}(),
                       abstol = $(DEFAULT_ABSTOL), kwargs...)
       local (ode, callbacks) = $(Symbol(modelName, "Model"))(tspan; parameters = parameters)
       local prob = $(_problemFor)(ode, solver)

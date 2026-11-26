@@ -32,7 +32,7 @@ end
 end
 
 #= Only the if-equations' condition parameters are marked, not the hysteresis or the homotopy parameter declared with
-   them; and the generated model, printed, parses (its kinds are constructor code). =#
+   them; and the generated model, exported, parses (its kinds are constructor code). =#
 @testset "If-condition parameters; the printed model" begin
   local CG::Module = OMBackend.CodeGeneration
   local sol = kindModel("Limiter", 1.0)
@@ -41,7 +41,7 @@ end
   @test marked[String(CG.ZC_HYSTERESIS)] == false && marked[String(CG.HOMOTOPY_LAMBDA)] == false
   @test any(((n, m),) -> startswith(n, "ifCond") && m, marked)
   local path::String = joinpath(mktempdir(), "Limiter.jl")
-  OMBackend.writeModelToFile(OMBackend.canonicalName("KindMetadata.Limiter"), path)
+  OMBackend.exportModel(path, OMBackend.canonicalName("KindMetadata.Limiter"))
   local code::Expr = Meta.parseall(read(path, String))
   @test !any(e -> e isa Expr && e.head in (:error, :incomplete), code.args)
 end

@@ -816,14 +816,7 @@ function generateIMTKTargetCode(simCode::SimCode.SIM_CODE)::Tuple{String, Expr}
   return (modelName, modelCode)
 end
 
-"""
-The generated code of a model for writing it out: the array path's module for an array
-model, else the MTK path's code.
-"""
-_writtenModel(modelName) = modelName in ARRAY_PRESERVE_DE_MODELS && haskey(COMPILED_MODELS_ARRAY_PRESERVE_DE, modelName) ?
-  COMPILED_MODELS_ARRAY_PRESERVE_DE[modelName][1] : getCompiledModel(modelName)
-
-function getCompiledModel(modelName)
+function getCompiledModel(modelName::String)::Expr
   haskey(COMPILED_MODELS_MTK, modelName) ||
     error("Model $(modelName) is not compiled (OMBackend.translate first). Translated: $(join(availableModels(), ", "))")
   return COMPILED_MODELS_MTK[modelName][1]
@@ -901,92 +894,6 @@ function _evalModelArrayPreserveDE(modelName::String, modelCode::Expr)::Nothing
   ARRAY_MODULES[modelName] = (_modelModule(Symbol(modelName)), h)
   return nothing
 end
-
-"""
-
-```
-writeModelToFile(modelName::String, filePath::String; keepComments = true, keepBeginBlocks = true)
-```
-  Writes a model to file by default the file is formatted and comments are kept.
-"""
-function writeModelToFile(modelName::String, filePath::String; keepComments = true, keepBeginBlocks = true)
-  model = _writtenModel(modelName)
-  try
-    mAsStr = modelToString(modelName; MTK = true,
-                           keepComments = keepComments,
-                           keepBeginBlocks = keepBeginBlocks)
-    if model.head == :module
-      #= Module expression serializes cleanly, no begin/end stripping needed =#
-      mAsStr = OSMC_COPYRIGHT_HEADER * mAsStr
-      writeStringToFile(filePath, mAsStr)
-    else
-      try
-        #= Replace top level begin/end for legacy quote blocks =#
-        beginIdx = last(findfirst("begin", mAsStr)) + 1
-        endIdx = first(findlast("end",  mAsStr)) - 1
-        mAsStr = mAsStr[beginIdx:endIdx]
-        mAsStr = OSMC_COPYRIGHT_HEADER * mAsStr
-        writeStringToFile(filePath, mAsStr)
-      catch e
-        @error "Error removing initial begin/end pairs" exception=(e, catch_backtrace())
-      end
-    end
-  catch e
-    @error "Failed writing $model to file: $filePath" exception=(e, catch_backtrace())
-  end
-end
-
-"""
-    Write the contents of a string to file.
-"""
-function writeStringToFile(fileName::String, contents::String)
-  local fdesc = open(fileName, "w")
-  write(fdesc, contents)
-  close(fdesc)
-end
-
-"""
-  Prints a model.
-  If the specified model exists. Print it to stdout.
-"""
-function printModel(modelName::String; MTK = true, keepComments = true, keepBeginBlocks = true)
-  try
-    println(modelToString(modelName::String; MTK = MTK, keepComments = keepComments, keepBeginBlocks = keepBeginBlocks))
-  catch
-    @error "Model: $(modelName) is not compiled. Available models are: $(join(availableModels(), ", "))"
-    error("Error printing model: $(modelName)")
-  end
-end
-
-"""
- Converts a given backend model to a string
-"""
-function modelToString(modelName::String; MTK = true, keepComments = true, keepBeginBlocks = true)
-  local model::Expr = _writtenModel(modelName)
-  strippedModel = "$model"
-  #= Remove all the redundant blocks from the model =#
-  if keepComments == false
-    strippedModel = CodeGeneration.stripComments(model)
-  end
-  if keepBeginBlocks == false
-    strippedModel = CodeGeneration.stripBeginBlocks(model)
-  end
-  local modelStr::String = "$strippedModel"
-  local formattedResults
-  try
-    formattedResults = formatText(modelStr;
-                                  remove_extra_newlines = true,
-                                  indent = 4,
-                                  margin = 200,
-                                  always_use_return = true)
-  catch e
-    isFatal(e) && rethrow()
-    @warn "Julia Formatter failed to format the output results due to $(e)"
-    formattedResults = modelStr
-  end
-  return formattedResults
-end
-
 
 """
     availableModels() -> Vector{String}

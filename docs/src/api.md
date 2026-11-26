@@ -4,7 +4,8 @@ CurrentModule = OMBackend
 
 # API reference
 
-The names on this page are OMBackend's public API: they are marked `public` and hold for all of 1.x.
+The names on this page are OMBackend's public API: they are marked `public` and hold for all of 1.x, except: 1.3.0
+replaced `printModel`, `modelToString` and `writeModelToFile` with [`exportModel`](@ref).
 Nothing is exported: call them as `OMBackend.name`. Every other name is internal and may change in any release.
 
 ## Translate
@@ -48,13 +49,13 @@ OMBackend.pristineParameters
 OMBackend.buildId
 ```
 
-## Inspect and write models
+## Inspect and export models
 
 ```@docs
 OMBackend.availableModels
-OMBackend.printModel
-OMBackend.modelToString
-OMBackend.writeModelToFile
+OMBackend.exportModel
+OMBackend.ExportFormat
+OMBackend.JuliaSource
 ```
 
 ## Caches

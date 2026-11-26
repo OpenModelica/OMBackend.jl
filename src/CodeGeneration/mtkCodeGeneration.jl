@@ -519,7 +519,7 @@ simCodeKinds(simCode::SC.SIM_CODE)::Vector{Tuple{Symbol, SimCodeKind}} =
 """
     simCodeKindsExpr(simCode) -> Expr
 
-Code that builds `simCodeKinds(simCode)`, for the generated model: printed (`writeModelToFile`), it is Julia that
+Code that builds `simCodeKinds(simCode)`, for the generated model: exported (`exportModel`), it is Julia that
 parses, where the values themselves print in OMJLIR's notation.
 """
 function simCodeKindsExpr(simCode::SC.SIM_CODE)::Expr
