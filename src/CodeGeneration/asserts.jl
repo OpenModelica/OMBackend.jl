@@ -61,14 +61,20 @@ Base.showerror(io::IO, e::ModelicaAssertionError) =
 """
     solveStoppedAtStart(prob, solver, message; kwargs...)
 
-The solve of a model that reached a `terminate()` at the initialization: it ends at its start (OpenModelica ends the
-simulation there, its result the initial values), the integrator initialized and no step taken (a callback's
-`initialize` cannot end it: the integrator's initialization reads the stop times after it).
+The solve of a model that reached a `terminate()` at the initialization (its `message`): it ends at its start
+(OpenModelica ends the simulation there, its result the initial values), the integrator initialized and no step taken
+(a callback's `initialize` cannot end it: the integrator's initialization reads the stop times after it). `message`
+`nothing`: an array model's structural change at the initialization (a `when initial()` of a recompilation), the run
+of its mode ends there with Success (`simulateModes` goes on in the next).
 """
-function solveStoppedAtStart(prob, solver, message::String; kwargs...)
+function solveStoppedAtStart(prob, solver, message::Union{Nothing, String}; kwargs...)
   local integrator = DiffEqBase.init(prob, solver; kwargs...)
-  @info "Modelica terminate() at the initialization" message
-  DiffEqBase.terminate!(integrator)
+  if message === nothing
+    DiffEqBase.terminate!(integrator, DiffEqBase.SciMLBase.ReturnCode.Success)
+  else
+    @info "Modelica terminate() at the initialization" message
+    DiffEqBase.terminate!(integrator)
+  end
   return DiffEqBase.solve!(integrator)
 end
 

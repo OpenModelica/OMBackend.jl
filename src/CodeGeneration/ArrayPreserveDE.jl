@@ -200,11 +200,13 @@ function _parameterRules(symbols::Vector{Symbol}, deps::Vector{Vector{Symbol}}, 
 end
 
 """
-    ArrayStartState(discrete, wcond, wnew, ndlog, upre, ureinit, loops, blocks, nRootLog, nObjectLog)
+    ArrayStartState(discrete, wcond, wnew, ndlog, upre, ureinit, loops, blocks, nRootLog, nObjectLog, structural)
 
 A problem's state after its initialization (`ArrayRuntimeState.atStart`): the discrete state (`_discreteState`), the
 when-conditions, the length of the event log, the pre() and reinit buffers of the states, the loops' roots (the
-families' and the large blocks' guesses) and the length of their log, the length of the external objects' call log.
+families' and the large blocks' guesses) and the length of their log, the length of the external objects' call log,
+the structural change the initialization reached (`_structuralChange!`; (0, 0.0): none; a `when initial()` of a
+recompilation: the mode's run ends at its start).
 """
 struct ArrayStartState
   discrete::Tuple{Vector{Float64}, Vector{Float64}, Vector{Bool}, Vector{Float64}}
@@ -217,6 +219,7 @@ struct ArrayStartState
   blocks::Vector{Vector{Float64}}
   nRootLog::Int
   nObjectLog::Int
+  structural::Tuple{Int, Float64}
 end
 
 """
@@ -818,7 +821,7 @@ end
 _startState(p::ArrayModelParameters)::ArrayStartState =
   ArrayStartState(_discreteState(p), copy(p.wcond), copy(p.wnew), length(p.dlog), copy(p.upre), copy(p.ureinit),
                   map(copy, p.loops), Vector{Float64}[copy(b.y) for b in p.blocks], length(p.state.rootLog),
-                  length(p.state.objectLog))
+                  length(p.state.objectLog), p.state.structural)
 
 """
     _checkBlocksSolved(p)
@@ -973,7 +976,7 @@ function _restoreStart!(p::ArrayModelParameters)::Nothing
   fill!(p.sampleActive, false)
   p.state.terminal = false
   p.state.pending = (NaN, Float64[]); p.state.leftLimit = (NaN, Float64[]); p.state.terminated = nothing
-  p.state.structural = (0, 0.0)
+  p.state.structural = s.structural
   empty!(p.state.whenMemo)
   return nothing
 end
@@ -3037,9 +3040,11 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
   local jacProto::Union{Nothing, Expr} = pattern === nothing ? nothing :
     :(Symbolics.SparseArrays.sparse($(pattern[1]), $(pattern[2]), ones($(length(pattern[1]))), $nStates, $nStates, $(_keepFirst)))
   local paramsType::UnionAll = ArrayModelParameters
-  #= a terminate() at the initialization: the problem ends at its start =#
-  local endsAtStart::Union{Nothing, Expr} = hasTerminate ?
-    :(p.state.terminated === nothing || return (ODEProblem(f, u0, (tspan[1], tspan[1]), p), cb)) : nothing
+  #= a terminate() or a structural change at the initialization: the problem ends at its start =#
+  local hasStructural::Bool = !isempty(g.structuralChanges)
+  local endsAtStart::Union{Nothing, Expr} = hasTerminate || hasStructural ?
+    :((p.state.terminated === nothing && first(p.state.structural) == 0) ||
+      return (ODEProblem(f, u0, (tspan[1], tspan[1]), p), cb)) : nothing
   #= the large functions' statements in functions of bounded size (_splitStatements), the calls of the functions not
      called as impure shared in each (`_shareCalls`) =#
   local pure::Set{Symbol} = Set{Symbol}(Symbol(nm) for nm::String in keys(g.functions) if !(nm in g.impure))
@@ -3771,10 +3776,10 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
       local initKw = (; $(_initializeKwargs)(prob, kwargs, abstol)..., $(_stepKwargs)(kwargs, tspan, N_RELATIONS)...,
                       $(solverVerbosity)(kwargs)...)
       OMBackend.CodeGeneration._resetRHSError!()
-      local sol = $(hasTerminate ?
-                    :(prob.p.state.terminated === nothing ?
+      local sol = $(hasTerminate || hasStructural ?
+                    :(prob.p.state.terminated === nothing && first(prob.p.state.structural) == 0 ?
                         DifferentialEquations.solve(prob, solver; callback = callbacks, abstol = abstol, initKw..., kwargs...) :
-                      $(solveStoppedAtStart)(prob, solver, something(prob.p.state.terminated); callback = callbacks,
+                      $(solveStoppedAtStart)(prob, solver, prob.p.state.terminated; callback = callbacks,
                                              abstol = abstol, initKw..., kwargs...)) :
                     :(DifferentialEquations.solve(prob, solver; callback = callbacks, abstol = abstol, initKw..., kwargs...)))
       #= an error that every smaller step met ends the run =#

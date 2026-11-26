@@ -199,4 +199,88 @@ _vssValue(sol, name::String)::Float64 = OMBackend.variableValues(sol, name)[end]
     @test sol.t[end] ≈ 0.5 atol = 1e-12
     @test _vssValue(sol, "k") == 3.0
   end
+
+  #= An event at the start instant in the solve's initialization (a sample's first tick, `_sampleStart!`) that ends
+     the run: terminate! left the integrator no stop, and its first step size read one (a BoundsError). =#
+  @testset "A terminate() at the first sample instant ends the run at the start" begin
+    local program = OMFrontend.OpenModelicaParser.Modelica"""
+      model TerminateAtFirstSample
+        Real x(start = 1.0);
+        Integer k(start = 0);
+      equation
+        der(x) = -x;
+        when sample(0.0, 0.25) then
+          k = pre(k) + 1;
+        end when;
+        when k >= 1 then
+          terminate("the first tick");
+        end when;
+      end TerminateAtFirstSample;
+      """
+    local name::String = _vssTranslate(program, "TerminateAtFirstSample")
+    @test name in OMBackend.ARRAY_PRESERVE_DE_MODELS
+    local sol = OMBackend.simulate(name; tspan = (0.0, 0.9), reltol = 1e-10, abstol = 1e-10)
+    @test sol.retcode == ReturnCode.Terminated
+    @test sol.t[end] == 0.0
+    @test _vssValue(sol, "k") == 1.0 && _vssValue(sol, "x") == 1.0
+  end
+
+  @testset "A transition at the first sample instant: the next mode from the start" begin
+    local program = OMFrontend.OpenModelicaParser.Modelica"""
+      model VSSFirstTick
+        model A
+          Real x(start = 1.0);
+        equation
+          der(x) = -x;
+        end A;
+        model B
+          Real x(start = 0.0);
+        equation
+          der(x) = 1.0;
+        end B;
+        structuralmode A a;
+        structuralmode B b;
+        Integer k(start = 0);
+      equation
+        when sample(0.0, 0.25) then
+          k = pre(k) + 1;
+        end when;
+        initialStructuralState(a);
+        structuralTransition(a, b, k >= 1);
+      end VSSFirstTick;
+      """
+    local name::String = _vssTranslate(program, "VSSFirstTick")
+    @test name in OMBackend.ARRAY_PRESERVE_DE_MODELS
+    local sols = OMBackend.simulate(name; tspan = (0.0, 0.9), reltol = 1e-10, abstol = 1e-10)
+    @test length(sols) == 2
+    @test sols[1].t[end] == 0.0 && _vssValue(sols[1], "k") == 1.0
+    #= b.x from a.x = 1 at 0; the ticks at 0.25, 0.5, 0.75 in b =#
+    @test _vssValue(sols[2], "b.x") ≈ 1.9 atol = 1e-8
+    @test _vssValue(sols[2], "k") == 4.0
+  end
+
+  #= A structural change the initialization reaches (`when initial()`): kept in the start state (`ArrayStartState`),
+     which the solve restores (it was reset there and lost), and the mode's run ends at its start. =#
+  @testset "A recompilation at the initialization" begin
+    local program = OMFrontend.OpenModelicaParser.Modelica"""
+      model VSSInitialGrow
+        parameter Integer N = 2;
+        Real x[N](start = {i for i in 1:N});
+      equation
+        for i in 1:N loop
+          der(x[i]) = -x[i];
+        end for;
+        when initial() then
+          recompilation(N, 3);
+        end when;
+      end VSSInitialGrow;
+      """
+    local name::String = _vssTranslate(program, "VSSInitialGrow")
+    @test name in OMBackend.ARRAY_PRESERVE_DE_MODELS
+    local sols = OMBackend.simulate(name; tspan = (0.0, 1.0), reltol = 1e-10, abstol = 1e-10)
+    @test length(sols) == 2
+    @test sols[1].t[end] == 0.0 && sols[1].retcode == ReturnCode.Success
+    @test length(sols[2].u[end]) == 3
+    @test _vssValue(sols[2], "x[3]") ≈ 3 * exp(-1.0) atol = 1e-8
+  end
 end

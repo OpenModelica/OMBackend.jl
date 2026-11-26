@@ -141,15 +141,29 @@ the next mode), a terminate() reached (its message, p.state.terminated) the run.
 """
 function _terminateReached!(integrator::DiffEqBase.DEIntegrator)::Bool
   if first(integrator.p.state.structural) != 0
-    DiffEqBase.terminate!(integrator, DiffEqBase.SciMLBase.ReturnCode.Success)
+    _endRun!(integrator, DiffEqBase.SciMLBase.ReturnCode.Success)
     return false
   end
   local message::Union{Nothing, String} = integrator.p.state.terminated
   message === nothing && return true
   integrator.p.state.terminated = nothing
   @info "Modelica terminate() reached" message time = integrator.t
-  DiffEqBase.terminate!(integrator)
+  _endRun!(integrator, DiffEqBase.SciMLBase.ReturnCode.Terminated)
   return false
+end
+
+"""
+    _endRun!(integrator, retcode) -> Nothing
+
+`terminate!` of `integrator` with `retcode`. In its initialization (an event at the start instant in a callback's
+`initialize`: a sample's tick at the start, `_sampleStart!`) the start is kept as a stop: OrdinaryDiffEqCore's first
+step size, after the callbacks' initialization, reads the first stop (4.19.1: a BoundsError where terminate! left
+none). The solve ends there, no step taken.
+"""
+function _endRun!(integrator::DiffEqBase.DEIntegrator, retcode::DiffEqBase.SciMLBase.ReturnCode.T)::Nothing
+  DiffEqBase.terminate!(integrator, retcode)
+  integrator.iter == 0 && DiffEqBase.add_tstop!(integrator, integrator.t)
+  return nothing
 end
 
 """
@@ -176,7 +190,7 @@ function _eventAt!(integrator::DiffEqBase.DEIntegrator, sampleInstant::Bool = fa
   end
   @error string("[events] the event iteration did not settle at t = ", integrator.t,
                 " (relations switching back and forth: a chattering model); the simulation stops")
-  DiffEqBase.terminate!(integrator, DiffEqBase.SciMLBase.ReturnCode.Failure)
+  _endRun!(integrator, DiffEqBase.SciMLBase.ReturnCode.Failure)
   return false
 end
 
