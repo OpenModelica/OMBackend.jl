@@ -1,3 +1,38 @@
+#= /*
+* This file is part of OpenModelica.
+*
+* Copyright (c) 1998-2026, Open Source Modelica Consortium (OSMC),
+* c/o Linköpings universitet, Department of Computer and Information Science,
+* SE-58183 Linköping, Sweden.
+*
+* All rights reserved.
+*
+* THIS PROGRAM IS PROVIDED UNDER THE TERMS OF AGPL VERSION 3 LICENSE OR
+* THIS OSMC PUBLIC LICENSE (OSMC-PL) VERSION 1.8.
+* ANY USE, REPRODUCTION OR DISTRIBUTION OF THIS PROGRAM CONSTITUTES
+* RECIPIENT'S ACCEPTANCE OF THE OSMC PUBLIC LICENSE OR THE GNU AGPL
+* VERSION 3, ACCORDING TO RECIPIENTS CHOICE.
+*
+* The OpenModelica software and the OSMC (Open Source Modelica Consortium)
+* Public License (OSMC-PL) are obtained from OSMC, either from the above
+* address, from the URLs:
+* http://www.openmodelica.org or
+* https://github.com/OpenModelica/ or
+* http://www.ida.liu.se/projects/OpenModelica,
+* and in the OpenModelica distribution.
+*
+* GNU AGPL version 3 is obtained from:
+* https://www.gnu.org/licenses/licenses.html#GPL
+*
+* This program is distributed WITHOUT ANY WARRANTY; without
+* even the implied warranty of MERCHANTABILITY or FITNESS
+* FOR A PARTICULAR PURPOSE, EXCEPT AS EXPRESSLY SET FORTH
+* IN THE BY RECIPIENT SELECTED SUBSIDIARY LICENSE CONDITIONS OF OSMC-PL.
+*
+* See the full OSMC Public License conditions for more details.
+*
+*/ =#
+
 #= The export of translated models to other formats (Author: John Tinnerholm). =#
 
 #= The packages the generated code loads, bound in OMBackend (the others are through backendAPI.jl): the exported
@@ -200,13 +235,13 @@ function _sourceNode(e::Any, lines::Bool)::Any
   e isa Expr || return e
   if e.head === :try
     return Expr(:try, Any[i == 2 || a === false || (a isa Expr && a.head === :block) ? a : Expr(:block, a)
-                          for (i::Int, a) in enumerate(e.args)]...)
+                          for (i::Int, a::Any) in enumerate(e.args)]...)
   elseif lines
     return e
   elseif e.head === :macrocall && length(e.args) >= 2 && e.args[2] isa LineNumberNode
     return Expr(:macrocall, e.args[1], nothing, e.args[3:end]...)
   elseif (e.head === :block || e.head === :quote) && any(a -> a isa LineNumberNode, e.args)
-    return Expr(e.head, Any[a for a in e.args if !(a isa LineNumberNode)]...)
+    return Expr(e.head, Any[a for a::Any in e.args if !(a isa LineNumberNode)]...)
   end
   return e
 end
@@ -280,11 +315,11 @@ function _valueRoots!(roots::Set{Symbol}, seen::Base.IdSet{Any}, v::Any)::Nothin
     #= other values, callable ones (`Base.Fix1`, `∘`) too: printed by their type and fields =#
     _typeRoots!(roots, seen, typeof(v))
     if v isa AbstractDict
-      for (k, x) in v
+      for (k::Any, x::Any) in v
         _valueRoots!(roots, seen, k); _valueRoots!(roots, seen, x)
       end
     elseif v isa AbstractArray || v isa Tuple || v isa NamedTuple
-      for x in v
+      for x::Any in v
         _valueRoots!(roots, seen, x)
       end
     else
@@ -300,7 +335,7 @@ end
 function _typeRoots!(roots::Set{Symbol}, seen::Base.IdSet{Any}, t::Any)::Nothing
   if t isa DataType
     push!(roots, nameof(Base.moduleroot(t.name.module)))
-    for p in t.parameters
+    for p::Any in t.parameters
       p isa Type || p isa TypeVar ? _typeRoots!(roots, seen, p) : _valueRoots!(roots, seen, p)
     end
   elseif t isa UnionAll
@@ -330,7 +365,7 @@ OMBackend itself (`const OMBackend = <the module>`), is evaluated where OMBacken
 function _standaloneModule(code::Expr, roots::Vector{Symbol})::Expr
   local body::Expr = _standaloneStatement(code.args[3], roots)::Expr
   local bound::Set{Symbol} = _importedNames(body)
-  local imports::Vector{Any} = Any[_rootImport(r) for r in roots if !(r in bound)]
+  local imports::Vector{Any} = Any[_rootImport(r) for r::Symbol in roots if !(r in bound)]
   return Expr(:module, code.args[1], code.args[2], Expr(:block, imports..., body.args...))
 end
 
@@ -338,7 +373,7 @@ end
 function _standaloneSubmodule(code::Expr, roots::Vector{Symbol})::Expr
   local body::Expr = _standaloneStatement(code.args[3], roots)::Expr
   return Expr(:module, code.args[1], code.args[2],
-              Expr(:block, _IMPORT_OMBACKEND, Any[_rootImport(r) for r in roots]..., body.args...))
+              Expr(:block, _IMPORT_OMBACKEND, Any[_rootImport(r) for r::Symbol in roots]..., body.args...))
 end
 
 const _IMPORT_OMBACKEND = Expr(:import, Expr(:., :OMBackend))
@@ -350,11 +385,11 @@ _rootImport(root::Symbol)::Expr =
 "The names the top-level `using` and `import` statements of `body` bind (the last name of each path)."
 function _importedNames(body::Expr)::Set{Symbol}
   local names::Set{Symbol} = Set{Symbol}()
-  for s in body.args
+  for s::Any in body.args
     if s isa Expr && s.head === :block
       union!(names, _importedNames(s))
     elseif s isa Expr && (s.head === :using || s.head === :import)
-      for p in s.args
+      for p::Any in s.args
         p isa Expr && p.head === :. && !isempty(p.args) && p.args[end] isa Symbol && push!(names, p.args[end])
       end
     end
@@ -367,13 +402,13 @@ its submodules import)."
 function _standaloneStatement(s::Any, roots::Vector{Symbol})::Any
   s isa Expr || return s
   if s.head === :block
-    return Expr(:block, Any[_standaloneStatement(a, roots) for a in s.args]...)
+    return Expr(:block, Any[_standaloneStatement(a, roots) for a::Any in s.args]...)
   elseif s.head === :module
     return _standaloneSubmodule(s, roots)
   elseif s.head === :const && _bindsOMBackend(s.args[1])
     return _IMPORT_OMBACKEND
   elseif s.head === :using || s.head === :import
-    return Expr(s.head, Any[_throughOMBackend(p) for p in s.args]...)
+    return Expr(s.head, Any[_throughOMBackend(p) for p::Any in s.args]...)
   end
   return s
 end
@@ -430,7 +465,7 @@ function _executableProject(packageName::Symbol, imports::Vector{Symbol})::Strin
   local ombackend::Base.PkgId = Base.PkgId(OMBackend)
   local deps::Vector{Base.PkgId} = Base.PkgId[ombackend]
   for root::Symbol in imports
-    local ids::Vector{Base.PkgId} = Base.PkgId[id for id in keys(Base.loaded_modules) if id.name == String(root)]
+    local ids::Vector{Base.PkgId} = Base.PkgId[id for id::Base.PkgId in keys(Base.loaded_modules) if id.name == String(root)]
     length(ids) == 1 || error("exportModel: the package $(root) the model loads is not loaded")
     push!(deps, only(ids))
   end
@@ -514,19 +549,19 @@ function _dataValueText(v::Any, indent::String)::String
   local entry::String = "\n" * indent * "    "
   if v isa Dict
     show(io, typeof(v)); print(io, "(")
-    for (k, x) in v
+    for (k::Any, x::Any) in v
       print(io, entry); show(io, k); print(io, " => "); show(io, x); print(io, ",")
     end
     print(io, "\n", indent, ")")
   elseif v isa Vector
     show(io, eltype(v)); print(io, "[")
-    for x in v
+    for x::Any in v
       print(io, entry); show(io, x); print(io, ",")
     end
     print(io, "\n", indent, "]")
   else
     print(io, "(")
-    for x in v::Tuple
+    for x::Any in v::Tuple
       print(io, entry); show(io, x); print(io, ",")
     end
     print(io, "\n", indent, ")")

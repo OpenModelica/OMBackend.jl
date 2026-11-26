@@ -383,10 +383,11 @@ _precompileResidual!(res::AbstractVector, z::AbstractVector, ::Any)::Nothing = _
 """
     _precompileWarmupArrayHelpers() -> Nothing
 
-The array code's helpers that every array model calls with its own functions (`@nospecialize`: compiled once, for
-`Function`), into the image: the initial system's solve (`sortedInitialSolve`, `scaledTrustRegionSolve`: NonlinearSolve's
-TrustRegion over `_ScaledResidual`; `newtonInitialSolve`) and the relation search of an event iteration. Without them, a process's first model with asserts or an initial system compiled them (PID_Controller
-0.14 s, 2026-11-18).
+The array code's helpers that every array model calls, into the image: the initial system's solve
+(`sortedInitialSolve`, `scaledTrustRegionSolve`: NonlinearSolve's TrustRegion over `_ScaledResidual`;
+`newtonInitialSolve`, with the model's residual function `@nospecialize`: compiled once, for `Function`) and the
+relation search of an event iteration (on the parameters of every translate's model, `ErasedArrayModelCode`). Without
+them, a process's first model with an initial system compiled them (PID_Controller 0.14 s, 2026-11-18).
 """
 function _precompileWarmupArrayHelpers()::Nothing
   local AG::Module = CodeGeneration.ArrayPreserveDE

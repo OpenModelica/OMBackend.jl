@@ -34,8 +34,8 @@
 */ =#
 
 #= The main function of an array model's executable (Author: John Tinnerholm): the model's problem, solver and
-   integrator made when the executable is built (juliac), and at run time only a reinit! and a solve!, with no keyword
-   calls: what juliac's trimming resolves at compile time (`OMBackend.Executable`, Export/exportModel.jl). =#
+   integrator made when the executable is built (juliac), and at run time only a solve!, with no keyword calls: what
+   juliac's trimming resolves at compile time (`OMBackend.Executable`, Export/exportModel.jl). Experimental. =#
 
 """
     executableSolver(sparse::Bool) -> Rodas5P

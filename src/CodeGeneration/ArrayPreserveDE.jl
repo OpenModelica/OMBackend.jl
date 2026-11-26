@@ -492,14 +492,6 @@ struct ArrayModelParameters{C <: ArrayModelCode}
 end
 
 """
-    ArrayModelParameters(fields...)
-
-The parameters of `fields`, each converted to its field's type as a struct without type parameters converts them (the
-relations of a solution's point are a `BitVector`, `algebraics`); the code's type `C` that of the last field.
-"""
-ArrayModelParameters(fields::Vararg{Any, N}) where {N} = ArrayModelParameters{typeof(fields[N])}(fields...)
-
-"""
 A copy of a problem's parameters (`remake(prob; p = deepcopy(prob.p))`, an ensemble's trajectories): its buffers,
 solvers and run state copied, the model's module and code shared (a module is no value: `deepcopy` refused it).
 """
@@ -3405,7 +3397,7 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
       local entry = k == 0 ? vcat(p.d, Float64.(p.rel), p.evv) : p.dlog[k][2]
       local nD = length(p.d); local nR = length(p.rel)
       local d = entry[1:nD]
-      local rel = entry[(nD + 1):(nD + nR)] .!= 0
+      local rel = Vector{Bool}(entry[(nD + 1):(nD + nR)] .!= 0)
       local evv = entry[(nD + nR + 1):end]
       local q = $(paramsType)(p.values, rel, d, copy(d), copy(p.wcond), copy(p.sampleActive),
                               [false], [false], copy(p.upre), copy(p.ureinit), copy(p.wnew), p.dlog, evv, copy(p.hyst), copy(p.tend),
@@ -3820,7 +3812,9 @@ function _traceChanges!(parts::Vector{String}, label::String, before::Vector{T},
 end
 
 "`v` as `[x, y, ...]`, its entries printed by `string` (no `show` of an array)."
-_vectorText(v::Vector{T}) where {T} = string("[", join(String[string(x) for x in v], ", "), "]")
+function _vectorText(v::Vector{T})::String where {T}
+  return string("[", join(String[string(x) for x::T in v], ", "), "]")
+end
 
 """
     _searchRelations!(du, a, u, p, t, fire, rel0, d0, flips, instance, relation) -> Bool
