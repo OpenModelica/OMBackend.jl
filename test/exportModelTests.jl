@@ -155,6 +155,73 @@ end
   @test sort(sols[end].u[end]) ≈ sort([exp(-0.5) + 0.5, 2 * exp(-0.5) + 1.0]) rtol = 1e-6
 end
 
+"The bytes one call of the right-hand side `f` allocates (its second call)."
+function rhsAllocated(f::Any, du::Vector{Float64}, u::Vector{Float64}, p::Any)::Int
+  f(du, u, p, 0.1)
+  return @allocated f(du, u, p, 0.1)
+end
+
+"The bytes a right-hand side allocates of the problem the function `constructor` of the module `mod` makes."
+function rhsBytes(mod::Module, constructor::Symbol)::Int
+  local made::Any = Base.invokelatest(getglobal(mod, constructor), (0.0, 1.0))
+  local prob::Any = made isa Tuple ? made[1] : made
+  local du::Vector{Float64} = similar(prob.u0)
+  Base.invokelatest(rhsAllocated, prob.f, du, prob.u0, prob.p)
+  return Base.invokelatest(rhsAllocated, prob.f, du, prob.u0, prob.p)
+end
+
+"The model `name` exported to a file and the file loaded into a module of its own: the file's module and its expression."
+function exportInclude(name::String)::Tuple{Module, Expr}
+  local path::String = joinpath(mktempdir(), "Exported.jl")
+  OMBackend.exportModel(path, name)
+  local m::Expr = only(filter(e -> e isa Expr && e.head === :module, Meta.parseall(read(path, String)).args))
+  local sandbox::Module = Module(:ExportSandbox)
+  Base.include(sandbox, path)
+  return (getglobal(sandbox, m.args[2]::Symbol), m)
+end
+
+#= The values the code's functions hold (vectors, structs) are module constants of the file, not literals: a literal
+   is a new object at each evaluation (CoupledLoopEvents: 70 KB per right-hand side exported, 464 B in memory). =#
+@testset "exportModel: the exported right-hand side allocates as the translated one" begin
+  local name::String = exportTranslate("ArrayPath.CoupledLoopEvents", EXPORT_ARRAY_PATH_SCODE; scalarize = false)
+  local constructor::Symbol = Symbol(name, "Model")
+  try
+    local inMemory::Int = rhsBytes(OMBackend._modelModule(Symbol(name)), constructor)
+    local (exported::Module, m::Expr) = exportInclude(name)
+    @test rhsBytes(exported, constructor) == inMemory
+    #= the constants of the model module and of its cold-code module: one name each =#
+    local constants::Vector{Symbol} = Symbol[]
+    local CG::Module = OMBackend.CodeGeneration
+    CG.CodeGenerationUtil._iterativePostwalk(m) do e
+      e isa Expr && e.head === :const && e.args[1] isa Expr && startswith(string(e.args[1].args[1]), "_EXPORTED_") &&
+        push!(constants, e.args[1].args[1])
+      return e
+    end
+    @test !isempty(constants) && allunique(constants)
+  finally
+    OMBackend.forgetModel(name)
+  end
+end
+
+#= The file's external objects (tables) are registered under a key of their own: including it freed the translated
+   model's tables, and forgetting the translated model freed the file's. =#
+@testset "exportModel: the file's external objects are its own" begin
+  local name::String = exportTranslate("ArrayPath.TableDrive", EXPORT_ARRAY_PATH_SCODE; scalarize = false)
+  local exported::Module = OMBackend
+  try
+    exported = first(exportInclude(name))
+    local translated::Any = OMBackend.simulate(name; tspan = (0.0, 1.0), reltol = 1e-8, abstol = 1e-8)
+    @test translated.retcode == ReturnCode.Success
+    local sol::Any = Base.invokelatest(() -> exported.simulate((0.0, 1.0); reltol = 1e-8, abstol = 1e-8))
+    @test sol.retcode == ReturnCode.Success
+    @test sol.u[end] ≈ translated.u[end] rtol = 1e-8
+  finally
+    OMBackend.forgetModel(name)
+  end
+  local again::Any = Base.invokelatest(() -> exported.simulate((0.0, 1.0)))
+  @test again.retcode == ReturnCode.Success
+end
+
 @testset "exportModel: a model that is not translated" begin
   local path::String = joinpath(mktempdir(), "NotTranslated.jl")
   @test_throws ErrorException OMBackend.exportModel(path, "NotTranslated")
