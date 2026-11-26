@@ -51,7 +51,7 @@ import OMFrontend.Frontend.SCodeUtil
 import OMFrontend.SCode
 import OMBackend
 import OMBackend: SimCode, @BACKEND_LOGGING, @VSS_DEBUG
-import OMBackend.Runtime: recompiledSimCode
+import OMBackend.Runtime: recompiledSimCode, recompiledArrayModel
 import ..LowerFlatModel: FunctionList
 
 using MetaModelica
@@ -75,6 +75,27 @@ function recompiledSimCode(metaModel::SCode.CLASS, activeModeName::String, eleme
   local (flatModelica::F.FLAT_MODEL, functionCache) = OMFrontend.instantiateSCodeToFM(modelicaActiveModeName, newProgram)
   @VSS_DEBUG @info "[RECOMPILATION] step 3/7: frontend (instantiateSCodeToFM) done" elapsed_s=round(time()-started, digits=2)
   return translateToSimCode(flatModelica, OMFrontend.cacheToFunctionList(functionCache))
+end
+
+"""
+    recompiledArrayModel(metaModel::SCode.CLASS, activeModeName::String, elementToChange::String, newValue::Real)
+      -> OMBackend.OMJLIR.Model
+
+The OMJLIR model of the model `metaModel` (its SCode class) recompiled with its arrays kept: the element
+`elementToChange` of the active mode `activeModeName` set to `newValue` (`setElementInSCodeProgram!`), instantiated
+again without scalarizing with the classes it was instantiated with (OMFrontend.recompilationProgram) and lowered with
+its functions (`OMBackend.lowerFlatModel`), before the passes. The array code's recompilation
+(`OMBackend.recompiledArrayModule`).
+"""
+function recompiledArrayModel(metaModel::SCode.CLASS, activeModeName::String, elementToChange::String,
+                              newValue::Real)::OMBackend.OMJLIR.Model
+  local modelicaActiveModeName::String = modelicaPathName(activeModeName, metaModel)
+  local newProgram::SCode.Program = setElementInSCodeProgram!(activeModeName, elementToChange, newValue, metaModel) <|
+    OMFrontend.recompilationProgram(SCodeUtil.elementName(metaModel))
+  local (flatModelica::F.FLAT_MODEL, functionCache) =
+    OMFrontend.instantiateSCodeToFM(modelicaActiveModeName, newProgram; scalarize = false)
+  local functions::Union{Nothing, FunctionList} = OMFrontend.cacheToFunctionList(functionCache)
+  return OMBackend.lowerFlatModel(flatModelica; functions = something(functions, MetaModelica.nil))
 end
 
 """

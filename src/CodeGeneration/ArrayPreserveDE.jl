@@ -259,11 +259,17 @@ mutable struct ArrayRuntimeState
   terminal::Bool   #= the terminal event, after the solve: terminal() is true (`_terminalEvent!`) =#
   objectLog::Vector{Tuple{Float64, Int, Int}}
   objectAt::Int
+  #= OMJL's structural change reached (its number in the module's STRUCTURAL_CHANGES and its new value; 0: none,
+     `_structuralChange!`): the run ends after its event =#
+  structural::Tuple{Int, Float64}
+  #= the problem starts a mode at a structural change (the model function's `starts`): its start time is the instant
+     after the change's event, whose sample() ticks the mode before took (`_sampleStart!`) =#
+  entered::Bool
 end
 ArrayRuntimeState(nSamples::Int, strings::Vector{String}, nDelays::Int = 0) =
   ArrayRuntimeState(zeros(nSamples), zeros(nSamples), Float64[], Dict{Tuple{Int, Int, Int}, Any}(), Set{Any}(), false, false,
                     (NaN, Float64[]), nothing, (Float64[], Float64[], Bool[], Float64[]), strings, (NaN, Float64[]),
-                    nothing, RootLogEntry[], false, DelayState(nDelays), false, Tuple{Float64, Int, Int}[], 0)
+                    nothing, RootLogEntry[], false, DelayState(nDelays), false, Tuple{Float64, Int, Int}[], 0, (0, 0.0), false)
 
 """
     InitialPass(on, x, r)
@@ -406,6 +412,8 @@ struct ArrayModelCode
   #= the relations' crossing functions need no when-condition (crossings!) =#
   crossingsOnly::Bool
   hasTerminate::Bool
+  #= OMJL's structural changes in the when bodies (`_structuralChange!`): the run ends at their event =#
+  hasStructural::Bool
   #= the asserts' relations on continuous values are crossings (assertCrossings!) =#
   hasCrossingAsserts::Bool
   nDelays::Int
@@ -869,6 +877,7 @@ function _restoreStart!(p::ArrayModelParameters)::Nothing
   fill!(p.sampleActive, false)
   p.state.terminal = false
   p.state.pending = (NaN, Float64[]); p.state.leftLimit = (NaN, Float64[]); p.state.terminated = nothing
+  p.state.structural = (0, 0.0)
   empty!(p.state.whenMemo)
   return nothing
 end
@@ -1089,9 +1098,10 @@ Whether the generated array model `model` takes overrides of all `names` (`simul
 `parameterValues` and `modelParameters` apply them): each the name of a parameter or element it has (Modelica's or
 canonical), not structural (`FIXED_PARAMETERS`, `FIXED_STRINGS`), and no structural parameter or one without a rule
 (that is not `START_OPAQUE`'s) reads them, also through other parameters' bindings. Each reader counts as changed, as
-for a value that changes it.
+for a value that changes it. The array model of a variable structure system: `modesAreTunable`.
 """
 function areTunable(model::Module, names::Vector{String})::Bool
+  isdefined(model, :MODES) && return modesAreTunable(model, names)
   local changed::Set{Symbol} = Set{Symbol}()
   local fixedStrings::Set{Int} = model.FIXED_STRINGS
   for name::String in names
@@ -2047,6 +2057,8 @@ function jl(g::Gen, x::IR)
     x.op == :setlocal && return Expr(:(=), args...)
     x.op == :assertcall && return :(($(args[1])) || _assertFailed(p, $(args[3]), ($(args[3]), _col), t, $(args[2])))
     x.op == :terminate && return :(_terminate!(p, $(args[1])))
+    #= OMJL's structural change k with its new value (`_structuralChange!`) =#
+    x.op == :structural && return :($(_structuralChange!)(p, $(args[1]), $(args[2])))
     x.op == :stringparam && return :(p.state.strings[$(x.args[1].v)])
     #= an external object: the module's constant (`_objectDefinitions`) =#
     if x.op == :object
@@ -2304,7 +2316,8 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
                      a0::Vector{Float64}, aNominal::Vector{Float64}, fixedMask::Vector{Bool}, stateNamesOrdered::Vector{String},
                      algNamesOrdered::Vector{String}, discreteNamesOrdered::Vector{String}; keepsArrays::Bool = true,
                      startRules::Vector{Tuple{Symbol, Int, IR}} = Tuple{Symbol, Int, IR}[],
-                     startFixed::Vector{String} = String[], placeholderStarts::Bool = false)::Expr
+                     startFixed::Vector{String} = String[], placeholderStarts::Bool = false,
+                     owner::String = modelName)::Expr
   #= the domain level's passes and the causal level (SimCode.Domains) =#
   local schedule::Schedule = causalSchedule!(g; keepsArrays, full = FULL[], fixedMask)
   #= a terminate() in a when body or an initial algorithm: the run's stop (`_terminate!`, emitted for such a model only) =#
@@ -2801,7 +2814,7 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
     end
   end
   local (paramOrder, rules, bindingKinds) = _parameterRules(g)
-  local objectDefs::Vector{Any} = _objectDefinitions(g, modelName)
+  local objectDefs::Vector{Any} = _objectDefinitions(g, modelName, owner)
   #= Layout of the flat parameter vector: (symbol, offset, length, dims), Julia (column-major)
      order inside an array. =#
   local layout = Tuple{Symbol, Int, Int, Vector{Int}}[]
@@ -3147,6 +3160,9 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
     end
 
     const ASSERTS = $(assertTexts)
+    #= OMJL's structural changes of the when bodies, by their number (`_structuralChange!`, `simulateModes`): an explicit
+       transition's switch (:transition, mode, :none), a recompilation (:recompilation, component, the type of its value) =#
+    const STRUCTURAL_CHANGES = $(g.structuralChanges)
     #= A model function with an assert: the equations are evaluated after each step as for
        the model's asserts (a call only an algebraic variable reads was never made: OMJL's
        AssertTests.ConstantCall, positiveTwice(-1.0)). =#
@@ -3436,7 +3452,8 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
     using .ColdCode: equations!, invariants!, assertRows!, whens!
 
     const CODE = $(ArrayModelCode)(equations!, whens!, crossings!, delayNow!, initialResiduals!, initialAlgorithms!,
-                                   checkAsserts, USES_LEFT, CROSSINGS_ONLY, $(hasTerminate), $(nCross > 0), N_DELAYS,
+                                   checkAsserts, USES_LEFT, CROSSINGS_ONLY, $(hasTerminate), $(!isempty(g.structuralChanges)),
+                                   $(nCross > 0), N_DELAYS,
                                    N_SAMPLES, RELATION_SLOT, TIME_SLOT, RELATION_INSTANCE, INIT_UNKNOWNS, INIT_PARAMS,
                                    N_INIT, INIT_ROWS, INIT_REDUNDANT, INIT_REDUNDANT_TEXTS, INIT_LOOP_PLACES, INIT_READS,
                                    $(clusterPre), ASSERTS)
@@ -3475,8 +3492,11 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
                            $(ArrayRuntimeState)(N_SAMPLES, strings, N_DELAYS), @__MODULE__, CODE)
     end
 
-    #= The problem and its event callbacks, as getMTKProblem returns them. =#
-    function $(Symbol(modelName, "Model"))(tspan = (0.0, 1.0); parameters::AbstractDict = Dict{String, Any}())
+    #= The problem and its event callbacks, as getMTKProblem returns them. `starts`: the values a mode entered at a
+       structural change starts from (`simulateModes`, by the mode's names), in the place of its initialization;
+       `nothing` at the simulation's start. =#
+    function $(Symbol(modelName, "Model"))(tspan = (0.0, 1.0); parameters::AbstractDict = Dict{String, Any}(),
+                                           starts::Union{Nothing, AbstractDict{String, Float64}} = nothing)
       local p = modelParameters(tspan; parameters = parameters)
       local u0 = copy(U0)
       #= the starts from the parameters: with overrides, and at each start where one reads a parameter computed there =#
@@ -3485,21 +3505,28 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
         p.upre .= u0; p.ureinit .= u0
       end
       $(isempty(paramAlgBody) ? nothing : :(parameterAlgorithms!(u0, p, tspan[1])))
-      USES_HOMOTOPY && (u0 = homotopyStart!(u0, p, tspan[1]))
-      $(isempty(clusterPre) ? nothing :
-        :(local (uStart, preStart, used, guessStart) =
-            (copy(u0), p.dpre[$clusterPre], p.d[$clusterPre], loopGuesses(p))))
-      length(INIT_ROWS) > 0 && (u0 = initialize(u0, p, tspan[1]))
-      isempty(INIT_REDUNDANT) || checkRedundantInitial(u0, p, tspan[1])
-      $(isempty(initAlgBody) ? nothing : :(initialAlgorithms!(u0, p, tspan[1])))
-      $(isempty(clusterPre) ? nothing : :(u0 = initialClusters!(uStart, u0, p, tspan[1], preStart, used, guessStart)))
-      $(isempty(freeStartStmts) ? nothing : :(freeParameterStarts!(p)))
+      #= a mode entered at a structural change starts from the values at the change: the initial equations and
+         algorithms hold at the simulation's start (MLS 8.6), initial() is false =#
+      local entered::Bool = starts !== nothing
+      if entered
+        $(_enterMode!)(u0, p, starts)
+      else
+        USES_HOMOTOPY && (u0 = homotopyStart!(u0, p, tspan[1]))
+        $(isempty(clusterPre) ? nothing :
+          :(local (uStart, preStart, used, guessStart) =
+              (copy(u0), p.dpre[$clusterPre], p.d[$clusterPre], loopGuesses(p))))
+        length(INIT_ROWS) > 0 && (u0 = initialize(u0, p, tspan[1]))
+        isempty(INIT_REDUNDANT) || checkRedundantInitial(u0, p, tspan[1])
+        $(isempty(initAlgBody) ? nothing : :(initialAlgorithms!(u0, p, tspan[1])))
+        $(isempty(clusterPre) ? nothing : :(u0 = initialClusters!(uStart, u0, p, tspan[1], preStart, used, guessStart)))
+        $(isempty(freeStartStmts) ? nothing : :(freeParameterStarts!(p)))
+      end
       N_SAMPLES == 0 || sampleSchedule!(p)
       if N_RELATIONS > 0 || N_WHENS > 0 || N_DISCRETE_UNKNOWNS > 0
         #= the initialization's solution: pre() is the start values, no when fires on its condition =#
         startSolution!(u0, p, tspan[1], false) ||
           error("array model: the relations and discrete values at the start do not settle")
-        if USES_INITIAL
+        if USES_INITIAL && !entered
           #= when initial(): its body runs in the initialization, then initial() is false again =#
           p.initPhase[1] = true
           startSolution!(u0, p, tspan[1], true) || error("array model: the initial events do not settle")
@@ -3605,8 +3632,9 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
     end
 
     function simulate(tspan = (0.0, 1.0), solver = Tsit5(); parameters::AbstractDict = Dict{String, Any}(),
-                      abstol = $(DEFAULT_ABSTOL), kwargs...)
-      local (ode, callbacks) = $(Symbol(modelName, "Model"))(tspan; parameters = parameters)
+                      starts::Union{Nothing, AbstractDict{String, Float64}} = nothing, abstol = $(DEFAULT_ABSTOL),
+                      kwargs...)
+      local (ode, callbacks) = $(Symbol(modelName, "Model"))(tspan; parameters = parameters, starts = starts)
       local prob = $(_problemFor)(ode, solver)
       local initKw = (; $(_initializeKwargs)(prob, kwargs, abstol)..., $(_stepKwargs)(kwargs, tspan, N_RELATIONS)...,
                       $(solverVerbosity)(kwargs)...)
@@ -4010,19 +4038,22 @@ function _stmtHasOp(st::Stmt, op::Symbol)::Bool
 end
 
 """
-    generateArrayPreserveDECode(sc::SimCode.SIM_CODE, modelName) -> (modelName, moduleExpr) or (nothing, reason)
+    generateArrayPreserveDECode(sc::SimCode.SIM_CODE, modelName; owner = modelName)
+      -> (modelName, moduleExpr) or (nothing, reason)
 
-The array-preserving module of the simulation code of a model with its arrays kept (`SimCode.lowerArraySystem`),
-through its domain level (`SimCode.Domains.domainSystem`) and causal level (`SimCode.Domains.causalSchedule!`); or
-`nothing` and the reason the model is outside the supported scope.
+The array-preserving module `modelName` of the simulation code of a model with its arrays kept
+(`SimCode.lowerArraySystem`), through its domain level (`SimCode.Domains.domainSystem`) and causal level
+(`SimCode.Domains.causalSchedule!`); or `nothing` and the reason the model is outside the supported scope. `owner`: the
+model whose build owns its external objects (a structural mode's module: the model of its modes, `arrayModes.jl`).
 """
-function generateArrayPreserveDECode(sc::SimCode.SIM_CODE, modelName::String)
+function generateArrayPreserveDECode(sc::SimCode.SIM_CODE, modelName::String; owner::String = modelName)
   try
     local (functionDefs::Vector{Any}, _) = _functionDefinitions(sc.functions)
     local ds::DomainSystem = domainSystem(sc)
     return (modelName, _emitModule(ds.g, modelName, functionDefs, ds.u0, ds.d0, ds.a0, ds.aNominal, ds.fixedMask, ds.stateNames,
                                    ds.algebraicNames, ds.discreteNames; keepsArrays = ds.keepsArrays,
-                                   startRules = ds.startRules, startFixed = ds.startFixed, placeholderStarts = ds.placeholderStarts))
+                                   startRules = ds.startRules, startFixed = ds.startFixed, placeholderStarts = ds.placeholderStarts,
+                                   owner))
   catch err
     err isa Union{NotSupported, Passes.IndexReduction.NotHandled} || rethrow(err)
     return (nothing, err isa NotSupported ? err.msg : sprint(showerror, err))
@@ -4032,14 +4063,15 @@ end
 """
 The external objects the code reads (`Gen.objects`) as the module's constants `OBJECT_k`: each made once, when the
 module is evaluated, by its constructor's call on the translated parameter values (`PARAMETER_VALUES`), and registered
-under the model with its destructor (`CodeGeneration._externalObjectRef`); the objects of the model's build before this
-one are freed first. The elements of an array of them also as the array `OBJECTS_k` (`k` its first element's), of the
-array's dimensions. NotSupported for a constructor call without code.
+under the model `owner` with its destructor (`CodeGeneration._externalObjectRef`); the objects of the model's build
+before this one are freed first (by the module of the modes for a structural mode's module, `owner` not `modelName`:
+`structuralModesModule`). The elements of an array of them also as the array `OBJECTS_k` (`k` its first element's), of
+the array's dimensions. NotSupported for a constructor call without code.
 """
-function _objectDefinitions(g::Gen, modelName::String)::Vector{Any}
+function _objectDefinitions(g::Gen, modelName::String, owner::String)::Vector{Any}
   isempty(g.objects) && return Any[]
-  local model::String = _OMBACKEND.canonicalName(modelName)
-  local defs::Vector{Any} = Any[:($(_OMBACKEND.CodeGeneration.freeExternalObjects!)($model))]
+  local model::String = _OMBACKEND.canonicalName(owner)
+  local defs::Vector{Any} = owner == modelName ? Any[:($(_OMBACKEND.CodeGeneration.freeExternalObjects!)($model))] : Any[]
   local arrays::Dict{String, Vector{Int}} = Dict{String, Vector{Int}}()
   local order::Vector{String} = String[]   #= the arrays in the order of their first elements: the same code each time =#
   for (k::Int, o::ObjectSlot) in enumerate(g.objects)
@@ -4096,5 +4128,6 @@ end
 include("arrayEvents.jl")
 include("arrayAsserts.jl")
 include("arrayInitialization.jl")
+include("arrayModes.jl")
 
 end #= module ArrayPreserveDE =#

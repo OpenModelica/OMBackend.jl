@@ -138,6 +138,12 @@ function backendScalarizedModel(fm::F.FLAT_MODEL;
   end
 end
 
+"""
+Whether the flat model `fm` changes its structure during a simulation (OMJL): structural modes (`structuralmode`), or
+a recompilation (the frontend keeps the SCode class of such a model, `scodeProgram`).
+"""
+_isStructural(fm::F.FLAT_MODEL)::Bool = !isempty(fm.structuralSubmodels) || fm.scodeProgram !== nothing
+
 "`translate(fm; scalarize = false)`: the routes with the arrays kept, in order; `nothing` where none takes `fm`."
 function _translateArraysKept(fm::F.FLAT_MODEL;
                               functionList::Union{Nothing, FunctionList},
@@ -153,7 +159,15 @@ function _translateArraysKept(fm::F.FLAT_MODEL;
   local options::TranslateOptions = (; functionList, mode, warnMissingStartValues, eliminateNonDynamic, observedFilter,
                                      checkSimCode)
   local result::Union{Nothing, Tuple{String, Expr}}
-  local reduced::Union{Nothing, OMJLIR.Model} =
+  if _isStructural(fm)
+    #= a variable structure system: an array module per mode (OMJL's structural modes, the modes recompilations give)
+       or, where the array form does not take a mode, the model scalarized by the backend =#
+    result = @BACKEND_PERFLOG "[backendAPI] structuralArrayTargetCode" structuralArrayTargetCode(name) do
+      lowerFlatModel(fm; functions = something(functionList, MetaModelica.nil))
+    end
+    result === nothing || return result
+  end
+  local reduced::Union{Nothing, OMJLIR.Model} = _isStructural(fm) ? nothing :
     @BACKEND_PERFLOG "[backendAPI] reducedArrayModel" reducedArrayModel(fm; functionList)
   if reduced !== nothing
     result = @BACKEND_PERFLOG "[backendAPI] generateReducedArrayPreserveDECode" generateReducedArrayPreserveDETargetCode(name,

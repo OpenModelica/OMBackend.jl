@@ -59,6 +59,7 @@ include("causalize.jl")
 include("Evaluation/Evaluation.jl")
 include("IndexReduction/IndexReduction.jl")
 include("arrayCodeForm.jl")
+include("structuralModes.jl")
 
 """
 The passes, in order: name => pass. The first group is the previous backend's BDAECreate (the

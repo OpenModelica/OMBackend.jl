@@ -104,7 +104,7 @@ mapRoots(g::G, s::IR.TERMINATE) where {G} = IR.TERMINATE(g(s.message), s.source)
 mapRoots(g::G, s::IR.REINIT) where {G} = IR.REINIT(s.state, g(s.value), s.source)
 mapRoots(g::G, s::IR.NORETCALL) where {G} = IR.NORETCALL(g(s.call), s.source)
 mapRoots(g::G, s::IR.RECOMPILATION) where {G} = IR.RECOMPILATION(s.component, g(s.newValue))
-mapRoots(::G, s::Union{IR.RETURN, IR.BREAK, IR.AGENTIC_RECOMPILATION}) where {G} = s
+mapRoots(::G, s::Union{IR.RETURN, IR.BREAK, IR.AGENTIC_RECOMPILATION, IR.TRANSITION}) where {G} = s
 
 "The continuous-time partitions and the structural modes' systems, each with its variables."
 partitionsWithVariables(model::IR.Model) =
