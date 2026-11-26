@@ -66,8 +66,7 @@ function _settle!(du::AbstractVector, a::AbstractVector, u::AbstractVector, p::A
                                   (p.rel, p.d, p.evv, p.wnew, p.ureinit))
   end
   searched && return false
-  _searchRelations!(c.equations!, c.whens!, du, a, u, p, t, fire, rel0, d0, flips, c.relationInstance,
-                    c.relationSlot) || return false
+  _searchRelations!(du, a, u, p, t, fire, rel0, d0, flips, c.relationInstance, c.relationSlot) || return false
   return _settle!(du, a, u, p, t, fire, true)
 end
 

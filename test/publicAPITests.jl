@@ -13,7 +13,7 @@ const PUBLIC_API_NAMES = Symbol[
   #= tunable parameters (OMSurrogates) =#
   :withTunableParameters, :isTunable, :pristineParameters, :buildId,
   #= inspect and export models =#
-  :availableModels, :exportModel, :ExportFormat, :JuliaSource,
+  :availableModels, :exportModel, :ExportFormat, :JuliaSource, :Executable,
   #= caches =#
   :clearCaches!, :forgetModel]
 

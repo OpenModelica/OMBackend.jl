@@ -56,6 +56,7 @@ OMBackend.availableModels
 OMBackend.exportModel
 OMBackend.ExportFormat
 OMBackend.JuliaSource
+OMBackend.Executable
 ```
 
 ## Caches

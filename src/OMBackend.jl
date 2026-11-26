@@ -72,7 +72,7 @@ public translate, BackendMode, IMTK_MODE, MTK_MODE, EliminationOptions, explainI
 public simulate, resimulate, getMTKProblem, defaultSolver, daeFallbackSolver, variableValues,
   eventCallbacks, isEventCallback, isStepControl, ModelicaAssertionError, plot
 public withTunableParameters, isTunable, pristineParameters, buildId
-public availableModels, exportModel, ExportFormat, JuliaSource
+public availableModels, exportModel, ExportFormat, JuliaSource, Executable
 public clearCaches!, forgetModel
 #= The names 1.0 renamed, kept for 1.x with a deprecation warning: not public. =#
 include("deprecated.jl")

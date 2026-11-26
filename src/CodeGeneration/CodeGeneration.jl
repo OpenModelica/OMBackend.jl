@@ -44,6 +44,8 @@ import DiffEqBase
 import SciMLBase
 import DiffEqCallbacks
 import OrdinaryDiffEq
+import LinearSolve
+import SciMLLogging
 import ADTypes
 import NonlinearSolve
 import Graphs

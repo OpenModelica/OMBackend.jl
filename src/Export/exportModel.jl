@@ -9,7 +9,8 @@ import Symbolics, NonlinearSolve, DiffEqCallbacks, DataStructures, Setfield, OMR
 
 A format [`exportModel`](@ref) writes a translated model in: one subtype per format, each with its method
 `exportModel(io::IO, modelName::String, format)`. A format that is not one stream (a directory) has its own
-`exportModel(path::String, modelName::String, format)` as well. [`JuliaSource`](@ref) is the only format so far.
+`exportModel(path::String, modelName::String, format)` as well: [`JuliaSource`](@ref), a file; [`Executable`](@ref), a
+package directory.
 """
 abstract type ExportFormat end
 
@@ -34,12 +35,35 @@ Base.@kwdef struct JuliaSource <: ExportFormat
 end
 
 """
+    Executable(; startTime = 0.0, stopTime = 1.0, reltol = 1e-6, abstol = 1e-10, comments = false)
+
+A translated array model (the arrays-kept route: `translate(...; scalarize = false)`) as the package of an executable,
+built with juliac: its directory holds `Project.toml`, `src/<Package>.jl` with the main function and `src/<Model>.jl`,
+the model as [`JuliaSource`](@ref) (`comments`). The executable simulates the model over (`startTime`, `stopTime`)
+with Rodas5P (a named linear solver, KLU or LU), tolerances `reltol` and `abstol`, and writes the time points and
+states as CSV to the file given as its argument, or to standard output. Its problem and integrator are made when
+juliac builds it. Exit code 0 for a successful solve, 1 for a failed one. OMBackend does not depend on juliac
+(JuliaC.jl); with an environment that has it, after `Pkg.instantiate()` in the package's directory `pkg`:
+
+```
+julia --project=<env with JuliaC> -e 'using JuliaC; JuliaC.main(ARGS)' -- --output-exe model --bundle build --trim=unsafe-warn --experimental pkg
+```
+"""
+Base.@kwdef struct Executable <: ExportFormat
+  startTime::Float64 = 0.0
+  stopTime::Float64 = 1.0
+  reltol::Float64 = 1e-6
+  abstol::Float64 = CodeGeneration.ArrayPreserveDE.DEFAULT_ABSTOL
+  comments::Bool = false
+end
+
+"""
     exportModel(path::String, modelName::String, format::ExportFormat = JuliaSource()) -> String
     exportModel(io::IO, modelName::String, format::ExportFormat = JuliaSource()) -> Nothing
 
 Writes the translated model `modelName` (either name form, [`canonicalName`](@ref)) in `format` to the file `path`,
-returned, or to `io`. The file is written once the whole export is done: an export that fails leaves no file. Throws
-for a model that is not translated ([`availableModels`](@ref)).
+returned, or to `io` (a directory `path` for [`Executable`](@ref)). The file is written once the whole export is done:
+an export that fails leaves no file. Throws for a model that is not translated ([`availableModels`](@ref)).
 
 ```julia
 OMBackend.exportModel("HelloWorld.jl", "HelloWorld")
@@ -55,6 +79,43 @@ function exportModel(path::String, modelName::String, format::ExportFormat = Jul
 end
 
 exportModel(io::IO, modelName::String)::Nothing = exportModel(io, modelName, JuliaSource())
+
+exportModel(::IO, ::String, ::Executable)::Nothing =
+  throw(ArgumentError("exportModel: an Executable is a package directory: give its path, not a stream"))
+
+function exportModel(path::String, modelName::String, format::Executable)::String
+  local name::String = canonicalName(modelName)
+  (name in ARRAY_PRESERVE_DE_MODELS && haskey(COMPILED_MODELS_ARRAY_PRESERVE_DE, name)) ||
+    error("exportModel: an Executable needs the array code (translate with scalarize = false); $(name) has none")
+  (ispath(path) && !(isdir(path) && isempty(readdir(path)))) &&
+    error("exportModel: $(path) exists; an Executable is written to a new or empty directory")
+  format.startTime < format.stopTime || error("exportModel: the start time is not before the stop time")
+  local source::IOBuffer = IOBuffer()
+  exportModel(source, name, JuliaSource(comments = format.comments))
+  local modelText::String = String(take!(source))
+  local modelModule::Symbol = _generatedModule(name).args[2]::Symbol
+  local packageName::Symbol = Symbol(modelModule, "Executable")
+  local main::Expr = CodeGeneration.ArrayPreserveDE.generateExecutableMain(packageName, modelModule,
+    string(modelModule, ".jl"), (format.startTime, format.stopTime); reltol = format.reltol, abstol = format.abstol)
+  local mainText::String = _formattedJulia(sprint(print, _sourceCode(main, false); context = :module => _ExportPrint))
+  #= written beside `path`, then moved there: a failed export leaves nothing =#
+  local parent::String = dirname(abspath(path))
+  mkpath(parent)
+  local staging::String = mktempdir(parent; prefix = ".omb-export-")
+  try
+    mkpath(joinpath(staging, "src"))
+    write(joinpath(staging, "src", string(modelModule, ".jl")), modelText)
+    write(joinpath(staging, "src", string(packageName, ".jl")), OSMC_COPYRIGHT_HEADER,
+          _executableUsage(name, packageName), mainText, endswith(mainText, "\n") ? "" : "\n")
+    write(joinpath(staging, "Project.toml"), _executableProject(packageName, _directImports(modelText)))
+    isdir(path) && rm(path)
+    mv(staging, path)
+  catch
+    rm(staging; force = true, recursive = true)
+    rethrow()
+  end
+  return path
+end
 
 function exportModel(io::IO, modelName::String, format::JuliaSource)::Nothing
   local name::String = canonicalName(modelName)
@@ -316,6 +377,61 @@ function _boundPackage(root::Any)::Bool
   (root isa Symbol && root !== :OMBackend && isdefined(OMBackend, root)) || return false
   local value::Any = getglobal(OMBackend, root)
   return value isa Module && parentmodule(value) === value
+end
+
+"""
+The roots of the `using` and `import` paths at the top level of the module of the Julia source `text`, other than
+OMBackend and relative ones: the packages it loads directly (a standard library: LinearAlgebra).
+"""
+function _directImports(text::String)::Vector{Symbol}
+  local m::Expr = only(filter(e -> e isa Expr && e.head === :module, Meta.parseall(text).args))
+  local roots::Set{Symbol} = Set{Symbol}()
+  for s::Any in (m.args[3]::Expr).args
+    (s isa Expr && s.head in (:using, :import)) || continue
+    for p::Any in s.args
+      local path::Expr = p.head in (:(:), :as) ? p.args[1] : p
+      local root::Symbol = path.args[1]::Symbol
+      root in (:OMBackend, :.) || push!(roots, root)
+    end
+  end
+  return sort!(collect(roots))
+end
+
+"""
+The `Project.toml` of the executable's package `packageName`: OMBackend and the packages `imports` as its
+dependencies, OMBackend by its directory (`[sources]`) where it is not installed from a registry (developed).
+"""
+function _executableProject(packageName::Symbol, imports::Vector{Symbol})::String
+  local ombackend::Base.PkgId = Base.PkgId(OMBackend)
+  local deps::Vector{Base.PkgId} = Base.PkgId[ombackend]
+  for root::Symbol in imports
+    local ids::Vector{Base.PkgId} = Base.PkgId[id for id in keys(Base.loaded_modules) if id.name == String(root)]
+    length(ids) == 1 || error("exportModel: the package $(root) the model loads is not loaded")
+    push!(deps, only(ids))
+  end
+  local dir::String = pkgdir(OMBackend)
+  local registered::Bool = any(d -> startswith(dir, joinpath(d, "packages") * "/"), DEPOT_PATH)
+  local io::IOBuffer = IOBuffer()
+  println(io, "name = \"", packageName, "\"")
+  println(io, "uuid = \"", Base.uuid5(ombackend.uuid, string(packageName)), "\"")
+  println(io, "version = \"0.1.0\"\n\n[deps]")
+  for id::Base.PkgId in sort!(deps; by = id -> id.name)
+    println(io, id.name, " = \"", id.uuid, "\"")
+  end
+  registered || println(io, "\n[sources]\nOMBackend = {path = ", repr(dir), "}")
+  println(io, "\n[compat]\nOMBackend = \"", something(pkgversion(OMBackend), v"1.3.0"), "\"\njulia = \"", VERSION.major, ".",
+          VERSION.minor, "\"")
+  return String(take!(io))
+end
+
+"The comment at the top of the main file of the executable's package `packageName` of the model `name`."
+function _executableUsage(name::String, packageName::Symbol)::String
+  local version::String = string(something(pkgversion(OMBackend), "(no version)"))
+  return """
+    #= The executable of the model $(name), exported by OMBackend $(version) (OMBackend.exportModel, Executable).
+       Built with juliac (JuliaC.jl) from this package's directory after `Pkg.instantiate()`; it writes the time points
+       and states as CSV to its argument (a file) or to standard output. =#
+    """
 end
 
 "The comment at the top of the Julia source of the model `name`, whose module is `moduleName`."

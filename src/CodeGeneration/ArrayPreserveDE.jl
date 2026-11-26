@@ -97,7 +97,8 @@ import ...SimCode.Domains: DomainSystem, InstanceTable, EqClass, EvFn, Gen, IR, 
   domainSystem, ns, Schedule, causalSchedule!, ParameterBinding, parameterBindings, _bindingDeps, InitialSystem
 
 const SII = ModelingToolkit.SymbolicIndexingInterface
-import ..CodeGeneration: NonlinearSolve, ADTypes, DiffEqBase
+import ..CodeGeneration: NonlinearSolve, ADTypes, DiffEqBase, SciMLBase, OrdinaryDiffEq, LinearSolve, SciMLLogging,
+  LAST_RHS_ERROR, _resetRHSError!
 
 "Where crossing functions are written (`CrossingOut`): nowhere, a view of the callback's output, or a vector."
 const CrossingTarget = Union{Nothing, SubArray{Float64, 1, Vector{Float64}, Tuple{UnitRange{Int}}, true}, Vector{Float64}}
@@ -166,10 +167,6 @@ function _stepKwargs(kwargs::Base.Pairs, tspan::Tuple{Real, Real}, nRelations::I
   return (; dtmax = (RELATION_CHECKS - 1) * span / OUTPUT_INTERVALS)
 end
 
-#= The parameter argument of an array model's problem: the parameter values (one flat
-   vector, laid out by the model's PARAMETER_LAYOUT; one type for every array model, so the
-   solver is compiled once), the discrete state (relation values, discrete variables and their
-   pre values, when-condition values, state values before the event) and the generated module. =#
 """
     RootLogEntry
 
@@ -390,17 +387,22 @@ end
 What the simulation's functions common to every array model (arrayEvents.jl: the event iteration and callbacks;
 arrayAsserts.jl: the asserts during a solve; arrayInitialization.jl: the initial system) read of a model
 (`ArrayModelParameters.code`, the module's `CODE`): its own functions, the code of its equations, its relations' slots
-and its initial system. The functions are called through `Function` fields: the common functions are compiled once
-(into the package image), not again for each model's module.
+and its initial system. The type parameters are the functions' types. A translate's module holds them as `Function`
+(`ErasedArrayModelCode`): the common functions are compiled once (into the package image), not again for each model's
+module. An executable's (`specializedCode`) holds their own types: every call is resolved at compile time, as
+juliac's trimming needs.
 """
-struct ArrayModelCode
-  equations!::Function
-  whens!::Function
-  crossings!::Function
-  delayNow!::Function
-  initialResiduals!::Function
-  initialAlgorithms!::Function
-  checkAsserts::Function
+struct ArrayModelCode{EQ <: Function, WH <: Function, CR <: Function, DN <: Function, IR <: Function, IA <: Function,
+                      CA <: Function, RO <: Function}
+  equations!::EQ
+  whens!::WH
+  crossings!::CR
+  delayNow!::DN
+  initialResiduals!::IR
+  initialAlgorithms!::IA
+  checkAsserts::CA
+  #= the external objects' calls made again up to a time (`_restoreStart!`) =#
+  replayObjects!::RO
   #= the algebraic variables' left limit at an event (pre() of an algebraic variable) =#
   usesLeft::Bool
   #= the relations' crossing functions need no when-condition (crossings!) =#
@@ -432,7 +434,25 @@ struct ArrayModelCode
   asserts::Vector{Tuple{String, String, Bool}}
 end
 
-struct ArrayModelParameters
+"The code of a translate's module: its functions as `Function` (one type for every model, `ArrayModelCode`)."
+const ErasedArrayModelCode = ArrayModelCode{Function, Function, Function, Function, Function, Function, Function, Function}
+
+"""
+    specializedCode(code::ArrayModelCode) -> ArrayModelCode
+
+`code` with its functions' own types as its parameters (an executable's, `ArrayModelCode`).
+"""
+specializedCode(code::ArrayModelCode)::ArrayModelCode =
+  ArrayModelCode(Any[getfield(code, f) for f in fieldnames(ArrayModelCode)]...)
+
+"""
+The parameter argument of an array model's problem: the parameter values (one flat vector, laid out by the model's
+PARAMETER_LAYOUT), the discrete state (relation values, discrete variables and their pre values, when-condition values,
+state values before the event), the buffers and run state, the generated module and its code `C` (`ArrayModelCode`).
+One type for every model of a translate (`ErasedArrayModelCode`: the solver is compiled once); an executable's
+specialized (`specializedCode`).
+"""
+struct ArrayModelParameters{C <: ArrayModelCode}
   values::Vector{Float64}
   rel::Vector{Bool}
   d::Vector{Float64}
@@ -460,8 +480,16 @@ struct ArrayModelParameters
   pass::InitialPass           #= the loops the initial solve holds (`initialize`) =#
   state::ArrayRuntimeState     #= the run's state (samples, memo, warnings, asserts, terminate) =#
   model::Module
-  code::ArrayModelCode
+  code::C
 end
+
+"""
+    ArrayModelParameters(fields...)
+
+The parameters of `fields`, each converted to its field's type as a struct without type parameters converts them (the
+relations of a solution's point are a `BitVector`, `algebraics`); the code's type `C` that of the last field.
+"""
+ArrayModelParameters(fields::Vararg{Any, N}) where {N} = ArrayModelParameters{typeof(fields[N])}(fields...)
 
 """
 A copy of a problem's parameters (`remake(prob; p = deepcopy(prob.p))`, an ensemble's trajectories): its buffers,
@@ -858,7 +886,7 @@ function _restoreStart!(p::ArrayModelParameters)::Nothing
      restored: the calls' arguments are evaluated) =#
   resize!(p.state.objectLog, s.nObjectLog)
   p.state.objectAt = typemax(Int)
-  Base.invokelatest(p.model.replayObjects!, s.upre, p, Inf)
+  p.code.replayObjects!(s.upre, p, Inf)
   for (G, start) in zip(p.loops, s.loops)
     G .= start
   end
@@ -885,7 +913,7 @@ _keepFirst(x::Float64, ::Float64)::Float64 = x
 `f()` with the discrete state of `p` set to `s` (`_discreteState`; the step start's, where an event ended the step), restored
 after; with the state as it is where `s` holds none (before the first step).
 """
-function _withDiscreteState(@nospecialize(f::Function), p::ArrayModelParameters, s::Tuple{Vector{Float64}, Vector{Float64}, Vector{Bool}, Vector{Float64}})
+function _withDiscreteState(f::Function, p::ArrayModelParameters, s::Tuple{Vector{Float64}, Vector{Float64}, Vector{Bool}, Vector{Float64}})
   (length(s[1]) == length(p.d) && length(s[3]) == length(p.rel)) || return f()
   local now::Tuple{Vector{Float64}, Vector{Float64}, Vector{Bool}, Vector{Float64}} = _discreteState(p)
   p.d .= s[1]; p.dpre .= s[2]; p.rel .= s[3]; p.evv .= s[4]
@@ -914,12 +942,12 @@ An array model's right-hand side `f` whose error (a domain error, a Modelica ass
 `_RHS_STEP_ERRORS`) rejects the step: the derivatives NaN, the solver retries smaller; the error is kept until the
 run ends (`_rethrowRHSError` throws it if the run fails), not forgotten when a later call succeeds (the scalar path's
 `_StepRejectingRHS` clears it: an error-level assert in a function ended an array model's run without its message).
-One type for every model (`f::Function`, a dynamic call per evaluation): with the model's own function type in it,
-DiffEqBase's wrappers (`wrapfun_jac_iip`) and `ColoredJacobian` were inferred again for each model (MSL EngineV6
-1.2 s).
+A translate's module erases `f`'s type (`StepRejectingRHS{Function}`, one type for every model, a dynamic call per
+evaluation): with the model's own function type in it, DiffEqBase's wrappers (`wrapfun_jac_iip`) and `ColoredJacobian`
+were inferred again for each model (MSL EngineV6 1.2 s). An executable's keeps it (`specializedProblem`).
 """
-struct StepRejectingRHS <: Function
-  f::Function
+struct StepRejectingRHS{F <: Function} <: Function
+  f::F
 end
 
 function (r::StepRejectingRHS)(du, u, p, t)
@@ -2922,9 +2950,12 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
       push!(ruleFunctions, ruleName)
     end
   end
-  local jacProto = pattern === nothing ? :(nothing) :
+  local jacProto::Union{Nothing, Expr} = pattern === nothing ? nothing :
     :(Symbolics.SparseArrays.sparse($(pattern[1]), $(pattern[2]), ones($(length(pattern[1]))), $nStates, $nStates, $(_keepFirst)))
-  local paramsType = ArrayModelParameters
+  local paramsType::UnionAll = ArrayModelParameters
+  #= a terminate() at the initialization: the problem ends at its start =#
+  local endsAtStart::Union{Nothing, Expr} = hasTerminate ?
+    :(p.state.terminated === nothing || return (ODEProblem(f, u0, (tspan[1], tspan[1]), p), cb)) : nothing
   #= the large functions' statements in functions of bounded size (_splitStatements) =#
   local (eqDefs::Vector{Expr}, eqStmts::Vector{Any}) =
     _splitStatements(:equations!, Symbol[:du, :a, :u, :p, :t, :z, :mode, :fire], Symbol[], paramLocals, _rollRuns(body); fired = true)
@@ -3435,14 +3466,14 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
     end
     using .ColdCode: equations!, invariants!, assertRows!, whens!
 
-    const CODE = $(ArrayModelCode)(equations!, whens!, crossings!, delayNow!, initialResiduals!, initialAlgorithms!,
-                                   checkAsserts, USES_LEFT, CROSSINGS_ONLY, $(hasTerminate), $(nCross > 0), N_DELAYS,
-                                   N_SAMPLES, RELATION_SLOT, TIME_SLOT, RELATION_INSTANCE, INIT_UNKNOWNS, INIT_PARAMS,
-                                   N_INIT, INIT_ROWS, INIT_REDUNDANT, INIT_REDUNDANT_TEXTS, INIT_LOOP_PLACES, INIT_READS,
-                                   $(clusterPre), ASSERTS)
+    const CODE = $(ErasedArrayModelCode)(equations!, whens!, crossings!, delayNow!, initialResiduals!, initialAlgorithms!,
+                                         checkAsserts, replayObjects!, USES_LEFT, CROSSINGS_ONLY, $(hasTerminate),
+                                         $(nCross > 0), N_DELAYS, N_SAMPLES, RELATION_SLOT, TIME_SLOT, RELATION_INSTANCE,
+                                         INIT_UNKNOWNS, INIT_PARAMS, N_INIT, INIT_ROWS, INIT_REDUNDANT,
+                                         INIT_REDUNDANT_TEXTS, INIT_LOOP_PLACES, INIT_READS, $(clusterPre), ASSERTS)
 
     #= The parameters and discrete state of a simulation over `tspan` (before the initialization). =#
-    function modelParameters(tspan = (0.0, 1.0); parameters::AbstractDict = Dict{String, Any}())
+    function modelParameters(tspan = (0.0, 1.0); parameters::AbstractDict = Dict{String, Any}(), code = CODE)
       #= the overrides of String parameters into the run state's values, the others parameterValues' =#
       local strings = copy(STRING_VALUES)
       local numeric = Dict{String, Any}()
@@ -3472,12 +3503,17 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
                            Matrix{Float64}[copy(G) for G in LOOP_GUESSES],
                            $(LoopWork){Float64}[$(LoopWork){Float64}(size(G, 1)) for G in LOOP_GUESSES],
                            $(InitialPass)(false, zeros(N_INIT_LOOPS), zeros(N_INIT_LOOPS)),
-                           $(ArrayRuntimeState)(N_SAMPLES, strings, N_DELAYS), @__MODULE__, CODE)
+                           $(ArrayRuntimeState)(N_SAMPLES, strings, N_DELAYS), @__MODULE__, code)
     end
 
-    #= The problem and its event callbacks, as getMTKProblem returns them. =#
-    function $(Symbol(modelName, "Model"))(tspan = (0.0, 1.0); parameters::AbstractDict = Dict{String, Any}())
-      local p = modelParameters(tspan; parameters = parameters)
+    #= The Jacobian's sparsity pattern (`nothing`: dense), a new one per problem. =#
+    jacobianPattern() = $jacProto
+
+    #= What the problem's two forms share (the model's `Model` function, `specializedProblem`): the parameters `p` with
+       the model's code `code`, the start values `u0` after the initialization and the event callbacks `cbs` of a
+       simulation over `tspan`. =#
+    function problemParts(tspan, parameters::AbstractDict, code)
+      local p = modelParameters(tspan; parameters = parameters, code = code)
       local u0 = copy(U0)
       #= the starts from the parameters: with overrides, and at each start where one reads a parameter computed there =#
       if $(startsAtEachStart ? true : :(!isempty(parameters)))
@@ -3516,27 +3552,6 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
       $(_logRoots!)(p, tspan[1])
       $(isempty(initAssertBody) ? nothing : :(checkInitialAsserts(u0, p, tspan[1])))
       invariants!(p.abuf, p)
-      #= a domain error or an assert in the right-hand side rejects the step (the solver retries smaller), as in the
-         scalar path (MSL DifferenceAmplifier's x^y of a negative x at a trial point) =#
-      #= tgrad! wrapped to one type for every array model (the right-hand side is, AutoSpecialize): the model's own
-         function type in the problem compiled the solver again for each model; through `_ErasedCall`, so the
-         wrapping (`wrapfun_jac_iip`) is not inferred again for each model either =#
-      #= the Jacobian in a sparsity pattern by the array code's own differences, a step per state (ColoredJacobian) =#
-      local jacPattern = $jacProto
-      local rhs = $(StepRejectingRHS)(RHS!)
-      local jac = jacPattern === nothing ? nothing :
-        OMBackend.CodeGeneration.DiffEqBase.wrapfun_jac_iip($(ColoredJacobian)(rhs, jacPattern),
-                                                            (jacPattern, u0, p, Float64(tspan[1])))
-      #= with a Jacobian given and no ForwardDiff, DiffEqBase leaves the right-hand side as it is (`promote_f`: its
-         wrap path needs `f.jac === nothing`): the model's own function type in the problem compiled the solver again
-         for each model (3 s each; the package tests 27 min for 15). Wrapped here then, as DiffEqBase wraps it =#
-      local wrapped = jac === nothing ? rhs :
-        OMBackend.CodeGeneration.DiffEqBase.wrapfun_jac_iip(rhs, (u0, u0, p, Float64(tspan[1])))
-      local f::ODEFunction = ODEFunction(wrapped; jac_prototype = jacPattern, jac = jac,
-                                         tgrad = OMBackend.CodeGeneration.DiffEqBase.wrapfun_jac_iip(
-                                           $(_OMBACKEND.CodeGeneration._ErasedCall{Nothing})(tgrad!),
-                                           (u0, u0, p, Float64(tspan[1]))),
-                                         sys = $(ArraySystem)(@__MODULE__))
       #= RightRootFind: the event lands just past the root, where the relation has its new value. =#
       local cbs = Any[]
       #= the relations were set literally above; from the solve on they have the hysteresis =#
@@ -3595,12 +3610,52 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
       $(usesTerminal ? :(push!(cbs, DiscreteCallback($(_OMBACKEND.CodeGeneration.NotAnEvent)((u, t, integrator) -> false), integrator -> nothing;
                                                      finalize = (c, u, t, integrator) -> _terminalEvent!(integrator),
                                                      save_positions = (false, false)))) : nothing)
+      return (p, u0, cbs)
+    end
+
+    #= The problem and its event callbacks, as getMTKProblem returns them: one type for every model. =#
+    function $(Symbol(modelName, "Model"))(tspan = (0.0, 1.0); parameters::AbstractDict = Dict{String, Any}())
+      local (p, u0, cbs) = problemParts(tspan, parameters, CODE)
+      #= a domain error or an assert in the right-hand side rejects the step (the solver retries smaller), as in the
+         scalar path (MSL DifferenceAmplifier's x^y of a negative x at a trial point); its type erased
+         (`StepRejectingRHS{Function}`) =#
+      #= tgrad! wrapped to one type for every array model (the right-hand side is, AutoSpecialize): the model's own
+         function type in the problem compiled the solver again for each model; through `_ErasedCall`, so the
+         wrapping (`wrapfun_jac_iip`) is not inferred again for each model either =#
+      #= the Jacobian in a sparsity pattern by the array code's own differences, a step per state (ColoredJacobian) =#
+      local jacPattern = jacobianPattern()
+      local rhs = $(StepRejectingRHS){Function}(RHS!)
+      local jac = jacPattern === nothing ? nothing :
+        OMBackend.CodeGeneration.DiffEqBase.wrapfun_jac_iip($(ColoredJacobian)(rhs, jacPattern),
+                                                            (jacPattern, u0, p, Float64(tspan[1])))
+      #= with a Jacobian given and no ForwardDiff, DiffEqBase leaves the right-hand side as it is (`promote_f`: its
+         wrap path needs `f.jac === nothing`): the model's own function type in the problem compiled the solver again
+         for each model (3 s each; the package tests 27 min for 15). Wrapped here then, as DiffEqBase wraps it =#
+      local wrapped = jac === nothing ? rhs :
+        OMBackend.CodeGeneration.DiffEqBase.wrapfun_jac_iip(rhs, (u0, u0, p, Float64(tspan[1])))
+      local f::ODEFunction = ODEFunction(wrapped; jac_prototype = jacPattern, jac = jac,
+                                         tgrad = OMBackend.CodeGeneration.DiffEqBase.wrapfun_jac_iip(
+                                           $(_OMBACKEND.CodeGeneration._ErasedCall{Nothing})(tgrad!),
+                                           (u0, u0, p, Float64(tspan[1]))),
+                                         sys = $(ArraySystem)(@__MODULE__))
       #= one callback type for every model (`_erasedCallbacks`): the solver's callback functions compiled once =#
       local cb = isempty(cbs) ? nothing : OMBackend.CodeGeneration._erasedCallbacks(cbs)
-      $(hasTerminate ? quote
-          #= a terminate() at the initialization: the problem ends at its start =#
-          p.state.terminated === nothing || return (ODEProblem(f, u0, (tspan[1], tspan[1]), p), cb)
-        end : nothing)
+      $(endsAtStart)
+      return (ODEProblem(f, u0, tspan, p), cb)
+    end
+
+    #= The problem and its event callbacks with each function's own type, an executable's (juliac's trimming resolves
+       every call at compile time): the model's code specialized (`specializedCode`), the right-hand side too
+       (`FullSpecialize`, not wrapped), its own Jacobian and tgrad!, the callbacks as they are; no symbolic system. =#
+    function specializedProblem(tspan = (0.0, 1.0); parameters::AbstractDict = Dict{String, Any}())
+      local (p, u0, cbs) = problemParts(tspan, parameters, $(specializedCode)(CODE))
+      local jacPattern = jacobianPattern()
+      local rhs = $(StepRejectingRHS)(RHS!)
+      local f = ODEFunction{true, DifferentialEquations.SciMLBase.FullSpecialize}(
+        rhs; jac_prototype = jacPattern, jac = jacPattern === nothing ? nothing : $(ColoredJacobian)(rhs, jacPattern),
+        tgrad = tgrad!)
+      local cb = isempty(cbs) ? nothing : DifferentialEquations.CallbackSet(cbs...)
+      $(endsAtStart)
       return (ODEProblem(f, u0, tspan, p), cb)
     end
 
@@ -3693,27 +3748,53 @@ function _readsParameterOf(x::IR, names::Set{String})::Bool
 end
 
 """
+What a sweep's pass compares (`_settle!`, `_traceSettlePass`): the relations, discrete values, event-generating
+functions' values, when-conditions and reinit values.
+"""
+const SettleValues = Tuple{Vector{Bool}, Vector{Float64}, Vector{Float64}, Vector{Bool}, Vector{Float64}}
+
+"""
     _traceSettlePass(t, pass, before, after)
 
 The changes of one of the last passes of an event iteration's sweep that does not settle (`_settle!`), with
 OMBACKEND_ARRAY_TRACE: the slots of the relations, discrete values, event-generating functions' values,
 when-conditions and reinit values that changed. `before` and `after` hold those five, in that order.
 """
-function _traceSettlePass(t::Real, pass::Int, before::NTuple{5, AbstractVector},
-                          after::NTuple{5, AbstractVector})::Nothing
+function _traceSettlePass(t::Real, pass::Int, before::SettleValues, after::SettleValues)::Nothing
   _OMBACKEND.envSwitch("OMBACKEND_ARRAY_TRACE") || return nothing
-  local labels::NTuple{5, String} = ("relations", "discretes", "event functions", "when-conditions", "reinit")
   local parts::Vector{String} = String[]
-  for (label::String, b::AbstractVector, x::AbstractVector) in zip(labels, before, after)
-    local changed::Vector{Int} = findall(b .!= x)
-    isempty(changed) || push!(parts, string(label, " ", changed, ": ", b[changed], " -> ", x[changed]))
-  end
-  println("[arraycode] sweep at t = ", t, ", pass ", pass, ": ", join(parts, "; "))
+  _traceChanges!(parts, "relations", before[1], after[1])
+  _traceChanges!(parts, "discretes", before[2], after[2])
+  _traceChanges!(parts, "event functions", before[3], after[3])
+  _traceChanges!(parts, "when-conditions", before[4], after[4])
+  _traceChanges!(parts, "reinit", before[5], after[5])
+  _traceLine("[arraycode] sweep at t = ", t, ", pass ", pass, ": ", join(parts, "; "))
   return nothing
 end
 
 """
-    _searchRelations!(equations!, whens!, du, a, u, p, t, fire, rel0, d0, flips) -> Bool
+A line of a run's trace (OMBACKEND_ARRAY_TRACE) on the process's standard output, `Core.stdout`: one stream type,
+which an executable's trimming resolves (`stdout` is an `IO` a session may replace).
+"""
+function _traceLine(parts::Vararg{Any, N})::Nothing where {N}
+  println(Core.stdout, parts...)
+  return nothing
+end
+
+"The slots where `before` and `after` differ, with both values, into `parts` as `<label> [slots]: [before] -> [after]`."
+function _traceChanges!(parts::Vector{String}, label::String, before::Vector{T}, after::Vector{T})::Nothing where {T}
+  local changed::Vector{Int} = findall(before .!= after)
+  isempty(changed) && return nothing
+  push!(parts, string(label, " ", _vectorText(changed), ": ", _vectorText(before[changed]), " -> ",
+                      _vectorText(after[changed])))
+  return nothing
+end
+
+"`v` as `[x, y, ...]`, its entries printed by `string` (no `show` of an array)."
+_vectorText(v::Vector{T}) where {T} = string("[", join(String[string(x) for x in v], ", "), "]")
+
+"""
+    _searchRelations!(du, a, u, p, t, fire, rel0, d0, flips, instance, relation) -> Bool
 
 The solution of a mixed system whose relations cycle in the event iteration's sweeps (`flips`: the relations that
 kept changing): the combinations of their values, fewest changes from the values before the sweeps (`rel0`, the
@@ -3733,31 +3814,29 @@ did not change in the sweeps. MSL IdealizedOpAmpLimited's `if V0*v_in > vps then
 V0*v_in` in SignalGenerator's comparator loop: at the fold the lower limit and the linear branch each gave the other,
 the upper limit (the jump to +15 V) is the solution.
 """
-function _searchRelations!(@nospecialize(equations!::Function), @nospecialize(whens!::Function), du::AbstractVector, a::AbstractVector, u::AbstractVector,
-                           p::ArrayModelParameters, t::Real, fire::Bool, rel0::Vector{Bool}, d0::Vector{Float64},
+function _searchRelations!(du::AbstractVector, a::AbstractVector, u::AbstractVector, p::ArrayModelParameters, t::Real, fire::Bool, rel0::Vector{Bool}, d0::Vector{Float64},
                            flips::BitVector, instance::Vector{Int},
                            relation::BitVector)::Bool
   local slots::Vector{Int} =
-    sort!(union(findall(flips), _literalChanges!(equations!, whens!, du, a, u, p, t, fire, rel0, d0)))
-  _searchCombinations!(equations!, whens!, du, a, u, p, t, fire, rel0, d0, slots) && return true
+    sort!(union(findall(flips), _literalChanges!(du, a, u, p, t, fire, rel0, d0)))
+  _searchCombinations!(du, a, u, p, t, fire, rel0, d0, slots) && return true
   local instances::Set{Int} = Set{Int}(instance[s] for s in slots)
   local wider::Vector{Int} = filter(s::Int -> relation[s] && instance[s] in instances, eachindex(instance))
   length(wider) > length(slots) || return false
-  return _searchCombinations!(equations!, whens!, du, a, u, p, t, fire, rel0, d0, wider)
+  return _searchCombinations!(du, a, u, p, t, fire, rel0, d0, wider)
 end
 
 """
-    _searchCombinations!(equations!, whens!, du, a, u, p, t, fire, rel0, d0, slots) -> Bool
+    _searchCombinations!(du, a, u, p, t, fire, rel0, d0, slots) -> Bool
 
 The combinations of the relations `slots` for `_searchRelations!`, fewest changes from `rel0` first; the first that
 gives itself back left in place (true), else the relations and discrete values `rel0` and `d0` restored (false); none
 tried for none or more than 12 slots.
 """
-function _searchCombinations!(@nospecialize(equations!::Function), @nospecialize(whens!::Function), du::AbstractVector, a::AbstractVector, u::AbstractVector,
-                              p::ArrayModelParameters, t::Real, fire::Bool, rel0::Vector{Bool}, d0::Vector{Float64},
+function _searchCombinations!(du::AbstractVector, a::AbstractVector, u::AbstractVector, p::ArrayModelParameters, t::Real, fire::Bool, rel0::Vector{Bool}, d0::Vector{Float64},
                               slots::Vector{Int})::Bool
   local trace::Bool = _OMBACKEND.envSwitch("OMBACKEND_ARRAY_TRACE")
-  trace && println("[arraycode] relation search at t = ", t, ": relations ", slots)
+  trace && _traceLine("[arraycode] relation search at t = ", t, ": relations ", _vectorText(slots))
   (isempty(slots) || length(slots) > 12) && return false
   local masks::Vector{Int} = sort!(collect(0:((1 << length(slots)) - 1)); by = count_ones)
   for mask::Int in masks
@@ -3773,8 +3852,8 @@ function _searchCombinations!(@nospecialize(equations!::Function), @nospecialize
     try
       for _ in 1:6
         local dBefore::Vector{Float64} = copy(p.d)
-        equations!(du, a, u, p, t, NO_CROSSINGS, false, fire)
-        whens!(du, a, u, p, t, NO_CROSSINGS, false, false)
+        p.code.equations!(du, a, u, p, t, NO_CROSSINGS, false, fire)
+        p.code.whens!(du, a, u, p, t, NO_CROSSINGS, false, false)
         if dBefore == p.d
           stable = true
           break
@@ -3784,10 +3863,10 @@ function _searchCombinations!(@nospecialize(equations!::Function), @nospecialize
       p.state.forced = false
     end
     (stable && all(isfinite, a) && all(isfinite, du)) || continue
-    equations!(du, a, u, p, t, NO_CROSSINGS, true, fire)
-    whens!(du, a, u, p, t, NO_CROSSINGS, true, fire)
-    trace && println("[arraycode]   combination ", candidate[slots], " gives ", p.rel[slots], "; others changed: ",
-                     setdiff(findall(p.rel .!= candidate), slots))
+    p.code.equations!(du, a, u, p, t, NO_CROSSINGS, true, fire)
+    p.code.whens!(du, a, u, p, t, NO_CROSSINGS, true, fire)
+    trace && _traceLine("[arraycode]   combination ", _vectorText(candidate[slots]), " gives ", _vectorText(p.rel[slots]),
+                        "; others changed: ", _vectorText(setdiff(findall(p.rel .!= candidate), slots)))
     p.rel == candidate && return true
   end
   p.rel .= rel0
@@ -3796,15 +3875,14 @@ function _searchCombinations!(@nospecialize(equations!::Function), @nospecialize
 end
 
 """
-    _literalChanges!(equations!, whens!, du, a, u, p, t, fire, rel0, d0) -> Vector{Int}
+    _literalChanges!(du, a, u, p, t, fire, rel0, d0) -> Vector{Int}
 
 The relations whose literal value (no hysteresis) at (u, t), with the relations `rel0` and the discrete values `d0`,
 differs from theirs: those within their hysteresis band (`_relationAt`). The equations and the lifted clusters of
 discrete equations (`whens!`: a Boolean `regular = x >= 6`) evaluated once; the relations, discrete values,
 event-generating functions' values, when-conditions and reinit values are restored.
 """
-function _literalChanges!(@nospecialize(equations!::Function), @nospecialize(whens!::Function), du::AbstractVector, a::AbstractVector, u::AbstractVector,
-                          p::ArrayModelParameters, t::Real, fire::Bool, rel0::Vector{Bool},
+function _literalChanges!(du::AbstractVector, a::AbstractVector, u::AbstractVector, p::ArrayModelParameters, t::Real, fire::Bool, rel0::Vector{Bool},
                           d0::Vector{Float64})::Vector{Int}
   local hyst::Float64 = p.hyst[1]
   local (evv::Vector{Float64}, wnew::Vector{Bool}, ureinit::Vector{Float64}) =
@@ -3814,8 +3892,8 @@ function _literalChanges!(@nospecialize(equations!::Function), @nospecialize(whe
   p.hyst[1] = 0.0
   local changed::Vector{Int}
   try
-    equations!(du, a, u, p, t, NO_CROSSINGS, true, fire)
-    whens!(du, a, u, p, t, NO_CROSSINGS, true, fire)
+    p.code.equations!(du, a, u, p, t, NO_CROSSINGS, true, fire)
+    p.code.whens!(du, a, u, p, t, NO_CROSSINGS, true, fire)
     changed = findall(p.rel .!= rel0)
   finally
     p.hyst[1] = hyst
@@ -4096,5 +4174,6 @@ end
 include("arrayEvents.jl")
 include("arrayAsserts.jl")
 include("arrayInitialization.jl")
+include("mainGeneration.jl")
 
 end #= module ArrayPreserveDE =#

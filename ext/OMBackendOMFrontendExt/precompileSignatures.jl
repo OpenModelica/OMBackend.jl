@@ -201,7 +201,7 @@ precompile(Tuple{typeof(OMBackend.Traversal.traverseField), OMBackend.OMJLIR.LBI
 precompile(Tuple{typeof(OMBackend.OMJLIR.formHash), OMBackend.OMJLIR.UNARY, UInt64})
 precompile(Tuple{typeof(OMBackend.Traversal.traverseField), OMBackend.OMJLIR.IF_EQUATION, OMBackend.OMJLIR._RootVisit, Nothing})
 precompile(Tuple{typeof(OMBackend.CodeGeneration.AlgorithmicCodeGeneration.expToJuliaExpAlg), OMBackend.SimCode.CAST})
-precompile(Tuple{Type{OMBackend.CodeGeneration.ArrayPreserveDE.ArrayModelCode}, Function, Function, Function, Function, Function, Function, Function, Bool, Bool, Bool, Bool, Int64, Int64, Base.BitArray{1}, Base.BitArray{1}, Array{Int64, 1}, Array{Int64, 1}, Array{Int64, 1}, Int64, Array{Int64, 1}, Array{Int64, 1}, Array{String, 1}, Array{Tuple{Int64, Int64, Int64}, 1}, Array{Array{Int64, 1}, 1}, Array{Int64, 1}, Array{Tuple{String, String, Bool}, 1}})
+precompile(Tuple{Type{OMBackend.CodeGeneration.ArrayPreserveDE.ErasedArrayModelCode}, Function, Function, Function, Function, Function, Function, Function, Function, Bool, Bool, Bool, Bool, Int64, Int64, Base.BitArray{1}, Base.BitArray{1}, Array{Int64, 1}, Array{Int64, 1}, Array{Int64, 1}, Int64, Array{Int64, 1}, Array{Int64, 1}, Array{String, 1}, Array{Tuple{Int64, Int64, Int64}, 1}, Array{Array{Int64, 1}, 1}, Array{Int64, 1}, Array{Tuple{String, String, Bool}, 1}})
 precompile(Tuple{typeof(OMBackend.SimCode.Domains._affine), OMBackend.SimCode.Domains.Ref, String})
 precompile(Tuple{typeof(OMBackend.SimCode.Domains._mul), OMBackend.SimCode.Domains.Op, OMBackend.SimCode.Domains.Ref})
 precompile(Tuple{typeof(OMBackend.SimCode.Domains._add), OMBackend.SimCode.Domains.Ref, OMBackend.SimCode.Domains.Op})

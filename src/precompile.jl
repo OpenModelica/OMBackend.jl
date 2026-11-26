@@ -385,8 +385,7 @@ _precompileResidual!(res::AbstractVector, z::AbstractVector, ::Any)::Nothing = _
 
 The array code's helpers that every array model calls with its own functions (`@nospecialize`: compiled once, for
 `Function`), into the image: the initial system's solve (`sortedInitialSolve`, `scaledTrustRegionSolve`: NonlinearSolve's
-TrustRegion over `_ScaledResidual`; `newtonInitialSolve`), the asserts' step-start state (`_withDiscreteState`) and the
-relation search of an event iteration. Without them, a process's first model with asserts or an initial system compiled them (PID_Controller
+TrustRegion over `_ScaledResidual`; `newtonInitialSolve`) and the relation search of an event iteration. Without them, a process's first model with asserts or an initial system compiled them (PID_Controller
 0.14 s, 2026-11-18).
 """
 function _precompileWarmupArrayHelpers()::Nothing
@@ -395,10 +394,9 @@ function _precompileWarmupArrayHelpers()::Nothing
     AG.sortedInitialSolve(_precompileResidual!, [0.0, 0.0], [1.0, 1.0], reads)
   end
   AG.newtonInitialSolve(_precompileResidual!, [0.0, 0.0])
-  local P::DataType = AG.ArrayModelParameters
+  local P::DataType = AG.ArrayModelParameters{AG.ErasedArrayModelCode}
   local V::DataType = Vector{Float64}
-  precompile(AG._withDiscreteState, (Function, P, Tuple{V, V, Vector{Bool}, V}))
-  precompile(AG._searchRelations!, (Function, Function, V, V, V, P, Float64, Bool, Vector{Bool}, V, BitVector, Vector{Int},
+  precompile(AG._searchRelations!, (V, V, V, P, Float64, Bool, Vector{Bool}, V, BitVector, Vector{Int},
                                     BitVector))
   return nothing
 end
