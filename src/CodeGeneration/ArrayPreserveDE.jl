@@ -303,9 +303,10 @@ end
     LoopWork{T}(k)
 
 The work arrays of a loop family's solve (`loopFamilySolve!`) of `k` unknowns: the iterate, the residuals there and at a
-perturbed point, the step, an attempt's start, the Jacobian, its LU factors (`_luFactor!`) and their pivots. One per
-family in the parameters for solves on Float64 (`ArrayModelParameters.loopWork`), so that a right-hand side allocates
-none; a solve on another number type (a solver's dual numbers) makes its own.
+perturbed point, the step, a kept iterate (the converged one while it is refined, or a stalled one), the Jacobian, its
+LU factors (`_luFactor!`) and their pivots. One per family in the parameters for solves on Float64
+(`ArrayModelParameters.loopWork`), so that a right-hand side allocates none; a solve on another number type (a
+solver's dual numbers) makes its own.
 """
 struct LoopWork{T}
   x::Vector{T}
@@ -559,7 +560,8 @@ families, `LOOPRES!`, a branch per family: this solve is compiled once per model
 algebraic variable in a after), the Jacobian by forward differences; the last solution kept as the next guess in
 `p.loops[f]` (in Float64 solves); residuals or a Jacobian not finite, or a singular Jacobian, make the unknowns NaN
 (the solver rejects the step); a solve that does not converge is made again with damped steps, from the last solution,
-from the start values `start` and from those varied by 0.1 of their size. The unknowns' sizes are at least their
+from the start values `start` and from those varied by 0.1 of their size; where none converges, the unknowns NaN too,
+or a stalled attempt's last iterate (steps within 1e-5, as `_blockNewton!`). The unknowns' sizes are at least their
 nominal values `nominal` (`SimCode._nominalValue`, per unknown and member), in the differences' steps, the varied
 starts and the convergence test, as omc's max(|x|, nominal) (omc's testsuite DAEModeNominal: x^2 + y^2 = 2 VBase^2
 from x = 1, nominal VBase = 230940; a step of 1.5e-8 at x = 1 lost the residual's change at 1e11, the Jacobian singular).
@@ -650,12 +652,14 @@ function loopFamilySolve!(residual!::R, f::Int, ids::Matrix{Int}, start::Matrix{
        Start values at which the residuals are stationary in an unknown leave no step (omc's testsuite Tearing9,
        x1*x1 - x3 + 2 = 0 from x1 = 0: the Jacobian [0], the least-norm step zero); varied as OpenModelica varies
        them (nonlinearSolverHybrd.c: x += 0.1 nominal; `blockSolve!` for a block), the positive root =#
+    local stalled::Bool = false
     for attempt::Int in 1:4
       converged && break
       for j::Int in 1:k
-        attempt == 2 && (xs[j] = x[j])
         x[j] = attempt <= 2 ? G[j, m] : attempt == 3 ? start[j, m] : start[j, m] + 0.1 * max(nominal[j, m], abs(start[j, m]))
       end
+      #= the steps in a row within 1e-5 of the unknowns' sizes, none a least-squares one =#
+      local small::Int = 0
       for _ in 1:50
         _setLoopUnknowns!(du, a, x, ids, m, nS)
         _loopResidual!(residual!, attempt > 1, f, r, du, a, u, p, t, zHeld, modeHeld, fire, m)
@@ -672,9 +676,9 @@ function loopFamilySolve!(residual!::R, f::Int, ids::Matrix{Int}, start::Matrix{
         end
         #= residuals or a Jacobian not finite, or a singular Jacobian (a trial point of the solver where the equations
            overflow, or a junction's derivative underflows: MSL DifferenceAmplifier's transistors): the unknowns NaN,
-           so the step is rejected =#
+           so the step is rejected; in a step after convergence the converged iterate (`xs`) stands =#
         if !(all(isfinite, r) && all(isfinite, J))
-          fill!(x, NaN)
+          converged ? copyto!(x, xs) : fill!(x, NaN)
           break
         end
         local leastSquares::Bool = false
@@ -686,7 +690,7 @@ function loopFamilySolve!(residual!::R, f::Int, ids::Matrix{Int}, start::Matrix{
           copyto!(dx, _LINALG.pinv(J; rtol = RANK_TOLERANCE) * r)
           leastSquares = true
         else
-          fill!(x, NaN)
+          converged ? copyto!(x, xs) : fill!(x, NaN)
           break
         end
         local scale::Float64 = 1.0
@@ -717,23 +721,41 @@ function loopFamilySolve!(residual!::R, f::Int, ids::Matrix{Int}, start::Matrix{
           x[j] -= scale * dx[j]
           step = max(step, abs(dx[j]) / (nominal[j, m] + abs(x[j])))
         end
+        #= converged, refined by the steps after (to 1e-12): a refining step that does not converge again leaves the
+           converged iterate =#
+        local refining::Bool = converged
         converged = step <= 1.0e-8 && (!leastSquares || _consistentResiduals(r, J, x, view(nominal, :, m)))
+        if refining && !converged
+          copyto!(x, xs)
+          converged = true
+          break
+        end
+        converged && copyto!(xs, x)
+        small = step <= 1.0e-5 && !leastSquares ? small + 1 : 0
         step <= 1.0e-12 && break
       end
       converged && break
-      #= no attempt converged: the first one's last iterate (NaN where it was not finite: the step is rejected) =#
-      if attempt == 4
-        for j::Int in 1:k
-          x[j] = xs[j]
-        end
+      #= the iterations used up in 10 steps or more within 1e-5 (round-off times the loop's condition): stalled at the
+         solution, kept in case no attempt converges, as `_blockNewton!` accepts a block's steps that stop contracting
+         within 1e-5 =#
+      if !stalled && small >= 10 && all(isfinite, x)
+        copyto!(xs, x)
+        stalled = true
       end
     end
+    #= no attempt converged: NaN, the step rejected, as OpenModelica rejects a step at which a nonlinear system is not
+       solved. The first attempt's last iterate went into the solution (omc's testsuite Tearing19 from t = 0.714:
+       residuals up to 0.97, retcode Success; x + y = 1, x*y = time past t = 1/4) =#
+    if !converged
+      stalled ? copyto!(x, xs) : fill!(x, NaN)
+      converged = stalled
+    end
     _setLoopUnknowns!(du, a, x, ids, m, nS)
-    #= the relations at the solution: their crossings, at an event their values; the algorithms' outputs at it =#
-    (relations || outputs) && residual!(f, r, du, a, u, p, t, z, mode, fire, m)
-    #= the solution as the next guess: not a failed solve's NaN, nor the last iterate of a solve that did not converge
-       (unknowns that hold no solution, as a state set's selection read with the other side's states: the next solve
-       went to another root from there) =#
+    #= the relations at the solution: their crossings, at an event their values; the algorithms' outputs at it. At NaN
+       an error of the equations (a function's assert) is the loop's failure, not another one =#
+    (relations || outputs) && _loopResidual!(residual!, !converged, f, r, du, a, u, p, t, z, mode, fire, m)
+    #= the solution as the next guess, a stalled one too: not a failed solve's NaN (unknowns that hold no solution, as
+       a state set's selection read with the other side's states: the next solve went to another root from there) =#
     if converged && T === Float64 && all(isfinite, x)
       for j::Int in 1:k
         G[j, m] = x[j]
