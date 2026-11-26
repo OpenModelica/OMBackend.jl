@@ -875,6 +875,16 @@ struct AGENTIC_RECOMPILATION <: Statement
   initialEquations::Union{Nothing, String}
 end
 
+"""
+    TRANSITION(to)
+
+OMJL's explicit structural transition (`structuralTransition(from, to, condition)`) as the body of a structural
+when-equation of its mode `from` (`Passes.modeModels`): the switch to the mode `to` at the event.
+"""
+struct TRANSITION <: Statement
+  to::String
+end
+
 #= ==================================================================================== =#
 #= Equations                                                                            =#
 #= ==================================================================================== =#
@@ -2217,6 +2227,7 @@ _print(io::IO, ::BREAK, ::String) = print(io, "break")
 _print(io::IO, s::RECOMPILATION, ::String) = (print(io, "recompilation("); _print(io, s.component); print(io, ", "); _print(io, s.newValue); print(io, ")"))
 _print(io::IO, s::AGENTIC_RECOMPILATION, ::String) =
   (print(io, "agenticRecompilation("); _printJoined(io, s.components); print(io, ")"))
+_print(io::IO, s::TRANSITION, ::String) = print(io, "transition(", s.to, ")")
 
 _print(io::IO, b::StatementBranch) = _printBranches(io, "if", "elseif", [b], "")
 _print(io::IO, b::WhenBranch) = _printWhenBranches(io, [b], "")

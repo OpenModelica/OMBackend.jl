@@ -37,7 +37,7 @@ precompilation of OMBackend alone short; `OM` loads the first two itself):
 
 * Plots.jl: `OMBackend.plot` (`OMBackendPlotsExt`). On Windows load Plots before OMBackend: Glib's gettext
   runtime must be loaded before OMRuntimeExternalC's (OMBackend.jl#101).
-* JuliaFormatter.jl: the formatted generated code of `printModel`, `modelToString` and `writeModelToFile`; without it
+* JuliaFormatter.jl: the formatted code of `exportModel`'s Julia source; without it
   the code is written as it is (`OMBackendJuliaFormatterExt`).
 * OMFrontend.jl with MetaModelica.jl: the lowering of the frontend's flat model (`OMBackendOMFrontendExt`).
 

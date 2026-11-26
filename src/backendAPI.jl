@@ -325,8 +325,12 @@ translate reports in its error where none takes the model (`scalarizedFallbackRe
 """
 const ARRAY_PATH_REASONS = Dict{String, Dict{String, String}}()
 
-"The arrays-kept paths, in the order a translate tries them (`declineArrayPath!`, `scalarizedFallbackReason`)."
-const ARRAY_PATHS = ("array index reduction", "array code after index reduction", "backend scalarization")
+"""
+The arrays-kept paths, in the order a translate tries them (`declineArrayPath!`, `scalarizedFallbackReason`); a
+variable structure system's first (`structuralArrayTargetCode`), its modes through the array index reduction.
+"""
+const ARRAY_PATHS = ("array code of the structural modes", "array index reduction", "array code after index reduction",
+                     "backend scalarization")
 
 "The arrays-kept path `path` (one of ARRAY_PATHS) did not take the model `name`, for `reason`."
 function declineArrayPath!(name::String, path::String, reason::String)::Nothing
@@ -657,26 +661,56 @@ function generateReducedArrayPreserveDETargetCode(name::String, reduced::OMJLIR.
   end
   ARRAY_PRESERVE_DE_GENERATION[] || return decline("switched off (OMBackend.ARRAY_PRESERVE_DE_GENERATION)")
   isempty(TUNABLE_PARAMETERS[]) || return decline("withTunableParameters (the ModelingToolkit path's tunable sets)")
-  local reduction::Module = Passes.IndexReduction
   local (modelName::Union{Nothing, String}, modelCode::Union{String, Expr}) = try
-    #= solvedInArrays splits arrays in place (splitArrays!), a split that throws part-way leaves its model half split:
-       a copy, so the scalarized fallback reads `reduced` as reduced =#
-    local working::OMJLIR.Model = OMJLIR.Model(reduced.name, deepcopy(reduced.variables), deepcopy(reduced.continuous),
-                                               reduced.clocked, reduced.baseClocks, reduced.functions, reduced.initialMode,
-                                               reduced.modes, reduced.transitions, reduced.frontendModel)
-    local (solved::OMJLIR.Model, _) = @BACKEND_PERFLOG "[backendAPI] solvedInArrays" reduction.solvedInArrays(working)
-    Passes.arrayCodeForm!(solved)
-    local sc::SimCode.SIM_CODE = @BACKEND_PERFLOG "[backendAPI] array simulation code" SimCode.lowerArraySystem(solved)
-    @BACKEND_PERFLOG "[backendAPI] array code (after index reduction)" CodeGeneration.ArrayPreserveDE.generateArrayPreserveDECode(sc, name)
+    _arrayModuleCode(reduced, name)
   catch err
     isFatal(err) && rethrow()
-    err isa reduction.NotHandled && return decline(sprint(showerror, err))
-    err isa UnsupportedLowering &&
-      return decline(err.construct === nothing ? err.what : string(err.what, ": ", SimCode.Domains._str(err.construct)))
-    @warn "[backendAPI] array code after index reduction for $(name): an error ($(first(sprint(showerror, err), 300)))"
-    return decline("an error: $(first(sprint(showerror, err), 300))")
+    return decline(_arrayCodeReason(name, err))
   end
   modelName === nothing && return decline(string(modelCode))
+  return _registeredArrayModel(name, modelCode, decline)
+end
+
+"""
+    _arrayModuleCode(reduced, moduleName; owner = moduleName) -> Tuple{Union{Nothing, String}, Union{String, Expr}}
+
+The array module `moduleName` of the model whose index was reduced in array form (`reduced`, `reducedArrayModel`; not
+changed), as `generateArrayPreserveDECode` gives it: its derivative unknowns solved in array form
+(`Passes.IndexReduction.solvedInArrays`), in the array code's form (`Passes.arrayCodeForm!`), lowered into its
+simulation code (`SimCode.lowerArraySystem`). `owner`: the model whose build owns its external objects (a structural
+mode's: the model of the modes).
+"""
+function _arrayModuleCode(reduced::OMJLIR.Model, moduleName::String;
+                          owner::String = moduleName)::Tuple{Union{Nothing, String}, Union{String, Expr}}
+  #= solvedInArrays splits arrays in place (splitArrays!), a split that throws part-way leaves its model half split:
+     a copy, so the scalarized fallback reads `reduced` as reduced =#
+  local working::OMJLIR.Model = OMJLIR.Model(reduced.name, deepcopy(reduced.variables), deepcopy(reduced.continuous),
+                                             reduced.clocked, reduced.baseClocks, reduced.functions, reduced.initialMode,
+                                             reduced.modes, reduced.transitions, reduced.frontendModel)
+  local (solved::OMJLIR.Model, _) = @BACKEND_PERFLOG "[backendAPI] solvedInArrays" Passes.IndexReduction.solvedInArrays(working)
+  Passes.arrayCodeForm!(solved)
+  local sc::SimCode.SIM_CODE = @BACKEND_PERFLOG "[backendAPI] array simulation code" SimCode.lowerArraySystem(solved)
+  return @BACKEND_PERFLOG "[backendAPI] array code (after index reduction)" CodeGeneration.ArrayPreserveDE.generateArrayPreserveDECode(sc, moduleName; owner)
+end
+
+"""
+The reason the error `err` of the array code's generation of the model `name` (`_arrayModuleCode`) declines it: what
+the array form does not handle (NotHandled, UnsupportedLowering), another error (also a warning).
+"""
+function _arrayCodeReason(name::String, err::Exception)::String
+  err isa Passes.IndexReduction.NotHandled && return sprint(showerror, err)
+  err isa UnsupportedLowering &&
+    return err.construct === nothing ? err.what : string(err.what, ": ", SimCode.Domains._str(err.construct))
+  @warn "[backendAPI] array code after index reduction for $(name): an error ($(first(sprint(showerror, err), 300)))"
+  return string("an error: ", first(sprint(showerror, err), 300))
+end
+
+"""
+The array module `modelCode` of the model `name` cached and recorded (`_registerArrayPreserveDEModule!`,
+ARRAY_REDUCED_MODELS), `(name, modelCode)`; declined (`decline`, `nothing`) where it does not start
+(`_arrayStartFailure`).
+"""
+function _registeredArrayModel(name::String, modelCode::Expr, decline::Function)::Union{Nothing, Tuple{String, Expr}}
   _registerArrayPreserveDEModule!(name, modelCode)
   local failure::Union{Nothing, String} = _arrayStartFailure(name, modelCode)
   if failure !== nothing
@@ -686,6 +720,84 @@ function generateReducedArrayPreserveDETargetCode(name::String, reduced::OMJLIR.
   end
   push!(ARRAY_REDUCED_MODELS, name)
   return (name, modelCode)
+end
+
+"""
+    structuralArrayTargetCode(lower, name) -> Union{Nothing, Tuple{String, Expr}}
+
+The array model of the variable structure system `name` (canonical; OMJL's structural modes and recompilations,
+`Passes.isStructural`) that `lower()` lowers to OMJLIR: a module of one array module per mode
+(`ArrayPreserveDE.structuralModesModule`), each mode's model (`Passes.modeModels`; the model itself where it has no
+modes) through the array form (`reducedArrayModel`) to its array code (`_arrayModuleCode`). The modes a recompilation
+gives are compiled during the simulation (`recompiledArrayModule`). Cached and recorded as the arrayPreserveDE models
+(`_registeredArrayModel`). `nothing` where the array form or code does not take a mode: the reason recorded
+(`declineArrayPath!`, "array code of the structural modes", or reducedArrayModel's), and the caller scalarizes.
+"""
+function structuralArrayTargetCode(lower::Function, name::String)::Union{Nothing, Tuple{String, Expr}}
+  local decline::Function = (reason::String) -> begin
+    @info "[backendAPI] array code of the structural modes not taken for $(name): $(reason)"
+    declineArrayPath!(name, "array code of the structural modes", reason)
+    nothing
+  end
+  ARRAY_PRESERVE_DE_GENERATION[] || return decline("switched off (OMBackend.ARRAY_PRESERVE_DE_GENERATION)")
+  isempty(TUNABLE_PARAMETERS[]) || return decline("withTunableParameters (the ModelingToolkit path's tunable sets)")
+  local modes::Vector{Tuple{String, Expr}} = Tuple{String, Expr}[]
+  local initialMode::String = name
+  local frontendModel::Any = nothing
+  try
+    local lowered::OMJLIR.Model = @BACKEND_PERFLOG "[backendAPI] lowered (arrays kept)" lower()
+    frontendModel = lowered.frontendModel
+    if isempty(lowered.modes)
+      #= a model that recompiles: its first mode is the model; lowered again where the array form needs it again =#
+      local fresh::Base.RefValue{Bool} = Base.RefValue{Bool}(true)
+      local again::Function = () -> fresh[] ? (fresh[] = false; lowered) : lower()
+      local reduced::Union{Nothing, OMJLIR.Model} = reducedArrayModel(again, name)
+      reduced === nothing && return nothing
+      local (moduleName::Union{Nothing, String}, code::Union{String, Expr}) = _arrayModuleCode(reduced, "Mode_1"; owner = name)
+      moduleName === nothing && return decline(string(code))
+      push!(modes, (name, code))
+    else
+      initialMode = something(lowered.initialMode, first(lowered.modes).name)
+      for (k::Int, model::OMJLIR.Model) in enumerate(Passes.modeModels(lowered))
+        local modeName::String = lowered.modes[k].name
+        local reduced::Union{Nothing, OMJLIR.Model} = reducedArrayModel(() -> deepcopy(model), name)
+        reduced === nothing && return nothing
+        local (moduleName::Union{Nothing, String}, code::Union{String, Expr}) =
+          _arrayModuleCode(reduced, string("Mode_", k); owner = name)
+        moduleName === nothing && return decline(string("the mode ", modeName, ": ", code))
+        push!(modes, (modeName, code))
+      end
+    end
+  catch err
+    isFatal(err) && rethrow()
+    return decline(_arrayCodeReason(name, err))
+  end
+  local modelCode::Expr = CodeGeneration.ArrayPreserveDE.structuralModesModule(name, modes, initialMode, frontendModel)
+  return _registeredArrayModel(name, modelCode, decline)
+end
+
+"""
+    recompiledArrayModule(name, frontendModel, element, value, moduleName) -> Tuple{Expr, Any}
+
+The array module `moduleName` of a mode of the array model `name` (`structuralArrayTargetCode`) recompiled at a
+structural change, and its frontend model: the frontend's model `frontendModel` with the element `element` set to
+`value`, instantiated again with its arrays kept (`Runtime.recompiledArrayModel`), through the array form and code as
+the model's modes at its translate. An error where they do not take it.
+"""
+function recompiledArrayModule(name::String, @nospecialize(frontendModel), element::String, value::Union{Bool, Int, Float64},
+                               moduleName::String)::Tuple{Expr, Any}
+  local lower::Function = () -> Runtime.recompiledArrayModel(frontendModel, name, element, value)
+  #= the translate's record of the model kept (reducedArrayModel drops it at its start) =#
+  local recorded::Bool = name in ARRAY_REDUCED_MODELS
+  local reduced::Union{Nothing, OMJLIR.Model} = reducedArrayModel(lower, name)
+  recorded && push!(ARRAY_REDUCED_MODELS, name)
+  reduced === nothing &&
+    error(string("array model ", name, ": the mode recompiled with ", element, " = ", value, " is outside the array form (",
+                 scalarizedFallbackReason(name), ")"))
+  local (modelName::Union{Nothing, String}, code::Union{String, Expr}) = _arrayModuleCode(reduced, moduleName; owner = name)
+  modelName === nothing &&
+    error(string("array model ", name, ": the mode recompiled with ", element, " = ", value, " has no array code (", code, ")"))
+  return (code::Expr, reduced.frontendModel)
 end
 
 """
@@ -816,14 +928,7 @@ function generateIMTKTargetCode(simCode::SimCode.SIM_CODE)::Tuple{String, Expr}
   return (modelName, modelCode)
 end
 
-"""
-The generated code of a model for writing it out: the array path's module for an array
-model, else the MTK path's code.
-"""
-_writtenModel(modelName) = modelName in ARRAY_PRESERVE_DE_MODELS && haskey(COMPILED_MODELS_ARRAY_PRESERVE_DE, modelName) ?
-  COMPILED_MODELS_ARRAY_PRESERVE_DE[modelName][1] : getCompiledModel(modelName)
-
-function getCompiledModel(modelName)
+function getCompiledModel(modelName::String)::Expr
   haskey(COMPILED_MODELS_MTK, modelName) ||
     error("Model $(modelName) is not compiled (OMBackend.translate first). Translated: $(join(availableModels(), ", "))")
   return COMPILED_MODELS_MTK[modelName][1]
@@ -901,92 +1006,6 @@ function _evalModelArrayPreserveDE(modelName::String, modelCode::Expr)::Nothing
   ARRAY_MODULES[modelName] = (_modelModule(Symbol(modelName)), h)
   return nothing
 end
-
-"""
-
-```
-writeModelToFile(modelName::String, filePath::String; keepComments = true, keepBeginBlocks = true)
-```
-  Writes a model to file by default the file is formatted and comments are kept.
-"""
-function writeModelToFile(modelName::String, filePath::String; keepComments = true, keepBeginBlocks = true)
-  model = _writtenModel(modelName)
-  try
-    mAsStr = modelToString(modelName; MTK = true,
-                           keepComments = keepComments,
-                           keepBeginBlocks = keepBeginBlocks)
-    if model.head == :module
-      #= Module expression serializes cleanly, no begin/end stripping needed =#
-      mAsStr = OSMC_COPYRIGHT_HEADER * mAsStr
-      writeStringToFile(filePath, mAsStr)
-    else
-      try
-        #= Replace top level begin/end for legacy quote blocks =#
-        beginIdx = last(findfirst("begin", mAsStr)) + 1
-        endIdx = first(findlast("end",  mAsStr)) - 1
-        mAsStr = mAsStr[beginIdx:endIdx]
-        mAsStr = OSMC_COPYRIGHT_HEADER * mAsStr
-        writeStringToFile(filePath, mAsStr)
-      catch e
-        @error "Error removing initial begin/end pairs" exception=(e, catch_backtrace())
-      end
-    end
-  catch e
-    @error "Failed writing $model to file: $filePath" exception=(e, catch_backtrace())
-  end
-end
-
-"""
-    Write the contents of a string to file.
-"""
-function writeStringToFile(fileName::String, contents::String)
-  local fdesc = open(fileName, "w")
-  write(fdesc, contents)
-  close(fdesc)
-end
-
-"""
-  Prints a model.
-  If the specified model exists. Print it to stdout.
-"""
-function printModel(modelName::String; MTK = true, keepComments = true, keepBeginBlocks = true)
-  try
-    println(modelToString(modelName::String; MTK = MTK, keepComments = keepComments, keepBeginBlocks = keepBeginBlocks))
-  catch
-    @error "Model: $(modelName) is not compiled. Available models are: $(join(availableModels(), ", "))"
-    error("Error printing model: $(modelName)")
-  end
-end
-
-"""
- Converts a given backend model to a string
-"""
-function modelToString(modelName::String; MTK = true, keepComments = true, keepBeginBlocks = true)
-  local model::Expr = _writtenModel(modelName)
-  strippedModel = "$model"
-  #= Remove all the redundant blocks from the model =#
-  if keepComments == false
-    strippedModel = CodeGeneration.stripComments(model)
-  end
-  if keepBeginBlocks == false
-    strippedModel = CodeGeneration.stripBeginBlocks(model)
-  end
-  local modelStr::String = "$strippedModel"
-  local formattedResults
-  try
-    formattedResults = formatText(modelStr;
-                                  remove_extra_newlines = true,
-                                  indent = 4,
-                                  margin = 200,
-                                  always_use_return = true)
-  catch e
-    isFatal(e) && rethrow()
-    @warn "Julia Formatter failed to format the output results due to $(e)"
-    formattedResults = modelStr
-  end
-  return formattedResults
-end
-
 
 """
     availableModels() -> Vector{String}

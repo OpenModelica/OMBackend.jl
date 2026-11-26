@@ -1,5 +1,6 @@
 #= The public API (src/OMBackend.jl, docs/src/api.md): what holds for all of 1.x. A name added or removed here is an
-   API change: a minor release adds one, only a major release removes one. =#
+   API change: a minor release adds one, only a major release removes one (but 1.3.0 removed printModel, modelToString
+   and writeModelToFile, which exportModel replaces). =#
 
 "The public names of OMBackend 1.x."
 const PUBLIC_API_NAMES = Symbol[
@@ -11,8 +12,8 @@ const PUBLIC_API_NAMES = Symbol[
   :eventCallbacks, :isEventCallback, :isStepControl, :ModelicaAssertionError, :plot,
   #= tunable parameters (OMSurrogates) =#
   :withTunableParameters, :isTunable, :pristineParameters, :buildId,
-  #= inspect and write models =#
-  :availableModels, :printModel, :modelToString, :writeModelToFile,
+  #= inspect and export models =#
+  :availableModels, :exportModel, :ExportFormat, :JuliaSource, :Executable,
   #= caches =#
   :clearCaches!, :forgetModel]
 

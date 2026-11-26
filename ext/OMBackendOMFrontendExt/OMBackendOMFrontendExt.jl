@@ -56,7 +56,7 @@ import OMBackend: OMJLIR, Passes, SimCode, IMTKGen, DEFAULT_BACKEND_MODE, IMTK_M
   MODEL_RUN_DIRS, ARRAY_PRESERVE_DE_MODELS, ARRAY_REDUCED_MODELS, ARRAY_PATH_REASONS, BACKEND_SCALARIZED_MODELS,
   COMPILED_MODELS_MTK, canonicalName,
   createLogRunId, resetFallbacks!, withLogRunDir, debugWrite, logPath, envSwitch, isFatal, declineArrayPath!,
-  generateTargetCode, scalarizedReducedModel, generateReducedArrayPreserveDETargetCode, simulate,
+  generateTargetCode, scalarizedReducedModel, generateReducedArrayPreserveDETargetCode, structuralArrayTargetCode, simulate,
   defaultSolver, daeFallbackSolver, @BACKEND_PERFLOG, @BACKEND_LOGGING
 import OMBackend: translate, explainIndexReduction, omjlirModel, reducedArrayModel, backendScalarizedModel,
   lowerFlatModel, resolveModelicaURI

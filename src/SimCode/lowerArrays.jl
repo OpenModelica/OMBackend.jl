@@ -355,13 +355,18 @@ end
 arrayEquation(names::Names, eq::IR.ASSERT_EQUATION)::Equation =
   ASSERT_EQUATION(simExp(names, eq.condition), simExp(names, eq.message), simExp(names, eq.level), simSource(eq.source))
 
+"""
+A when-equation of a model with its arrays kept: a regular one, and a structural one (OMJL's `recompilation`, an
+explicit transition's switch, `IR.TRANSITION`: the array code ends the mode's run at its event, `ArrayPreserveDE`'s
+structural changes), as `WHEN_EQUATION`; an initial one as `INITIAL_WHEN_EQUATION`.
+"""
 function arrayEquation(names::Names, eq::IR.WHEN_EQUATION)::Equation
   local stmts::Union{Nothing, WHEN_STMTS} = nothing
-  local regular::Bool = eq.kind == IR.REGULAR_WHEN
+  local regular::Bool = eq.kind == IR.REGULAR_WHEN || eq.kind == IR.STRUCTURAL_WHEN
   for b in Iterators.reverse(eq.branches)
     stmts = WHEN_STMTS(arrayWhenCondition(names, b; atEvents = regular), arrayStatements(names, b.body), stmts)
   end
-  eq.kind == IR.REGULAR_WHEN &&
+  regular &&
     return WHEN_EQUATION(stmts::WHEN_STMTS, simSource(eq.source), EQ_ATTR(false, false, eq.attributes.kind === IR.EQ_DISCRETE))
   eq.kind in (IR.INITIAL_WHEN, IR.INITIAL_SECTION) &&
     return INITIAL_WHEN_EQUATION(stmts::WHEN_STMTS, simSource(eq.source), EQ_ATTR_DEFAULT)

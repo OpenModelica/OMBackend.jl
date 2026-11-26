@@ -353,6 +353,10 @@ mutable struct Gen
   #= the record constants (DATA_STRUCTURE) whose bindings are record literals, by name: a partial application's bound
      record input (`_partialApplicationIRx`, `data = Medium.data`) =#
   records::Dict{String, SC.RECORD}
+  #= OMJL's structural changes of the when bodies, numbered in their order (`Op(:structural)`, `_whenEffect`): an
+     explicit transition's switch `(:transition, mode, :none)`, a recompilation `(:recompilation, component, type)`, the
+     type of its new value (`:Real`, `:Integer`, `:Boolean`) =#
+  structuralChanges::Vector{Tuple{Symbol, String, Symbol}}
 end
 
 "A relation of a template by its expression and scope (the iterators' slots, the element-wise dimensions)."

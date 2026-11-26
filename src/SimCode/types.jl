@@ -534,6 +534,11 @@ struct AGENTIC_RECOMPILATION <: Statement
   initialEquations::Union{Nothing, String}
 end
 
+"OMJL's explicit structural transition in a structural when-equation of its mode: the switch to the mode `to` (IR.TRANSITION)."
+struct TRANSITION <: Statement
+  to::String
+end
+
 #= ==================================================================================== =#
 #= Equations                                                                            =#
 #= ==================================================================================== =#

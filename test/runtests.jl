@@ -517,6 +517,11 @@ TEST_GROUP == "kept" || @testset "OMBackend" begin
   #= ── 20w2. What the generated model's variables are (SimCodeKind, IfConditionParameter) ── =#
   include("kindMetadataTests.jl")
 
+  #= ── 20w2b. A translated model exported as Julia source, loaded from its file and simulated ── =#
+  include("exportModelTests.jl")
+  #= an array model's executable: its package, its main run in this session =#
+  include("exportExecutableTests.jl")
+
   #= ── 20w3. The initial value of a state from an alias equation ── =#
   include("aliasInitialValueTests.jl")
 
@@ -532,8 +537,8 @@ TEST_GROUP == "kept" || @testset "OMBackend" begin
   #= ── 20z. A failed build's simulate fails on the build's error ── =#
   include("failedBuildTests.jl")
 
-  #= ── 20z2. Variable structure systems on the arrays-kept route, scalarized by the backend ── =#
-  include("vssScalarizationTests.jl")
+  #= ── 20z2. Variable structure systems on the arrays-kept route: an array module per mode ── =#
+  include("vssArrayCodeTests.jl")
 
   #= ── 21. The backend reads the frontend's flat model only ──────── =#
   @testset "No DAE in the backend" begin

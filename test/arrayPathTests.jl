@@ -1006,9 +1006,13 @@ end DivideInLoop;
     local whens! = (du, a, u, q, t, z, mode, fire) -> nothing
     local a::Vector{Float64} = zeros(length(p.abuf))
     a[1] = 2.0
+    #= the model's code with these two functions (the search calls `p.code`'s), the parameters' other fields shared =#
+    local code = generation.ArrayModelCode(equations!, whens!,
+                                           Any[getfield(p.code, f) for f in fieldnames(typeof(p.code))[3:end]]...)
+    local q = generation.ArrayModelParameters(Any[getfield(p, f) for f in fieldnames(typeof(p))[1:(end - 1)]]..., code)
     #= each relation its own instance: no other relations to search with =#
-    @test generation._searchRelations!(equations!, whens!, zeros(1), a, zeros(1), p, 0.0, true, copy(p.rel), copy(p.d),
-                                       flips, collect(1:length(p.rel)), trues(length(p.rel)))
+    @test generation._searchRelations!(zeros(1), a, zeros(1), q, 0.0, true, copy(p.rel), copy(p.d), flips,
+                                       collect(1:length(p.rel)), trues(length(p.rel)))
     @test p.rel[1] && p.rel[2]
   end
 

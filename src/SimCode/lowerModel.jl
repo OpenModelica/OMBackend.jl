@@ -851,3 +851,4 @@ simStatement(::Names, s::IR.BREAK)::Statement = BREAK(simSource(s.source))
 simStatement(names::Names, s::IR.RECOMPILATION)::Statement = RECOMPILATION(simCref(names, s.component), simExp(names, s.newValue))
 simStatement(names::Names, s::IR.AGENTIC_RECOMPILATION)::Statement =
   AGENTIC_RECOMPILATION(SimCref[simCref(names, c) for c in s.components], s.prompt, s.initialEquations)
+simStatement(::Names, s::IR.TRANSITION)::Statement = TRANSITION(s.to)

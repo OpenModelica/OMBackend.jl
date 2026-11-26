@@ -1798,7 +1798,7 @@ function _whenStatements!(body::Vector{Tuple{Symbol, Ref, IR}}, g::Gen, statemen
       push!(entries, (switch ? :switch : :reinit, state, toIR(g, st.value, ctx)))
     elseif st isa SC.IF && _assignsIn(st)
       _whenIf!(body, g, st, guard, ctx, eq)
-    elseif st isa Union{SC.ASSERT, SC.NORETCALL, SC.TERMINATE, SC.IF}
+    elseif st isa WhenEffect
       push!(entries, (:call, noTarget, _whenEffect(g, st, ctx)))
     else
       ns("a when-statement $(nameof(typeof(st))): $(_str(eq))")
@@ -1940,10 +1940,15 @@ function _arrayValueIRx(g::Gen, e::SC.Exp, ctx::Ctx)::IR
   return _valueIRx(g, e, ctx)
 end
 
+"The when-statements the body runs for their effects (`_whenEffect`)."
+const WhenEffect = Union{SC.ASSERT, SC.NORETCALL, SC.TERMINATE, SC.IF, SC.TRANSITION, SC.RECOMPILATION}
+
 """
 A when body's statement for its effects, as the expression the body runs: an assert (checked when it runs), a call, a
-`terminate()` (the run ends after the event: `_terminate!`), an if-statement of them (`SimCode.whenOperators`: under
-their branch's condition), its conditions evaluated at the instant.
+`terminate()` (the run ends after the event: `_terminate!`), OMJL's structural change (an explicit transition's
+switch, a recompilation with its new value: the mode's run ends after the event, `Op(:structural)` of its number in
+`Gen.structuralChanges`), an if-statement of them (`SimCode.whenOperators`: under their branch's condition), its
+conditions evaluated at the instant.
 """
 function _whenEffect(g::Gen, st::SC.Statement, ctx::Ctx)::IR
   local actx::Ctx = _with(ctx; noEvent = true)
@@ -1954,6 +1959,14 @@ function _whenEffect(g::Gen, st::SC.Statement, ctx::Ctx)::IR
     return toIR(g, st.exp, actx)
   elseif st isa SC.TERMINATE
     return Op(:terminate, IR[_messageIRx(g, st.message, actx)])
+  elseif st isa SC.TRANSITION
+    push!(g.structuralChanges, (:transition, st.to, :none))
+    return Op(:structural, IR[Lit(length(g.structuralChanges)), Lit(0.0)])
+  elseif st isa SC.RECOMPILATION
+    local ty::SC.SType = _expType(st.newValue)
+    push!(g.structuralChanges, (:recompilation, SC.crefName(st.componentToChange),
+                                ty isa Union{SC.TYPE_INTEGER, SC.TYPE_ENUM} ? :Integer : ty isa SC.TYPE_BOOL ? :Boolean : :Real))
+    return Op(:structural, IR[Lit(length(g.structuralChanges)), toIR(g, st.newValue, actx)])
   elseif st isa SC.IF
     local chain::IR = Op(:seq, IR[_whenEffect(g, x, ctx) for x in st.elseBody])
     for b in Iterators.reverse(st.branches)
@@ -2521,7 +2534,7 @@ function domainSystem(sc::SC.SIM_CODE)::DomainSystem
                 EqClass[], EqClass[], AlgClass[], Tuple{String, String, Bool}[], WhenClass[], AssertClass[], 0, 0, 0, 0,
                 -1000, false, Dict{Int, Int}(), AlgClass[], String[], AssertClass[], functionOutputs, Dict{String, String}(),
                 Set{String}(), Tuple{String, String}[], ObjectSlot[], false, DelaySite[], false,
-                Dict{String, SC.RECORD}())
+                Dict{String, SC.RECORD}(), Tuple{Symbol, String, Symbol}[])
   local stateNamesOrdered::Vector{String} = String[]; local algNamesOrdered::Vector{String} = String[]
   local discreteNamesOrdered::Vector{String} = String[]
   local u0::Vector{Float64} = Float64[]; local d0::Vector{Float64} = Float64[]; local a0::Vector{Float64} = Float64[]
