@@ -120,7 +120,9 @@ function explainIndexReduction(fm::F.FLAT_MODEL;
 end
 
 function omjlirModel(fm::F.FLAT_MODEL; functionList::Union{Nothing, FunctionList} = nothing)::OMJLIR.Model
-  local model = lowerFlatModel(fm; functions = something(functionList, MetaModelica.nil))
+  local model::OMJLIR.Model = lowerFlatModel(fm; functions = something(functionList, MetaModelica.nil))
+  #= the frontend scalarizes the top level, not the variables of a structural mode: the modes' elements =#
+  isempty(model.modes) || (model = Passes.IndexReduction.scalarizeModes(model))
   return Passes.runPasses!(model)
 end
 

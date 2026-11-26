@@ -1381,6 +1381,18 @@ function scalarizeModel(model::IR.Model)::IR.Model
                   model.transitions, model.frontendModel)
 end
 
+"""
+    scalarizeModes(model) -> IR.Model
+
+`model` with each structural mode's variables and system as their elements (`scalarMode`), its other parts as they
+are: the frontend's scalarization (the ModelingToolkit route, `omjlirModel`) leaves a mode's variables arrays and
+their equations the elements' (`der(a.x[2]) = -a.x[2]` of `Real a.x[2]`), which the scalar code read as undefined
+names. The model is not changed.
+"""
+scalarizeModes(model::IR.Model)::IR.Model =
+  IR.Model(model.name, model.variables, model.continuous, model.clocked, model.baseClocks, model.functions,
+           model.initialMode, IR.StructuralMode[scalarMode(m) for m in model.modes], model.transitions, model.frontendModel)
+
 "The structural mode `m` with its variables and its system as their elements (`scalarizeModel`)."
 function scalarMode(m::IR.StructuralMode)::IR.StructuralMode
   local E::Elements = elements(m.variables; passesFollow = true)

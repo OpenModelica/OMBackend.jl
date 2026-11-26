@@ -47,6 +47,16 @@ _vssValue(sol, name::String)::Float64 = OMBackend.variableValues(sol, name)[end]
     #= x(0.5) carried into b, then x(1) = x(0.5) + {1, 2} * 0.5 =#
     @test _vssValue(sols[2], "b_x[1]") ≈ exp(-0.5) + 0.5 atol = 1e-8
     @test _vssValue(sols[2], "b_x[2]") ≈ 2 * exp(-0.5) + 1.0 atol = 1e-8
+    #= the scalarizing route (ModelingToolkit): the frontend left the modes' variables arrays and their equations the
+       elements' (UndefVarError der(a_x)[2]); the backend scalarizes the modes (`scalarizeModes`) =#
+    local scode = OMFrontend.translateToSCode(program)
+    local (fm, cache) = OMFrontend.instantiateSCodeToFM("VSSModes", scode)
+    OMBackend.translate(fm; functionList = OMFrontend.cacheToFunctionList(cache))
+    @test !(name in OMBackend.ARRAY_PRESERVE_DE_MODELS)
+    local mtk = OMBackend.simulate(name; tspan = (0.0, 1.0), reltol = 1e-10, abstol = 1e-10)
+    @test length(mtk) == 2
+    @test _vssValue(mtk[2], "b_x[1]") ≈ exp(-0.5) + 0.5 atol = 1e-8
+    @test _vssValue(mtk[2], "b_x[2]") ≈ 2 * exp(-0.5) + 1.0 atol = 1e-8
   end
 
   @testset "A transition on a state; a variable outside the modes; a mode's parameter" begin
