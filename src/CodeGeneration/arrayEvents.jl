@@ -39,6 +39,21 @@
    them (`_eventFunctionNames`). =#
 
 """
+    _eventBuffers(u, p) -> (du, a)
+
+The buffers into which the event code evaluates the equations at the state `u` (the state derivatives, the algebraic
+variables): the parameters' own on Float64 states (`edu`, `ebuf`), so that an event, a condition or a step's check
+allocates none (MSL EngineV6: five buffers of 15086 values per event, 56 µs each); fresh ones of u's number type
+otherwise. One pair for all: each function of the event code is done with the values it computed into them before it
+calls another that fills them (affectCrossing! before `_coincidentCrossings` evaluates the conditions).
+"""
+_eventBuffers(u::Vector{Float64}, p::ArrayModelParameters)::Tuple{Vector{Float64}, Vector{Float64}} = (p.edu, p.ebuf)
+
+function _eventBuffers(u::AbstractVector{T}, p::ArrayModelParameters)::Tuple{Vector{T}, Vector{T}} where {T}
+  return (Vector{T}(undef, length(u)), Vector{T}(undef, length(p.abuf)))
+end
+
+"""
     _settle!(du, a, u, p, t, fire, searched = false) -> Bool
 
 One sweep at (u, t): passes with the same pre() until nothing changes (a fired body runs in each: with pre() fixed it
@@ -79,7 +94,7 @@ condition there, the conditions' values become pre() of the conditions; with fir
 whens initial() turns true run. reinit() has no effect.
 """
 function startSolution!(u::AbstractVector, p::ArrayModelParameters, t::Real, fire::Bool)::Bool
-  local du::AbstractVector = similar(u); local a::AbstractVector = similar(u, length(p.abuf))
+  local (du::AbstractVector, a::AbstractVector) = _eventBuffers(u, p)
   _settle!(du, a, u, p, t, fire) || return false
   p.ureinit .= u
   p.wcond .= p.wnew
@@ -99,7 +114,7 @@ reinit() takes effect after the sweep (at the initialization, as OpenModelica, i
 function eventIteration!(u::AbstractVector, p::ArrayModelParameters, t::Real, fire::Bool, sampleInstant::Bool = false;
                          left::Bool = true)::Bool
   local c::ArrayModelCode = p.code
-  local du::AbstractVector = similar(u); local a::AbstractVector = similar(u, length(p.abuf))
+  local (du::AbstractVector, a::AbstractVector) = _eventBuffers(u, p)
   #= the algebraic variables' left limit: the equations with the relations and discrete values of before the event
      (`left`; a crossing computed it already, before its relations changed: `affectCrossing!`) =#
   if c.usesLeft && left
@@ -219,9 +234,8 @@ function conditions!(out::AbstractVector, u::AbstractVector, t::Real,
                      integrator::DiffEqBase.DEIntegrator)::Nothing
   local p::ArrayModelParameters = integrator.p
   local c::ArrayModelCode = p.code
-  local du::AbstractVector = similar(u)
+  local (du::AbstractVector, a::AbstractVector) = _eventBuffers(u, p)
   c.crossingsOnly && (c.crossings!(du, p.abuf, u, p, t, CrossingOut(out), false); return nothing)
-  local a::AbstractVector = similar(u, length(p.abuf))
   c.equations!(du, a, u, p, t, CrossingOut(out), false)
   c.whens!(du, a, u, p, t, CrossingOut(out), false, false)
   return nothing
@@ -246,7 +260,8 @@ function logStepRoots!(integrator::DiffEqBase.DEIntegrator)::Nothing
   local t::Float64 = integrator.t
   if p.state.leftLimit[1] == t
     local u::AbstractVector = integrator.u
-    p.code.equations!(similar(u), similar(u, length(p.abuf)), u, p, t, NO_CROSSINGS, false)
+    local (du::AbstractVector, a::AbstractVector) = _eventBuffers(u, p)
+    p.code.equations!(du, a, u, p, t, NO_CROSSINGS, false)
   end
   _logRoots!(p, t)
   return nothing
@@ -348,7 +363,7 @@ function affectCrossing!(integrator::DiffEqBase.DEIntegrator, events::AbstractVe
   c.nDelays == 0 || _delayLeft!(integrator)
   local tl::Float64 = max(integrator.tprev, t - max(1e-10, 2 * p.hyst[1]) * (1 + abs(t)))
   local ul::AbstractVector = tl < t ? integrator(tl) : copy(integrator.uprev)
-  local du::AbstractVector = similar(ul); local a::AbstractVector = similar(ul, length(p.abuf))
+  local (du::AbstractVector, a::AbstractVector) = _eventBuffers(ul, p)
   local before::Vector{Bool} = copy(p.rel)
   c.equations!(du, a, ul, p, tl, NO_CROSSINGS, true)
   c.whens!(du, a, ul, p, tl, NO_CROSSINGS, true, false)
@@ -529,11 +544,10 @@ function relationsChanged(u::AbstractVector, t::Real, integrator::DiffEqBase.DEI
   local rel0::Vector{Bool} = copy(p.rel); local w0::Vector{Bool} = copy(p.wcond)
   local e0::Vector{Float64} = copy(p.evv)
   local d0::Vector{Float64} = copy(p.d)
-  local du::AbstractVector = similar(u)
+  local (du::AbstractVector, a::AbstractVector) = _eventBuffers(u, p)
   if c.crossingsOnly
     c.crossings!(du, p.abuf, u, p, t, NO_CROSSINGS, true)
   else
-    local a::AbstractVector = similar(u, length(p.abuf))
     c.equations!(du, a, u, p, t, NO_CROSSINGS, true)
     c.whens!(du, a, u, p, t, NO_CROSSINGS, true, false)
   end

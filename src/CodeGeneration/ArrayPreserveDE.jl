@@ -489,6 +489,8 @@ mutable struct ArrayModelParameters{C <: ArrayModelCode}
   const aleft::Vector{Float64}       #= the algebraic variables before the event's sweep: pre() of one (its left limit) =#
   const tgradAfter::Vector{Float64}  #= tgrad!'s right-hand side after t (Float64 states: no buffer per call) =#
   const tgradBefore::Vector{Float64} #= tgrad!'s right-hand side before t =#
+  const edu::Vector{Float64}         #= the event code's state derivatives on Float64 states (`_eventBuffers`) =#
+  const ebuf::Vector{Float64}        #= the event code's algebraic variables on Float64 states (`_eventBuffers`) =#
   const blocks::Vector{BlockSolver}  #= the large algebraic loops' solvers (blockSolve!), in the order of the schedule =#
   #= per loop family its members' guesses (unknown, member): the run's last solutions =#
   const loops::Vector{Matrix{Float64}}
@@ -3491,7 +3493,7 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
       local q = $(paramsType)(p.values, rel, d, copy(d), copy(p.wcond), copy(p.sampleActive),
                               [false], [false], copy(p.upre), copy(p.ureinit), copy(p.wnew), p.dlog, evv, copy(p.hyst), copy(p.tend),
                               copy(p.homotopy),
-                              zeros($nAlg), copy(p.aleft), p.tgradAfter, p.tgradBefore, p.blocks, $(_rootsAt)(p, t, right), p.loopWork, p.pass, p.state,
+                              zeros($nAlg), copy(p.aleft), p.tgradAfter, p.tgradBefore, p.edu, p.ebuf, p.blocks, $(_rootsAt)(p, t, right), p.loopWork, p.pass, p.state,
                               p.model, p.code)
       POSITIONS_OBJECTS && k > 0 && replayObjects!(u, q, times[k])
       equations!(similar(u), a, u, q, t, $(NO_CROSSINGS), false)
@@ -3597,6 +3599,7 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
                            zeros(Bool, N_SAMPLES), [false], [false], copy(U0), copy(U0),
                            zeros(Bool, N_WHENS), Tuple{Float64, Vector{Float64}}[], zeros(N_RELATIONS), [0.0], [Float64(tspan[2])],
                            [1.0], zeros($nAlg), zeros($nAlg), zeros(length(U0)), zeros(length(U0)),
+                           zeros(length(U0)), zeros($nAlg),
                            $(BlockSolver)[$(BlockSolver)(BLOCK_PATTERNS[k], BLOCK_COLORS[k], BLOCK_GUESSES[k], BLOCK_LINEAR[k]; nominal = BLOCK_NOMINALS[k]) for k in eachindex(BLOCK_PATTERNS)],
                            Matrix{Float64}[copy(G) for G in LOOP_GUESSES],
                            $(LoopWork){Float64}[$(LoopWork){Float64}(size(G, 1)) for G in LOOP_GUESSES],
