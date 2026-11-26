@@ -266,6 +266,9 @@ const _WHEN_CALLBACK_LOCALS = ("x", "p", "t", "integrator", "lookuptableStates",
    it from the lookups after it (a Cartesian pendulum's x, y: a BoundsError on a Float64). =#
 const _WHEN_STATE_VECTOR = Symbol("#u")
 
+"The state vector of a when's condition (its argument `x`) as the change() memory reads it, after the lookups."
+const _WHEN_CONDITION_STATES = Symbol("#x")
+
 """
 `name = <state/param lookup>` bindings for the names a when callback reads, one per name, the
 states read from the callback's state vector as it was before any binding
@@ -1322,6 +1325,10 @@ function _discreteWhen(eq::SC.WHEN_EQUATION, @nospecialize(condition::SC.Exp), @
   #= Whether the when fires. `_follow`: whether change()/edge() may take the values now,
      where it does not fire (false within an event iteration's sweep; see below). =#
   local condBody = quote
+    #= the state vector before the condition's lookups bind the model's variables by name: a variable `x` replaced
+       the argument `x`, and the change() memory below read the variable (MSL InertialDelaySensitive's input x: a
+       BoundsError on a Float64) =#
+    local $(_WHEN_CONDITION_STATES) = x
     local lookuptableStates
     local lookuptableParams
     if _condCache[] === nothing
@@ -1357,7 +1364,8 @@ function _discreteWhen(eq::SC.WHEN_EQUATION, @nospecialize(condition::SC.Exp), @
        firing a `when edge(off)`, which then missed off's edge at 5/12); where it fires, its
        affect does. Not within a sweep of the event iteration: an algebraic value the next
        sweep solves again is stale there, and `edge(b) and c` would lose b's edge. =#
-    $(isempty(changeSeedPairs) ? :() : :(_follow && !_fires && begin $(_changeMemoryUpdates(condCrefs, simCode, :x)...) end))
+    $(isempty(changeSeedPairs) ? :() :
+      :(_follow && !_fires && begin $(_changeMemoryUpdates(condCrefs, simCode, _WHEN_CONDITION_STATES)...) end))
     _fires
   end
   #= The names of the `let` below, which the condition, its affect and its initialization share. =#

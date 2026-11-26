@@ -37,3 +37,34 @@ end
     @test sol(2.0; idxs = :y) ≈ 2.0 atol = 1.0e-6
   end
 end
+
+@testset "A when condition's change() of a variable named x (the MTK code)" begin
+  #= The condition's lookups bind the model's variables by name; a variable `x` replaced the condition's argument `x`
+     (the state vector), and the change() memory read the variable: a BoundsError on a Float64 (MSL
+     InertialDelaySensitive, ArrayPath.DelayCell). The memory reads the state vector bound before the lookups. =#
+  local program = OMFrontend.OpenModelicaParser.Modelica"""
+    model ChangeOfX
+      Real z(start = 0, fixed = true);
+      Integer x = if time < 0.3 then 2 else 3;
+      discrete Integer n(start = 0, fixed = true);
+      discrete Real tChange(start = -1, fixed = true);
+    equation
+      der(z) = 1;
+    algorithm
+      when {initial(), change(x) and not initial()} then
+        n := pre(n) + 1;
+        tChange := time;
+      end when;
+    end ChangeOfX;"""
+  local (fm, cache) = OMFrontend.instantiateSCodeToFM("ChangeOfX", OMFrontend.translateToSCode(program))
+  OMBackend.translate(fm; functionList = OMFrontend.cacheToFunctionList(cache))
+  local name::String = OMBackend.canonicalName("ChangeOfX")
+  try
+    local sol = OMBackend.simulate(name; tspan = (0.0, 1.0), reltol = 1.0e-6)
+    @test sol.retcode == ReturnCode.Success
+    @test sol(1.0; idxs = :n) == 2.0
+    @test sol(1.0; idxs = :tChange) ≈ 0.3 atol = 1.0e-6
+  finally
+    OMBackend.forgetModel(name)
+  end
+end
