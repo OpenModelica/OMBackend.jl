@@ -461,36 +461,39 @@ PARAMETER_LAYOUT), the discrete state (relation values, discrete variables and t
 state values before the event), the buffers and run state, the generated module and its code `C` (`ArrayModelCode`).
 One type for every model of a translate (`ErasedArrayModelCode`: the solver is compiled once); an executable's
 specialized (`specializedCode`).
+Mutable, its fields constant: a reference. Immutable, it was a value of 464 B (CoupledLoopEvents), copied to the heap
+at each dynamic call that passed it (the type-erased right-hand side, `StepRejectingRHS{Function}`; tgrad!, the
+Jacobian's evaluations).
 """
-struct ArrayModelParameters{C <: ArrayModelCode}
-  values::Vector{Float64}
-  rel::Vector{Bool}
-  d::Vector{Float64}
-  dpre::Vector{Float64}
-  wcond::Vector{Bool}
-  sampleActive::Vector{Bool}   #= sample() instances true at the current event =#
-  initPhase::Vector{Bool}      #= [true] while initializing: initial() =#
-  checking::Vector{Bool}       #= [true] while asserts in algorithms are checked =#
-  upre::Vector{Float64}
-  ureinit::Vector{Float64}     #= the state reinit() sets in a sweep, applied at its end =#
-  wnew::Vector{Bool}           #= when-conditions of the current pass, before the bodies run =#
-  dlog::Vector{Tuple{Float64, Vector{Float64}}}   #= from each event on: discrete values, then relations and event-function values =#
-  evv::Vector{Float64}         #= values of the event-generating functions (_evfn), by relation number =#
-  hyst::Vector{Float64}        #= [H]: the relations' hysteresis (_rel); 0 (literal relations) while initializing =#
-  tend::Vector{Float64}        #= [stop time]: a solution read there gives the final values (_dlogIndex) =#
-  homotopy::Vector{Float64}    #= [λ] of homotopy(): 1 (actual) but in the continuation (homotopyStart!) =#
-  abuf::Vector{Float64}        #= the algebraic variables of a right-hand side evaluated on Float64 (RHS!): no buffer per call =#
-  aleft::Vector{Float64}       #= the algebraic variables before the event's sweep: pre() of one (its left limit) =#
-  tgradAfter::Vector{Float64}  #= tgrad!'s right-hand side after t (Float64 states: no buffer per call) =#
-  tgradBefore::Vector{Float64} #= tgrad!'s right-hand side before t =#
-  blocks::Vector{BlockSolver}  #= the large algebraic loops' solvers (blockSolve!), in the order of the schedule =#
+mutable struct ArrayModelParameters{C <: ArrayModelCode}
+  const values::Vector{Float64}
+  const rel::Vector{Bool}
+  const d::Vector{Float64}
+  const dpre::Vector{Float64}
+  const wcond::Vector{Bool}
+  const sampleActive::Vector{Bool}   #= sample() instances true at the current event =#
+  const initPhase::Vector{Bool}      #= [true] while initializing: initial() =#
+  const checking::Vector{Bool}       #= [true] while asserts in algorithms are checked =#
+  const upre::Vector{Float64}
+  const ureinit::Vector{Float64}     #= the state reinit() sets in a sweep, applied at its end =#
+  const wnew::Vector{Bool}           #= when-conditions of the current pass, before the bodies run =#
+  const dlog::Vector{Tuple{Float64, Vector{Float64}}}   #= from each event on: discrete values, then relations and event-function values =#
+  const evv::Vector{Float64}         #= values of the event-generating functions (_evfn), by relation number =#
+  const hyst::Vector{Float64}        #= [H]: the relations' hysteresis (_rel); 0 (literal relations) while initializing =#
+  const tend::Vector{Float64}        #= [stop time]: a solution read there gives the final values (_dlogIndex) =#
+  const homotopy::Vector{Float64}    #= [λ] of homotopy(): 1 (actual) but in the continuation (homotopyStart!) =#
+  const abuf::Vector{Float64}        #= the algebraic variables of a right-hand side evaluated on Float64 (RHS!): no buffer per call =#
+  const aleft::Vector{Float64}       #= the algebraic variables before the event's sweep: pre() of one (its left limit) =#
+  const tgradAfter::Vector{Float64}  #= tgrad!'s right-hand side after t (Float64 states: no buffer per call) =#
+  const tgradBefore::Vector{Float64} #= tgrad!'s right-hand side before t =#
+  const blocks::Vector{BlockSolver}  #= the large algebraic loops' solvers (blockSolve!), in the order of the schedule =#
   #= per loop family its members' guesses (unknown, member): the run's last solutions =#
-  loops::Vector{Matrix{Float64}}
-  loopWork::Vector{LoopWork{Float64}}   #= per loop family its solve's work arrays (Float64 solves) =#
-  pass::InitialPass           #= the loops the initial solve holds (`initialize`) =#
-  state::ArrayRuntimeState     #= the run's state (samples, memo, warnings, asserts, terminate) =#
-  model::Module
-  code::C
+  const loops::Vector{Matrix{Float64}}
+  const loopWork::Vector{LoopWork{Float64}}   #= per loop family its solve's work arrays (Float64 solves) =#
+  const pass::InitialPass           #= the loops the initial solve holds (`initialize`) =#
+  const state::ArrayRuntimeState     #= the run's state (samples, memo, warnings, asserts, terminate) =#
+  const model::Module
+  const code::C
 end
 
 """

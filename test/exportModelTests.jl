@@ -187,6 +187,9 @@ end
   local constructor::Symbol = Symbol(name, "Model")
   try
     local inMemory::Int = rhsBytes(OMBackend._modelModule(Symbol(name)), constructor)
+    #= the boxed time of the type-erased call (`StepRejectingRHS{Function}`) at most: the parameters, an immutable
+       struct, were copied to the heap at each call (464 B) =#
+    @test inMemory <= 16
     local (exported::Module, m::Expr) = exportInclude(name)
     @test rhsBytes(exported, constructor) == inMemory
     #= the constants of the model module and of its cold-code module: one name each =#
