@@ -527,6 +527,68 @@ end
     @test loop.head === :for && !occursin("s1", string(loop)) && occursin("s2", string(loop))
   end
 
+  @testset "Emission: repeating statements as loops (_rollRuns)" begin
+    local AG::Module = OMBackend.CodeGeneration.ArrayPreserveDE
+    local one(x::Expr)::Expr = Expr(:let, Expr(:block), x)
+    local valuesOf(stmts::Vector{Any})::Vector{Float64} =
+      Base.invokelatest(eval(:(a -> (@inbounds begin; $(stmts...); end; a))), collect(1.0:40.0))
+    #= a recurrence of period 2, the literals advancing by one: one loop, in the statements' order =#
+    local chain::Vector{Any} = Any[one(:(a[1] = 1.0))]
+    for k::Int in 1:12
+      push!(chain, one(:(a[$(20 + k)] = a[$k] + 1.0)), one(:(a[$(1 + k)] = 0.5 * a[$(20 + k)])))
+    end
+    push!(chain, one(:(a[40] = a[13])))
+    local rolled::Vector{Any} = AG._rollRuns(chain; tables = false)
+    @test length(rolled) == 3 && rolled[2].head === :for
+    @test valuesOf(rolled) == valuesOf(chain)
+    #= literals that are not affine: a table only where tables are allowed =#
+    local scattered::Vector{Any} = Any[one(:(a[$i] = 2.0 * a[$(i + 20)])) for i::Int in (3, 1, 4, 1, 5, 9, 2, 6)]
+    @test AG._rollRuns(scattered; tables = false) == scattered
+    local tabled::Vector{Any} = AG._rollRuns(scattered)
+    @test length(tabled) == 1 && tabled[1].head === :for
+    @test valuesOf(tabled) == valuesOf(scattered)
+  end
+
+  @testset "A rod chain's torn block: code of one size for every length" begin
+    #= the chain is rigid: it moves as one mass N on the spring, x = 1 + 0.5 cos(sqrt(100 / N) t). The torn block's
+       recurrence (three statements per mass) is one loop: BLOCK_1! has the same size at N = 8 and N = 24 =#
+    local chains = Modelica"""
+      connector Flange Real s; flow Real f; end Flange;
+      model Mass parameter Real m = 1; Real s, v; Flange a, b;
+      equation a.s = s; b.s = s; der(s) = v; m * der(v) = a.f + b.f; end Mass;
+      model Rod parameter Real L = 1; Flange a, b; equation b.s = a.s + L; a.f + b.f = 0; end Rod;
+      model Spring parameter Real c = 100; Flange a, b; Real f;
+      equation f = c * (b.s - a.s - 1); a.f = -f; b.f = f; end Spring;
+      model Fixed Flange a; equation a.s = 0; end Fixed;
+      model RodChain "N masses on rigid rods, the first on a spring stretched by 0.5"
+        parameter Integer N = 8;
+        Mass m[N](s(start = {i + 0.5 for i in 1:N}), v(each start = 0));
+        Rod r[N - 1]; Spring sp; Fixed fx;
+      equation
+        connect(fx.a, sp.a); connect(sp.b, m[1].a);
+        for i in 1:N - 1 loop connect(m[i].b, r[i].a); connect(r[i].b, m[i + 1].a); end for;
+      end RodChain;
+      model RodChain24 extends RodChain(N = 24); end RodChain24;
+      """
+    local AG::Module = OMBackend.CodeGeneration.ArrayPreserveDE
+    local blockSize(x::Any)::Int =
+      !(x isa Expr) ? 0 :
+      x.head === :function && x.args[1] isa Expr && x.args[1].args[1] === Symbol("BLOCK_1!") ? AG._nodeCount(x) :
+      maximum(blockSize, x.args; init = 0)
+    local sizes::Vector{Int} = Int[]
+    for spec::Tuple{String, Int} in (("RodChain", 8), ("RodChain24", 24))
+      local (model::String, n::Int) = spec
+      local name::String = _translateProgram(chains, model; scalarized = false)
+      @test _arrayPathTaken(name)
+      push!(sizes, blockSize(OMBackend.COMPILED_MODELS_ARRAY_PRESERVE_DE[name][1]))
+      local sol = OMBackend.simulate(name; tspan = (0.0, 1.0), reltol = 1e-8, abstol = 1e-10)
+      @test sol.retcode == ReturnCode.Success
+      local x::Float64 = 1 + 0.5 * cos(sqrt(100 / n))
+      @test _values(sol, ["m[1].s", "m[$n].s", "sp.f"]) ≈ [x, x + n - 1, 100 * (x - 1)] rtol = 1e-5
+    end
+    @test sizes[1] > 0 && sizes[1] == sizes[2]
+  end
+
   @testset "Time-invariant rows: in invariants! only, per solve; the callbacks' types erased" begin
     #= n and c read parameters only (SimCode Domains: invariant rows): invariants! computes them once per solve,
        equations! (the relation's event, the observed values) calls it and holds no copy. MSL EngineV6: such rows were
