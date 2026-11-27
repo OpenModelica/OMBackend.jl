@@ -82,8 +82,8 @@ module ArrayPreserveDE
 import ModelingToolkit
 import ..CodeGeneration: stripBeginBlocks, ModelicaAssertionError, solveStoppedAtStart, _autoDtReset!, _finiteFirstStep!,
   ode_to_dae, _instantLength
-import ..CodeGeneration: DelayState, delayedValue, emptyDelayHistories!, startDelayHistories!, recordDelayStepEnd!,
-  recordDelayJumps!, delayJumpsDue!
+import ..CodeGeneration: DelayState, DelayLimit, DELAY_LEFT, DELAY_RIGHT, delayedValue, emptyDelayHistories!,
+  startDelayHistories!, recordDelayStepEnd!, recordDelayJumps!, delayJumpsDue!
 import ...Passes
 import ...Runtime: solverVerbosity
 import ...SimCode
@@ -3584,7 +3584,10 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
     #= The algebraic variables at a point (u, t) of a solution: the discrete, relation and
        event-function values of that time from the event log (after a solve p holds the final
        ones), on a copy of the discrete state; the loops started from the run's roots of that time (_rootsAt).
-       The external objects the when-bodies call as the run left them at the log entry's time (`replayObjects!`). =#
+       The external objects the when-bodies call as the run left them at the log entry's time (`replayObjects!`).
+       An event's two points read the delays at their jumps as the left and (`right`) the right limits, the event's
+       values (delays.jl `DelayLimit`): MSL CompareLosslessLines' reflected wave at 12.5 ns read 0 at both, its next
+       step's 5 V 0.36 ns later. =#
     function algebraics(u, p, t, right::Bool = false)
       local a = similar(u, $nAlg)
       local times = first.(p.dlog)
@@ -3600,7 +3603,14 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
                               zeros($nAlg), copy(p.aleft), p.tgradAfter, p.tgradBefore, p.edu, p.ebuf, p.blocks, $(_rootsAt)(p, t, right), p.loopWork, p.pass, p.state,
                               p.model, p.code)
       POSITIONS_OBJECTS && k > 0 && replayObjects!(u, q, times[k])
-      equations!(similar(u), a, u, q, t, $(NO_CROSSINGS), false)
+      local delays::$(DelayState) = p.state.delays
+      local limit::$(DelayLimit) = delays.limit
+      delays.limit = right ? $(DELAY_RIGHT) : $(DELAY_LEFT)
+      try
+        equations!(similar(u), a, u, q, t, $(NO_CROSSINGS), false)
+      finally
+        delays.limit = limit
+      end
       return a
     end
 

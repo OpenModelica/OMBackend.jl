@@ -580,11 +580,10 @@ end
 """
     affectDelay!(integrator)
 
-A delayed jump is due (delays.jl): the event iteration with the delayed values as right limits, until the recorder
-after the events (`_delayJumps!`).
+A delayed jump is due (delays.jl): the event iteration with the delayed values as right limits (the jump's event ran:
+`delayJumpsDue!`, `_takesJump`), then the recorder after the events (`_delayJumps!`).
 """
 function affectDelay!(integrator::DiffEqBase.DEIntegrator)::Nothing
-  integrator.p.state.delays.rightLimit = true
   _eventAt!(integrator)
   _logDiscretes!(integrator.p, integrator.t)
   DiffEqBase.derivative_discontinuity!(integrator, true)

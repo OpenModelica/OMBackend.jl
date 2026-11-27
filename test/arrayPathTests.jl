@@ -1658,6 +1658,21 @@ end DivideInLoop;
         k = integer(delay(u, 0.2));
         y = table[k];
       end DelayedTable;
+
+      model DelayedJumpThenEvent "x 5 from td/2 to td: y = delay(x, td) 5 from 1.5 td, z = delay(y, td) from 2.5 td"
+        parameter Real td = 5e-9;
+        Integer count(start = 0, fixed = true);
+        Real x;
+        Real y;
+        Real z;
+      equation
+        when time >= 1.5 * td + 1e-23 then
+          count = pre(count) + 1;
+        end when;
+        x = if time >= td / 2 and time < td then 5 else 0;
+        y = delay(x, td);
+        z = delay(y, td);
+      end DelayedJumpThenEvent;
       """
     #= between the steps the history is linear: the solver's steps at this tolerance leave 1.2e-4 =#
     local (sd, ad, _) = _bothWaysOf(delays, "DelayedDecay", ["x", "y"]; reltol = 1e-8, abstol = 1e-10)
@@ -1686,6 +1701,31 @@ end DivideInLoop;
       local (st, at, _) = _bothWaysOf(delays, "DelayedTable", ["k", "y"]; tspan = (0.0, stop))
       @test at == expected
       stop < 0.5 && @test st == expected
+    end
+    #= a read on a recorded jump takes it by the time against the jump's event time (`_takesJump`), not by s = t -
+       delayTime: before it the left limit, after it the right one, at it once the event ran (no longer pending), a
+       saved point's values afterwards as asked. An event within round-off before the due time takes the jump. =#
+    local CG::Module = OMBackend.CodeGeneration
+    local history()::OMBackend.CodeGeneration.DelayHistory =
+      CG.DelayHistory([0.0, 1.0, 1.0, 2.0], [0.0, 0.0, 5.0, 5.0], [1.0], [3.0], [1])
+    local h::OMBackend.CodeGeneration.DelayHistory = history()
+    local at(t::Float64, limit::OMBackend.CodeGeneration.DelayLimit)::Float64 = CG._delayedValue(h, t - 2.0, limit, t, 5.0)
+    @test [at(3.0, CG.DELAY_BY_EVENT), at(3.0 + 4eps(3.0), CG.DELAY_BY_EVENT), at(3.0 - 4eps(3.0), CG.DELAY_BY_EVENT)] ==
+          [0.0, 5.0, 0.0]
+    @test CG.delayJumpsDue!(CG.DelayState([h], CG.DELAY_BY_EVENT, [0.0], [2.0]), 3.0) && isempty(h.pending)
+    @test [at(3.0, CG.DELAY_BY_EVENT), at(3.0, CG.DELAY_LEFT), at(3.0, CG.DELAY_RIGHT)] == [5.0, 0.0, 5.0]
+    local takenBefore::OMBackend.CodeGeneration.DelayHistory = history()
+    @test CG.delayJumpsDue!(CG.DelayState([takenBefore], CG.DELAY_BY_EVENT, [0.0], [2.0]), 3.0 - 1e-13) &&
+          takenBefore.due == [3.0 - 1e-13]
+    #= the model: an event 1e-23 s after y's delayed jump at 1.5 td (MSL CompareLosslessLines: the pulse's own, at
+       7.5 ns) reads y after it. Before, s could not tell the two apart (a 1 ps tolerance): the event recorded y = 0 in
+       z's history, and z was 0.11 at 2.5 td + 5 ps =#
+    local jumpThenEvent::String = _translateProgram(delays, "DelayedJumpThenEvent"; scalarized = false)
+    @test _arrayPathTaken(jumpThenEvent)
+    for (stop, expected) in ((1.2505e-8, [0.0, 5.0, 1.0]), (1.6e-8, [0.0, 0.0, 1.0]))
+      local sol = OMBackend.simulate(jumpThenEvent; tspan = (0.0, stop))
+      @test sol.retcode == ReturnCode.Success
+      @test _values(sol, ["y", "z", "count"]) == expected
     end
   end
 
