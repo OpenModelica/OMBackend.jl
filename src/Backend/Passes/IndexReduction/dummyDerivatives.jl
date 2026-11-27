@@ -632,14 +632,16 @@ The dynamic state sets of a block (`rows` by the candidate `columns`) whose dumm
 (`chooseDummies` by `classes`), where its choice depends on the state: the dummies that remain
 once those of constant pivots are eliminated (`staticElimination`, in the classes' order: a
 pendulum's `der(\$DER.x)` by `der(\$DER.x) = der(vx)`, a body's position by its frame's) are
-the choice to make, all of one class; its candidates are the columns of that class not
-eliminated, its Jacobian the rows that remain (an entry that vanishes at the generic point that
-keeps the explicit relations, `propagatedValues` in `generic`, dropped: zero on the
-trajectories), split into its independent parts (two bodies' quaternions). A part of one row
-and at least two candidates, each the derivative of a variable that is no derivative, is a set.
-None where the choice is static (no class with both dummies and states, every dummy eliminated,
-or its pivots constants), the remaining dummies are of more than one class, or an entry does
-not differentiate. One row only for now (the switch, `dynamicSet!`, compares single pivots): a
+the choice to make, class by class; a class's candidates are its columns not eliminated, its
+Jacobian the rows that remain and read no remaining dummy of another class (an entry that
+vanishes at the generic point that keeps the explicit relations, `propagatedValues` in
+`generic`, dropped: zero on the trajectories), split into its independent parts (two bodies'
+quaternions). A part of one row and at least two candidates, each the derivative of a variable
+that is no derivative, is a set: the block's determinant is its pivot times that of the other
+rows by their dummies (MSL UniversalConstraint: a body's angles by the rotation constraint, its
+positions by the translations'). None where the choice is static (no class with both dummies
+and states, every dummy eliminated, or its pivots constants) or an entry does not
+differentiate. One row only for now (the switch, `dynamicSet!`, compares single pivots): a
 quaternion's norm (MSL MultiBody's bodies), a pendulum.
 """
 function dynamicSets(s::Structure, level::Int, rows::Vector{Int}, columns::Vector{Int}, chosen::Vector{Int},
@@ -655,30 +657,37 @@ function dynamicSets(s::Structure, level::Int, rows::Vector{Int}, columns::Vecto
   local reduced = staticElimination(s, rows, equations, order, columns, functions, values)
   reduced === nothing && return DynamicSet[]
   local (dummies, remaining, M) = reduced
-  (isempty(dummies) || length(unique(Int[classes[c] for c in dummies])) != 1) && return DynamicSet[]
-  local k = classes[first(dummies)]
+  isempty(dummies) && return DynamicSet[]
   local eliminated = Set{Int}(c for c in chosen if !(c in dummies))
-  local group = sort(Int[c for c in columns if classes[c] == k && !(c in eliminated)])
   local sets = DynamicSet[]
   #= an entry that vanishes at the generic point that keeps the explicit relations is zero on the trajectories
      (MSL ActuatorWithNoise: a rotor angle's, the machine's and its controller's angles tied, gamma = gammaC) =#
   generic[] === nothing && (generic[] = propagatedValues(s, partition, differentiated, functions, values, natural))
-  for i in remaining
-    local magnitudes = Dict{Int, Float64}(c => abs(something(evaluate(e, something(generic[])), Inf)) for (c, e) in M[i] if c in group)
-    local scale = maximum((x for (_, x) in magnitudes if isfinite(x)); init = 0.0)
-    for (c, x) in magnitudes
-      (isfinite(x) && x <= 1e-10 * scale) && delete!(M[i], c)
+  for k::Int in unique(Int[classes[c] for c in dummies])
+    local group::Vector{Int} = sort(Int[c for c in columns if classes[c] == k && !(c in eliminated)])
+    #= the rows whose remaining dummies are all of class k: a one-row part of them reads no other class's dummy,
+       so the block's determinant is its pivot times the other rows' by their dummies, whatever those rows read
+       (MSL UniversalConstraint: the rotation constraint by the angles; the translations' rows by the positions
+       and the angles) =#
+    local classRows::Vector{Int} = Int[i for i in remaining if all(c -> !haskey(M[i], c) || classes[c] == k, dummies)]
+    for i in classRows
+      local magnitudes::Dict{Int, Float64} =
+        Dict{Int, Float64}(c => abs(something(evaluate(e, something(generic[])), Inf)) for (c, e) in M[i] if c in group)
+      local scale::Float64 = maximum((x for (_, x) in magnitudes if isfinite(x)); init = 0.0)
+      for (c, x) in magnitudes
+        (isfinite(x) && x <= 1e-10 * scale) && delete!(M[i], c)
+      end
     end
-  end
-  local reads = Dict{Int, Vector{Int}}(i => Int[c for c in group if haskey(M[i], c)] for i in remaining)
-  for (partRows, partColumns) in components(remaining, group, reads)
-    local partDummies = filter(c -> c in dummies, partColumns)
-    (length(partRows) == 1 && length(partDummies) == 1 && length(partColumns) >= 2) || continue
-    all(c -> s.antiderivative[c] != 0 && s.antiderivative[s.antiderivative[c]] == 0, partColumns) || continue
-    local candidates = sort(partColumns)
-    local J = IR.Expression[get(M[only(partRows)], c, ZERO) for _ in 1:1, c in candidates]
-    isConstantEntry(M[only(partRows)][only(partDummies)], s) && continue
-    push!(sets, DynamicSet(level, candidates, partDummies, J, Vector{Int}[]))
+    local reads::Dict{Int, Vector{Int}} = Dict{Int, Vector{Int}}(i => Int[c for c in group if haskey(M[i], c)] for i in classRows)
+    for (partRows, partColumns) in components(classRows, group, reads)
+      local partDummies::Vector{Int} = filter(c -> c in dummies, partColumns)
+      (length(partRows) == 1 && length(partDummies) == 1 && length(partColumns) >= 2) || continue
+      all(c -> s.antiderivative[c] != 0 && s.antiderivative[s.antiderivative[c]] == 0, partColumns) || continue
+      local candidates::Vector{Int} = sort(partColumns)
+      local J::Matrix{IR.Expression} = IR.Expression[get(M[only(partRows)], c, ZERO) for _ in 1:1, c in candidates]
+      isConstantEntry(M[only(partRows)][only(partDummies)], s) && continue
+      push!(sets, DynamicSet(level, candidates, partDummies, J, Vector{Int}[]))
+    end
   end
   return sets
 end
