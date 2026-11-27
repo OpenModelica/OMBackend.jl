@@ -357,6 +357,8 @@ mutable struct Gen
      explicit transition's switch `(:transition, mode, :none)`, a recompilation `(:recompilation, component, type)`, the
      type of its new value (`:Real`, `:Integer`, `:Boolean`) =#
   structuralChanges::Vector{Tuple{Symbol, String, Symbol}}
+  #= the functions called as impure (MLS 12.3; `_allOutputsCallIRx`): each call evaluated, none shared (`_shareCalls`) =#
+  impure::Set{String}
 end
 
 "A relation of a template by its expression and scope (the iterators' slots, the element-wise dimensions)."
@@ -575,26 +577,22 @@ end
 
 """
 Sums as sorted term lists, so connection sums that list their terms in another order share
-a shape.
+a shape. A sum's terms are those of its nested sums, each canonical, sorted once (`sortperm`: equal keys in their
+order, as a sort of each nested sum before gave). Sorted again at each level of a left-deep sum of N terms, it was
+O(N^2 log N): the ladder's ground node of 3200 cells, 2.18 s of `_reroll`.
 """
 function _canonical(x::IR)::IR
   x isa Op || return x
-  local args::Vector{IR} = IR[_canonical(a) for a in x.args]
-  if x.op == :+
-    local terms::Vector{IR} = IR[]
-    for a::IR in args
-      _sumTerms!(terms, a)
-    end
-    #= each term's key once (sort!'s `by` computes it per comparison) =#
-    local keys::Vector{String} = String[irKey(_abstracted(t, Int[])) for t in terms]
-    local sorted::Vector{IR} = terms[sortperm(keys)]
-    local acc::IR = sorted[1]
-    for t::IR in @view sorted[2:end]
-      acc = Op(:+, IR[acc, t])
-    end
-    return acc
+  x.op == :+ || return Op(x.op, IR[_canonical(a) for a in x.args])
+  local terms::Vector{IR} = IR[_canonical(t) for t in _sumTerms!(IR[], x)]
+  #= each term's key once (sort!'s `by` computes it per comparison) =#
+  local keys::Vector{String} = String[irKey(_abstracted(t, Int[])) for t in terms]
+  local sorted::Vector{IR} = terms[sortperm(keys)]
+  local acc::IR = sorted[1]
+  for t::IR in @view sorted[2:end]
+    acc = Op(:+, IR[acc, t])
   end
-  return Op(x.op, args)
+  return acc
 end
 
 """
@@ -1623,11 +1621,11 @@ function _elements(g::Gen)::InstanceTable
   local aliased::Set{Tuple{Int, Int}} = Set{Tuple{Int, Int}}()
   local vanishing::Set{Tuple{Int, Int}} = Set{Tuple{Int, Int}}()
   local keyOf::Dict{Int, String} = Dict{Int, String}()
-  local divisors::Dict{Int, Union{Nothing, Vector{IR}}} = Dict{Int, Union{Nothing, Vector{IR}}}()
   for (ci, c) in enumerate(g.classes)
     local acc = accesses!(accesses!(Ref[], c.lhs), c.rhs)
     local keys::Vector{String} = String[irKey(r) for r in acc]
-    empty!(divisors)
+    #= the divisors of each access (`_accessDivisors`), at the first one needed =#
+    local divisors::Union{Nothing, Vector{Union{Nothing, Vector{IR}}}} = nothing
     #= an equation of discrete time: it reads the continuous variables through relations only (`off = s < 0`) =#
     local discreteTime::Bool = !(_continuous(g, c.lhs) || _continuous(g, c.rhs))
     for j in 1:size(c.domain, 2)
@@ -1659,8 +1657,8 @@ function _elements(g::Gen)::InstanceTable
       end
       for i in firstAccess:length(uid)
         (length(class), uid[i]) in aliased && continue
-        local ds::Union{Nothing, Vector{IR}} =
-          get!(() -> _explicitDivisors(g, c.lhs, c.rhs, upos[i]), divisors, upos[i])
+        divisors === nothing && (divisors = _accessDivisors(g, c.lhs, c.rhs, keys))
+        local ds::Union{Nothing, Vector{IR}} = divisors[upos[i]]
         (ds === nothing || isempty(ds)) && continue
         _zeroDivisor(g, ds, c, j) && push!(vanishing, (length(class), uid[i]))
       end
@@ -1781,6 +1779,59 @@ function _overdeterminedSet(el::InstanceTable, matchCol::Vector{Int}, visited::V
 end
 
 """
+    ReadyQueues()
+
+The ready nodes of Kahn's algorithm (`_schedule`, `_scheduleWithLoops`) by key: (class, matched access) of an
+equation instance, (0, family) of a loop block. The keys are in a heap by priority: a key whose remaining nodes are
+all ready first, then the one with the most ready, then the smallest key. A key's entry is pushed when its queue
+grows; an entry that no longer gives its queue's priority is dropped when it comes up (`_hasReady!`). Before, each
+round scanned all keys: rodChain (1600 masses on rods, arrays kept) has 20805 classes and 20803 rounds, `_schedule`
+took 2.45 s.
+"""
+struct ReadyQueues
+  queues::Dict{Tuple{Int, Int}, Vector{Int}}
+  "The nodes of each key not yet scheduled (all filled before the first is ready)."
+  remaining::Dict{Tuple{Int, Int}, Int}
+  "(not all remaining ready, minus the ready count, key) of each key at each time its queue grew; the best first."
+  heap::DataStructures.BinaryMinHeap{Tuple{Bool, Int, Tuple{Int, Int}}}
+end
+
+ReadyQueues() = ReadyQueues(Dict{Tuple{Int, Int}, Vector{Int}}(), Dict{Tuple{Int, Int}, Int}(),
+                            DataStructures.BinaryMinHeap{Tuple{Bool, Int, Tuple{Int, Int}}}())
+
+"The priority of `key`'s queue in the heap of `ready`."
+function _readyEntry(ready::ReadyQueues, key::Tuple{Int, Int})::Tuple{Bool, Int, Tuple{Int, Int}}
+  local n::Int = length(ready.queues[key])
+  return (n != ready.remaining[key], -n, key)
+end
+
+"`node` ready, in the queue of `key`."
+function _ready!(ready::ReadyQueues, key::Tuple{Int, Int}, node::Int)::Nothing
+  push!(get!(() -> Int[], ready.queues, key), node)
+  push!(ready.heap, _readyEntry(ready, key))
+  return nothing
+end
+
+"Whether a key has ready nodes; the heap's entries before the best one that no longer give their queue's priority dropped."
+function _hasReady!(ready::ReadyQueues)::Bool
+  while !isempty(ready.heap)
+    local top::Tuple{Bool, Int, Tuple{Int, Int}} = first(ready.heap)
+    (!isempty(ready.queues[top[3]]) && top == _readyEntry(ready, top[3])) && return true
+    pop!(ready.heap)
+  end
+  return false
+end
+
+"The best key and its ready nodes, taken (after `_hasReady!`): its queue empty, its remaining count less."
+function _takeBest!(ready::ReadyQueues)::Tuple{Tuple{Int, Int}, Vector{Int}}
+  local key::Tuple{Int, Int} = pop!(ready.heap)[3]
+  local batch::Vector{Int} = ready.queues[key]
+  ready.queues[key] = Int[]
+  ready.remaining[key] -= length(batch)
+  return (key, batch)
+end
+
+"""
 Kahn's algorithm in batches: all ready instances of one (class, matched access) at a time,
 a key whose remaining instances are all ready first. Returns the batches (consecutive equal
 keys merged), the matched access per instance and the producer per unknown.
@@ -1820,31 +1871,18 @@ function _schedule(el::InstanceTable, matchRow::Vector{Int}, nU::Int, settled::B
       indeg[r] += 1
     end
   end
-  local queues = Dict{Tuple{Int, Int}, Vector{Int}}()
-  local remaining = Dict{Tuple{Int, Int}, Int}()
+  local ready::ReadyQueues = ReadyQueues()
   local key = r -> (el.class[r], pos[r])
   for r in 1:N
-    remaining[key(r)] = get(remaining, key(r), 0) + 1
-    indeg[r] == 0 && push!(get!(queues, key(r), Int[]), r)
+    ready.remaining[key(r)] = get(ready.remaining, key(r), 0) + 1
+  end
+  for r in 1:N
+    indeg[r] == 0 && _ready!(ready, key(r), r)
   end
   local batches = Tuple{Tuple{Int, Int}, Vector{Int}}[]
   local done = 0
-  while true
-    local best = nothing
-    local bestFull = false
-    for (k, q) in queues
-      isempty(q) && continue
-      local full = length(q) == remaining[k]
-      if best === nothing || (full && !bestFull) ||
-         (full == bestFull && (length(q) > length(queues[best]) || (length(q) == length(queues[best]) && k < best)))
-        best = k
-        bestFull = full
-      end
-    end
-    best === nothing && break
-    local batch = queues[best]
-    queues[best] = Int[]
-    remaining[best] -= length(batch)
+  while _hasReady!(ready)
+    local (best::Tuple{Int, Int}, batch::Vector{Int}) = _takeBest!(ready)
     done += length(batch)
     if !isempty(batches) && batches[end][1] == best
       append!(batches[end][2], batch)
@@ -1854,7 +1892,7 @@ function _schedule(el::InstanceTable, matchRow::Vector{Int}, nU::Int, settled::B
     for r in batch
       for d in dependents[r]
         indeg[d] -= 1
-        indeg[d] == 0 && push!(get!(queues, key(d), Int[]), d)
+        indeg[d] == 0 && _ready!(ready, key(d), d)
       end
     end
   end
@@ -1968,51 +2006,81 @@ function _dividesByBlockUnknowns(g::Gen, rows::Vector{Int}, el::InstanceTable, m
 end
 
 """
-    _explicitDivisors(g, lhs, rhs, pos) -> Union{Nothing, Vector{IR}}
+    _accessDivisors(g, lhs, rhs, keys) -> Vector{Union{Nothing, Vector{IR}}}
 
-The divisors `_solveFor` divides by when it solves `lhs = rhs` for its access `pos`, where all read parameters and
-literals only; nothing where it would divide by a variable or cannot solve (omc's strict tearing: an equation of a
-loop is not solved by dividing by a variable, which may be zero; `_tearBlock` also checks the divisors' values).
+Per access of `lhs = rhs` (`accesses!` order; `keys` their `irKey`s): the divisors `_solveFor` divides by when it
+solves the equation for it, where all read parameters and literals only; nothing where it would divide by a variable
+or cannot solve (omc's strict tearing: an equation of a loop is not solved by dividing by a variable, which may be
+zero; `_tearBlock` also checks the divisors' values). One walk over the equation (`_divisorsWalk!`), an access read
+more than once through its affine form (`_affineDivisors`, once per name): an access at a time walked the equation
+and compared every access's key (a ladder's ground node of 400 rungs, a sum of 403 accesses: 0.89 s, O(n^3)). The
+accesses under one product share their vector: not to be changed.
 """
-function _explicitDivisors(g::Gen, lhs::IR, rhs::IR, pos::Int)::Union{Nothing, Vector{IR}}
-  local acc::Vector{Ref} = accesses!(accesses!(Ref[], lhs), rhs)
-  local key::String = irKey(acc[pos])
-  if count(r::Ref -> irKey(r) == key, acc) > 1
-    local l::Union{Nothing, Tuple{IR, IR}} = _affine(lhs, key)
-    local r::Union{Nothing, Tuple{IR, IR}} = _affine(rhs, key)
-    (l === nothing || r === nothing) && return nothing
-    local coefficient::IR = _sub(l[1], r[1])
-    (_isLit(coefficient, 0.0) || !_parametersOnly(g, coefficient)) && return nothing
-    return _isLit(coefficient, 1.0) ? IR[] : IR[coefficient]
+function _accessDivisors(g::Gen, lhs::IR, rhs::IR, keys::Vector{String})::Vector{Union{Nothing, Vector{IR}}}
+  local out::Vector{Union{Nothing, Vector{IR}}} = Union{Nothing, Vector{IR}}[]
+  sizehint!(out, length(keys))
+  local none::Vector{IR} = IR[]
+  _divisorsWalk!(out, g, lhs, none, true)
+  _divisorsWalk!(out, g, rhs, none, true)
+  local counts::Dict{String, Int} = Dict{String, Int}()
+  for k::String in keys
+    counts[k] = get(counts, k, 0) + 1
   end
-  local divisors::Vector{IR} = IR[]
-  local nl::Int = _nAccesses(lhs)
-  local (e::IR, k::Int) = pos <= nl ? (lhs, pos) : (rhs, pos - nl)
-  while true
-    e isa Ref && k == 1 && return divisors
-    e isa Op || return nothing
-    local j::Int = 0; local before::Int = 0
-    for (ai, arg) in enumerate(e.args)
-      local na::Int = _nAccesses(arg)
-      if k <= before + na
-        j = ai
-        break
-      end
-      before += na
-    end
-    if e.op == :* && length(e.args) == 2
-      _parametersOnly(g, e.args[3 - j]) || return nothing
-      push!(divisors, e.args[3 - j])
-    elseif !(e.op in (:+, :neg) || (e.op == :- && length(e.args) == 2) || (e.op == :/ && j == 1))
-      return nothing
-    end
-    e = e.args[j]
-    k -= before
+  local affine::Dict{String, Union{Nothing, Vector{IR}}} = Dict{String, Union{Nothing, Vector{IR}}}()
+  for (pos::Int, k::String) in enumerate(keys)
+    counts[k] > 1 || continue
+    haskey(affine, k) || (affine[k] = _affineDivisors(g, lhs, rhs, k))
+    out[pos] = affine[k]
   end
+  return out
 end
 
 """
-Whether the divisors of an explicit solve (`_explicitDivisors`) are all nonzero at the instance column `col` of the
+The divisors of the accesses of `x` (`_accessDivisors`) onto `out`, in `accesses!` order: `divisors` those of the
+path to `x`, `solvable` whether `_solveFor` gets through it (an access under a relation or an event function, or under
+an operation it does not invert, is not solved for).
+"""
+function _divisorsWalk!(out::Vector{Union{Nothing, Vector{IR}}}, g::Gen, x::IR, divisors::Vector{IR}, solvable::Bool)::Nothing
+  if x isa Ref
+    push!(out, solvable ? divisors : nothing)
+  elseif x isa Op
+    local binaryProduct::Bool = x.op == :* && length(x.args) == 2
+    local inverted::Bool = x.op in (:+, :neg) || (x.op == :- && length(x.args) == 2)
+    for (j::Int, a::IR) in enumerate(x.args)
+      if !solvable
+        _divisorsWalk!(out, g, a, divisors, false)
+      elseif binaryProduct
+        local other::IR = x.args[3 - j]
+        _parametersOnly(g, other) ? _divisorsWalk!(out, g, a, IR[divisors; other], true) : _divisorsWalk!(out, g, a, divisors, false)
+      else
+        _divisorsWalk!(out, g, a, divisors, inverted || (x.op == :/ && j == 1))
+      end
+    end
+  elseif x isa Rel
+    _divisorsWalk!(out, g, x.lhs, divisors, false)
+    _divisorsWalk!(out, g, x.rhs, divisors, false)
+  elseif x isa EvFn
+    _divisorsWalk!(out, g, x.arg, divisors, false)
+  end
+  return nothing
+end
+
+"""
+The divisor of solving `lhs = rhs` for an access read more than once (by its key `key`), as `_solveFor` solves it
+(`_solveLinear`): its coefficient (none where 1); nothing where the equation is not affine in it, or the coefficient is
+0 or reads a variable.
+"""
+function _affineDivisors(g::Gen, lhs::IR, rhs::IR, key::String)::Union{Nothing, Vector{IR}}
+  local l::Union{Nothing, Tuple{IR, IR}} = _affine(lhs, key)
+  local r::Union{Nothing, Tuple{IR, IR}} = _affine(rhs, key)
+  (l === nothing || r === nothing) && return nothing
+  local coefficient::IR = _sub(l[1], r[1])
+  (_isLit(coefficient, 0.0) || !_parametersOnly(g, coefficient)) && return nothing
+  return _isLit(coefficient, 1.0) ? IR[] : IR[coefficient]
+end
+
+"""
+Whether the divisors of an explicit solve (`_accessDivisors`) are all nonzero at the instance column `col` of the
 class `c` (with the parameters' values; one that cannot be evaluated counts as zero, as one that reads a parameter
 with fixed = false: the initialization computes it, MSL PrismaticWithLengthConstraint's `if positiveBranch then k2
 else -k2`).
@@ -2032,7 +2100,7 @@ function _nonzeroDivisors(g::Gen, divisors::Vector{IR}, c::EqClass, col::Int)::B
 end
 
 """
-Whether a divisor of an explicit solve (`_explicitDivisors`) is zero at the instance column `col` of the class `c`,
+Whether a divisor of an explicit solve (`_accessDivisors`) is zero at the instance column `col` of the class `c`,
 by the parameters' values; one that reads a parameter with fixed = false (its value comes with the initialization)
 or cannot be evaluated is not. The parameters stay tunable: an instance solved for another of its unknowns is right
 for any value of the coefficient.
@@ -2250,7 +2318,7 @@ end
     _tearBlock(g, el, block, matchRow) -> TornBlock
 
 A large block torn as omc tears (greedily, each instance solved for the unknown it determines last, not its matched
-one; `_tearOrder`): an instance is solved for an unknown it solves explicitly (`_explicitDivisors`, a divisor
+one; `_tearOrder`): an instance is solved for an unknown it solves explicitly (`_accessDivisors`, a divisor
 nonzero at the instance, the largest coefficient among the elements of its variable it reads, `_largestCoefficient`;
 not one it reads through two references). Torn twice, greedily and comparing `TEAR_LOOKAHEAD` candidates by their
 cascades (MSL EngineV6's loops in 52 iteration variables instead of 100); the one with fewer iteration variables is
@@ -2295,16 +2363,18 @@ function _tearBlock(g::Gen, el::InstanceTable, block::Vector{Int}, matchRow::Vec
     push!(reads[e], (v, el.upos[i]))
     push!(readers[v], e)
   end
-  local divisors::Dict{Tuple{Int, Int}, Union{Nothing, Vector{IR}}} = Dict{Tuple{Int, Int}, Union{Nothing, Vector{IR}}}()
+  #= per class: its accesses and their divisors (`_accessDivisors`) =#
   local accessesOf::Dict{Int, Vector{Ref}} = Dict{Int, Vector{Ref}}()
+  local divisorsOf::Dict{Int, Vector{Union{Nothing, Vector{IR}}}} = Dict{Int, Vector{Union{Nothing, Vector{IR}}}}()
   local solves::Function = function (e::Int, v::Int, access::Int)
     assigned[v] && return false
     local r::Int = block[e]
     (r, unknownIds[v]) in el.aliased && return false
     local c::EqClass = g.classes[el.class[r]]
-    local ds::Union{Nothing, Vector{IR}} = get!(() -> _explicitDivisors(g, c.lhs, c.rhs, access), divisors, (el.class[r], access))
-    (ds !== nothing && _nonzeroDivisors(g, ds, c, el.col[r])) || return false
     local acc::Vector{Ref} = get!(() -> accesses!(accesses!(Ref[], c.lhs), c.rhs), accessesOf, el.class[r])
+    local ds::Union{Nothing, Vector{IR}} =
+      get!(() -> _accessDivisors(g, c.lhs, c.rhs, String[irKey(x) for x in acc]), divisorsOf, el.class[r])[access]
+    (ds !== nothing && _nonzeroDivisors(g, ds, c, el.col[r])) || return false
     return _largestCoefficient(g, c, el.col[r], acc, access, Int[x[2] for x in reads[e] if x[1] != v])
   end
   #= (instance, unknown, access) in causal order, the iteration variables, the instances solved =#
@@ -2502,30 +2572,17 @@ function _scheduleWithLoops(el::InstanceTable, matchRow::Vector{Int}, producer::
   end
   local live::Vector{Int} = Int[n for n in 1:nNodes if n > N || blockOf[n] == 0]
   local key::Function = (n::Int) -> n <= N ? (el.class[n], pos[n]) : (0, blockFamily[n - N])
-  local queues::Dict{Tuple{Int, Int}, Vector{Int}} = Dict{Tuple{Int, Int}, Vector{Int}}()
-  local remaining::Dict{Tuple{Int, Int}, Int} = Dict{Tuple{Int, Int}, Int}()
+  local ready::ReadyQueues = ReadyQueues()
   for n in live
-    remaining[key(n)] = get(remaining, key(n), 0) + 1
-    indeg[n] == 0 && push!(get!(queues, key(n), Int[]), n)
+    ready.remaining[key(n)] = get(ready.remaining, key(n), 0) + 1
+  end
+  for n in live
+    indeg[n] == 0 && _ready!(ready, key(n), n)
   end
   local batches::Vector{Tuple{Tuple{Int, Int}, Vector{Int}}} = Tuple{Tuple{Int, Int}, Vector{Int}}[]
   local done::Int = 0
-  while true
-    local best::Union{Nothing, Tuple{Int, Int}} = nothing
-    local bestFull::Bool = false
-    for (k, q) in queues
-      isempty(q) && continue
-      local full::Bool = length(q) == remaining[k]
-      if best === nothing || (full && !bestFull) ||
-         (full == bestFull && (length(q) > length(queues[best]) || (length(q) == length(queues[best]) && k < best)))
-        best = k
-        bestFull = full
-      end
-    end
-    best === nothing && break
-    local batch::Vector{Int} = queues[best]
-    queues[best] = Int[]
-    remaining[best] -= length(batch)
+  while _hasReady!(ready)
+    local (best::Tuple{Int, Int}, batch::Vector{Int}) = _takeBest!(ready)
     done += length(batch)
     local items::Vector{Int} = best[1] == 0 ? Int[n - N for n in batch] : batch
     if !isempty(batches) && batches[end][1] == best
@@ -2535,7 +2592,7 @@ function _scheduleWithLoops(el::InstanceTable, matchRow::Vector{Int}, producer::
     end
     for n in batch, d in dependents[n]
       indeg[d] -= 1
-      indeg[d] == 0 && push!(get!(queues, key(d), Int[]), d)
+      indeg[d] == 0 && _ready!(ready, key(d), d)
     end
   end
   done == length(live) || ns("algebraic loop through the blocks ($(length(live) - done) left)")

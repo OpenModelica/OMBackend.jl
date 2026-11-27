@@ -43,8 +43,11 @@ read the history through an opaque term (DelayedValueFn): linear between the poi
 current step, towards the argument's present value (so delay(x, 0) is x); the argument itself before
 the history has a point (the initialization). A jump of the argument is a jump of the delayed value
 delayTime later: a time event there (withDelayEvents), which runs the event iteration where the model
-has one. Only during that event are the delayed values read as right limits (the value after the
-jump); otherwise as left limits, so a delay of a delayed value records the jump as a jump again.
+has one. A read at a jump (up to round-off) takes it by the time, not by s = t - delayTime, which carries
+t's round-off: past the jump's event time the value after it, before it the value before it; at that time,
+once its event ran (`DELAY_BY_EVENT`), so the left limits recorded at the step's end, before the event,
+make a delay of a delayed value record the jump as a jump again. A saved point's values afterwards read
+an event's two points as its left and right limits (`DELAY_LEFT`, `DELAY_RIGHT`).
 
 A jump caused inside a continuous callback's affect: its left limit is recorded where the callback moves
 the integrator to the event (the first re-solve of the instant, before the affect). Not handled: for a
@@ -56,27 +59,41 @@ A delay() call as OMFrontend passes it on: OpenModelica.Internal.delay2/delay3 (
 """
 _isDelayCall(e::SC.Exp)::Bool = e isa SC.CALL && e.name in (:OpenModelica_Internal_delay2, :OpenModelica_Internal_delay3, :delay)
 
+"""
+A delay() argument's history: its values `v` at the times `t`, a jump as a repeated time (left, then right limit);
+the jumps' times, each one's delayed event time (its time plus the delay time; the event's time where an event
+within round-off before it took it) and the jumps whose event is still to come within the solve's span.
+"""
 mutable struct DelayHistory
   t::Vector{Float64}
   v::Vector{Float64}
-  due::Vector{Float64}        # the times of delayed jumps to come: a jump's time + delayTime
+  jumps::Vector{Float64}
+  due::Vector{Float64}
+  pending::Vector{Int}
 end
-DelayHistory() = DelayHistory(Float64[], Float64[], Float64[])
+DelayHistory() = DelayHistory(Float64[], Float64[], Float64[], Float64[], Int[])
+
+"""
+How a read at a jump's own event time takes the jump: during the solve, once the jump's event ran
+(`DELAY_BY_EVENT`); a saved point's values after the solve, as the left or the right limit (an event's first and
+second point: `DELAY_LEFT`, `DELAY_RIGHT`). Before and after that time the time decides (`_takesJump`).
+"""
+@enum DelayLimit DELAY_BY_EVENT DELAY_LEFT DELAY_RIGHT
 
 """
     DelayState(n)
 
 A solve's delay histories of one model (a structural mode's own), one per delay() call (the array code: per
-instance of a call), whether they are read as right limits (during a delayed jump's event), and the present values
-of the calls' arguments and delay times, which the recorders fill before they record (`now`, `times`).
+instance of a call), how a read at a jump's event time takes it (`limit`), and the present values of the calls'
+arguments and delay times, which the recorders fill before they record (`now`, `times`).
 """
 mutable struct DelayState
   histories::Vector{DelayHistory}
-  rightLimit::Bool
+  limit::DelayLimit
   now::Vector{Float64}
   times::Vector{Float64}
 end
-DelayState(n::Integer) = DelayState([DelayHistory() for _ in 1:n], false, zeros(n), zeros(n))
+DelayState(n::Integer) = DelayState([DelayHistory() for _ in 1:n], DELAY_BY_EVENT, zeros(n), zeros(n))
 
 "The key of the delay states in a task's local storage."
 const DELAY_STATE_KEY = :omjl_delay_states
@@ -112,25 +129,52 @@ function clearDelayHistories!()::Nothing
 end
 
 """
-The value at s = t - delayTime, as a left limit or (`right`) a right limit on a recorded jump; `x` is
-the argument's value at the present time t.
+Whether a read at `t` is after the jump `j` of `h`: past the jump's event time; at it, as `limit` says (during the
+solve: once the event ran, the jump no longer pending).
 """
-function _delayedValue(h::DelayHistory, s::Float64, right::Bool, t::Float64, x::Float64)
-  local n = length(h.t)
+function _takesJump(h::DelayHistory, j::Int, t::Float64, limit::DelayLimit)::Bool
+  local d::Float64 = h.due[j]
+  t == d || return t > d
+  limit === DELAY_BY_EVENT && return !(j in h.pending)
+  return limit === DELAY_RIGHT
+end
+
+"""
+The value at s = t - delayTime, read at the time t; `x` is the argument's value at t. On a recorded jump (s within
+round-off of its time) the side the time takes (`_takesJump`): s carries t's round-off, so it cannot tell a second
+event 1.2e-23 s after a delayed jump from the one before it (MSL CompareLosslessLines at 7.5 ns: the pulse's own
+event read the line's input before its jump and recorded a dip to 0, which reached the input again 5 ns later).
+"""
+function _delayedValue(h::DelayHistory, s::Float64, limit::DelayLimit, t::Float64, x::Float64)::Float64
+  local n::Int = length(h.t)
   s <= h.t[1] && return h.v[1]
-  local tol = 1e-12 * max(1.0, abs(s))
-  #= Past the last point: within the current step, towards the present value. Not on the last point
-     itself: a jump recorded there (a delay of a delayed value, read by its recorder) has its limits. =#
-  if s > h.t[n] + tol
-    t <= h.t[n] && return h.v[n]
+  local tol::Float64 = 1e-12 * max(abs(s), abs(t))
+  #= The last point at or before s; on the jumps at s, the last point of the last one taken, or the point before
+     the first one. =#
+  local k::Int = 0
+  local j::Int = searchsortedlast(h.jumps, s + tol)
+  if j >= 1 && h.jumps[j] >= s - tol
+    local first::Float64 = h.jumps[j]
+    while j >= 1 && h.jumps[j] >= s - tol
+      if _takesJump(h, j, t, limit)
+        k = searchsortedlast(h.t, h.jumps[j])
+        break
+      end
+      first = h.jumps[j]
+      j -= 1
+    end
+    k == 0 && (k = searchsortedfirst(h.t, first) - 1)
+    k == 0 && return h.v[1]
+  else
+    k = searchsortedlast(h.t, s)
+  end
+  #= Past the last point: within the current step, towards the present value. =#
+  if k == n
+    (s <= h.t[n] || t <= h.t[n]) && return h.v[n]
     return h.v[n] + (s - h.t[n]) / (t - h.t[n]) * (x - h.v[n])
   end
-  #= The last point at or before s: on a jump (a repeated time) its last point for the right limit, the
-     point before it for the left one, up to round-off. =#
-  local k = clamp(searchsortedlast(h.t, right ? s + tol : s - tol), 1, n)
-  k == n && return h.v[n]
-  local t1 = h.t[k]
-  local t2 = h.t[k + 1]
+  local t1::Float64 = h.t[k]
+  local t2::Float64 = h.t[k + 1]
   return h.v[k] + (s - t1) / (t2 - t1) * (h.v[k + 1] - h.v[k])
 end
 
@@ -146,15 +190,15 @@ end
 """
 function delayedValue(s::DelayState, k::Int, t::Float64, delayTime::Float64, x::Float64)::Float64
   (k > length(s.histories) || isempty(s.histories[k].t)) && return x
-  return _delayedValue(s.histories[k], t - delayTime, s.rightLimit, t, x)
+  return _delayedValue(s.histories[k], t - delayTime, s.limit, t, x)
 end
 
 "The histories of `s` emptied: before a solve's start, so its initialization reads the arguments themselves."
 function emptyDelayHistories!(s::DelayState)::Nothing
   for h in s.histories
-    empty!(h.t); empty!(h.v); empty!(h.due)
+    empty!(h.t); empty!(h.v); empty!(h.jumps); empty!(h.due); empty!(h.pending)
   end
-  s.rightLimit = false
+  s.limit = DELAY_BY_EVENT
   return nothing
 end
 
@@ -180,8 +224,8 @@ end
 
 After the events at `t`: a present value (`s.now`) that differs from the last point at `t` is a jump, recorded as the
 right limit and due again its delay time later (`s.times`, filled by `times!()` when the first jump is found): a
-stop time of the solve within its time span (`delayJumpsDue!`). Round-off from an event's algebraic re-solve is no
-jump. The histories are read as left limits again.
+stop time of the solve within its time span, pending until its event (`delayJumpsDue!`). Round-off from an event's
+algebraic re-solve is no jump.
 """
 function recordDelayJumps!(times!::F, s::DelayState, t::Float64, integrator)::Nothing where {F}
   local filled::Bool = false
@@ -192,25 +236,34 @@ function recordDelayJumps!(times!::F, s::DelayState, t::Float64, integrator)::No
     push!(h.t, t); push!(h.v, x)
     filled || (times!(); filled = true)
     local tDue::Float64 = t + s.times[k]
+    push!(h.jumps, t); push!(h.due, tDue)
     #= The solve's end, not the build's: a cached build is made for a short span and solved for the
        model's (MSL Digital FullAdder: jumps due after the build's end were dropped, its gates fell
        back to 'U'). =#
     (tDue > t && integrator.tdir * (last(integrator.sol.prob.tspan) - tDue) >= 0) || continue
-    push!(h.due, tDue)
+    push!(h.pending, length(h.jumps))
     ModelingToolkit.SciMLBase.add_tstop!(integrator, tDue)
   end
-  s.rightLimit = false
   return nothing
 end
 
-"Whether a delayed jump of `s` is due at `t`; the due times at or before `t` are dropped."
+"""
+Whether a delayed jump of `s` is due at `t`: its event runs at `t`, the jump no longer pending. A jump due within the
+round-off of `t` (`1e-12 * |t|`) is `t`'s, its event time moved to `t` where it was later; one due before that is no
+longer pending, without an event.
+"""
 function delayJumpsDue!(s::DelayState, t::Float64)::Bool
-  local tol::Float64 = 1e-12 * max(1.0, abs(t))
+  local tol::Float64 = 1e-12 * abs(t)
   local hit::Bool = false
-  for h in s.histories, k in length(h.due):-1:1
-    local d::Float64 = h.due[k]
-    abs(d - t) <= tol && (hit = true)
-    d <= t + tol && deleteat!(h.due, k)
+  for h in s.histories, k in length(h.pending):-1:1
+    local j::Int = h.pending[k]
+    local d::Float64 = h.due[j]
+    d <= t + tol || continue
+    if d >= t - tol
+      hit = true
+      h.due[j] = min(d, t)
+    end
+    deleteat!(h.pending, k)
   end
   return hit
 end
@@ -241,8 +294,8 @@ delayLookup(model::Symbol, k::Integer, t, delayTime, x) =
 
 """
 The delayed jumps' time events: a discrete callback at each due time, among the other callbacks, so
-the event iteration (withRelationRefresh) runs after it; from its affect until the recorder after the
-event, the delayed values are right limits. Due times already passed are dropped.
+the event iteration (withRelationRefresh) runs after it; from its condition on, the delayed values at the
+jumps are right limits (`delayJumpsDue!`, `_takesJump`). Due times already passed are dropped.
 """
 function withDelayEvents(callbacks, model::Symbol)
   local due = function (_, t, _)
@@ -250,8 +303,6 @@ function withDelayEvents(callbacks, model::Symbol)
     return s !== nothing && delayJumpsDue!(s, Float64(t))
   end
   local affect! = function (integrator)
-    local s = delayState(model)
-    s === nothing || (s.rightLimit = true)
     SciMLBase.derivative_discontinuity!(integrator, true)
     return nothing
   end

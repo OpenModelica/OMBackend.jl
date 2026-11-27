@@ -165,7 +165,7 @@ end
 function exportModel(io::IO, modelName::String, format::JuliaSource)::Nothing
   local name::String = canonicalName(modelName)
   local source::Expr = _sourceCode(_generatedModule(name), format.comments)
-  local code::Expr = _standaloneModule(source, _valueRoots(source))
+  local code::Expr = _withObjectKey(_hoistedConstants(_standaloneModule(source, _valueRoots(source))), name)
   #= the large data values (name tables) bypass the formatter, which is superlinear in the arguments of one call
      (EngineV6: a Dict of 1.47 MB took 131 s of 167): placeholders while it formats, one entry per line after =#
   local data::Dict{Symbol, Any} = Dict{Symbol, Any}()
@@ -415,6 +415,155 @@ end
 
 "Whether `e` is the binding `OMBackend = <the OMBackend module>`."
 _bindsOMBackend(e::Any)::Bool = e isa Expr && e.head === :(=) && e.args[1] === :OMBackend && e.args[2] === OMBackend
+
+"""
+    _hoistedConstants(m::Expr) -> Expr
+
+The standalone module `m` (`_standaloneModule`) with the values its functions hold (vectors, dicts, structs) bound to
+module constants. In OMBackend a function holds the object itself; printed, the value is a literal, a new object at
+each evaluation (CoupledLoopEvents: 464 B per right-hand side in memory, 70 KB exported). A value a top-level
+constant binds goes by that constant's name, as the functions share it in OMBackend; another by `_EXPORTED_<k>`,
+defined after the module's imports. A submodule (the cold-code module, which imports its parent's names) reads a value
+its parent names before it by that name (`inherited`): the same object, as in OMBackend; another gets a constant of
+its own, numbered on from its parent's (`count`). Values in quoted expressions stay.
+"""
+_hoistedConstants(m::Expr)::Expr = _hoistedConstants(m, Ref(0), IdDict{Any, Symbol}())
+
+function _hoistedConstants(m::Expr, count::Base.RefValue{Int}, inherited::IdDict{Any, Symbol})::Expr
+  local statements::Vector{Any} = Any[]
+  _topLevelStatements!(statements, m.args[3]::Expr)
+  local names::IdDict{Any, Symbol} = copy(inherited)
+  #= the statement of a value's top-level constant: a submodule before it does not see the name =#
+  local boundAt::IdDict{Any, Int} = IdDict{Any, Int}()
+  for (i::Int, s::Any) in enumerate(statements)
+    s isa Expr && s.head === :const && s.args[1] isa Expr && (s.args[1]::Expr).head === :(=) || continue
+    local (lhs::Any, rhs::Any) = ((s.args[1]::Expr).args[1], (s.args[1]::Expr).args[2])
+    lhs isa Symbol && _hoistable(rhs) && !haskey(names, rhs) && (names[rhs] = lhs; boundAt[rhs] = i)
+  end
+  #= the values in the order the functions are visited: the same names each time =#
+  local inFunctions::Vector{Any} = Any[]
+  local quoted::Base.IdSet{Any} = Base.IdSet{Any}()
+  for s::Any in statements
+    s isa Expr && s.head !== :module && _functionValues!(inFunctions, quoted, s)
+  end
+  local hoisted::Base.IdSet{Any} = Base.IdSet{Any}()
+  local definitions::Vector{Any} = Any[]
+  for v::Any in inFunctions
+    v in quoted && continue
+    push!(hoisted, v)
+    haskey(names, v) && continue
+    count[] += 1
+    local nm::Symbol = Symbol("_EXPORTED_", count[])
+    names[v] = nm
+    push!(definitions, Expr(:const, Expr(:(=), nm, v)))
+  end
+  local hoist::Function = (v::Any) -> v isa Expr || !(v in hoisted) ? v : names[v]
+  local body::Vector{Any} = Any[s isa Expr && s.head === :module ?
+                                  _hoistedConstants(s, count, _namesBefore(names, boundAt, i)) :
+                                _bindsValue(s) || !(s isa Expr) ? s :
+                                CodeGeneration.CodeGenerationUtil._iterativePostwalk(hoist, s)
+                                for (i::Int, s::Any) in enumerate(statements)]
+  local k::Int = something(findfirst(s -> !(s isa LineNumberNode || s isa Expr && s.head in (:using, :import)), body),
+                           length(body) + 1)
+  return Expr(:module, m.args[1], m.args[2], Expr(:block, body[1:k - 1]..., definitions..., body[k:end]...))
+end
+
+"""
+The names of `names` (`_hoistedConstants`) a submodule at the top-level statement `i` sees: all but those of the
+constants after it (`boundAt`); the module's own `_EXPORTED_<k>` are defined after its imports, before any submodule.
+"""
+function _namesBefore(names::IdDict{Any, Symbol}, boundAt::IdDict{Any, Int}, i::Int)::IdDict{Any, Symbol}
+  local visible::IdDict{Any, Symbol} = IdDict{Any, Symbol}()
+  for (v::Any, nm::Symbol) in names
+    get(boundAt, v, 0) < i && (visible[v] = nm)
+  end
+  return visible
+end
+
+"The top-level statements of the module body `body` into `out`, its blocks flattened."
+function _topLevelStatements!(out::Vector{Any}, body::Expr)::Nothing
+  for s::Any in body.args
+    s isa Expr && s.head === :block ? _topLevelStatements!(out, s) : push!(out, s)
+  end
+  return nothing
+end
+
+"""
+Whether the value `v` in the generated code is an object a printed literal makes anew at each evaluation (a vector,
+a dict, a struct with such fields): not a bits value, a name, a string, a module, a type or a named function.
+"""
+function _hoistable(v::Any)::Bool
+  (v isa Expr || v isa Symbol || v isa LineNumberNode || v isa QuoteNode || v isa GlobalRef || v isa Module ||
+   v isa Type || v isa TypeVar || v isa Core.TypeofVararg || v isa AbstractString) && return false
+  v isa Function && Base.issingletontype(typeof(v)) && return false
+  return !isbits(v)
+end
+
+"Whether the top-level statement `s` is a constant bound to a value (`const NAME = <value>`), the value no expression."
+_bindsValue(s::Any)::Bool =
+  s isa Expr && s.head === :const && s.args[1] isa Expr && (s.args[1]::Expr).head === :(=) &&
+  !((s.args[1]::Expr).args[2] isa Expr)
+
+"""
+The values (`_hoistable`) in the function definitions (`function`, `f(x) = ...`, `x -> ...`) of the top-level
+statement `s` into `inFunctions` (each once, in the order visited), those in quoted expressions into `quoted`.
+Iterative: generated bodies are deep. A shared expression is visited once in and once outside a function.
+"""
+function _functionValues!(inFunctions::Vector{Any}, quoted::Base.IdSet{Any}, s::Expr)::Nothing
+  local found::Base.IdSet{Any} = Base.IdSet{Any}(inFunctions)
+  local todo::Vector{Tuple{Any, Bool, Bool}} = Tuple{Any, Bool, Bool}[(s, false, false)]
+  local seenIn::Base.IdSet{Any} = Base.IdSet{Any}()
+  local seenOut::Base.IdSet{Any} = Base.IdSet{Any}()
+  while !isempty(todo)
+    local (e::Any, inFunction::Bool, inQuote::Bool) = pop!(todo)
+    if !(e isa Expr)
+      _hoistable(e) || continue
+      if inQuote
+        push!(quoted, e)
+      elseif inFunction && !(e in found)
+        push!(found, e); push!(inFunctions, e)
+      end
+      continue
+    end
+    if !inQuote
+      local seen::Base.IdSet{Any} = inFunction ? seenIn : seenOut
+      e in seen && continue
+      push!(seen, e)
+    end
+    local ex::Expr = e
+    local body::Bool = inFunction || ex.head === :function || ex.head === :-> ||
+      (ex.head === :(=) && ex.args[1] isa Expr && (ex.args[1]::Expr).head in (:call, :where, :(::)))
+    local q::Bool = inQuote || ex.head === :quote
+    for a::Any in Iterators.reverse(ex.args)
+      push!(todo, (a, body, q))
+    end
+  end
+  return nothing
+end
+
+"""
+    _withObjectKey(m::Expr, name::String) -> Expr
+
+The module `m` of the model `name` with its external objects (tables) registered and freed under a key of its own
+(`"<name> (exported)"`), not the model's: including the file freed the objects of the translated model (`name`). As a
+translated model's module evaluated again, an include of the file frees the objects of the include before it: one
+include of an exported model at a time.
+"""
+function _withObjectKey(m::Expr, name::String)::Expr
+  local key::String = name * " (exported)"
+  return CodeGeneration.CodeGenerationUtil._iterativePostwalk(m) do (e::Any)
+    e isa Expr && e.head === :call && length(e.args) >= 2 && _objectRegistry(e.args[1]) && e.args[end] == name ||
+      return e
+    return Expr(:call, e.args[1:end - 1]..., key)
+  end
+end
+
+"Whether `f` (a callee) is OMBackend's `freeExternalObjects!` or `_externalObjectRef`, by value or by path."
+function _objectRegistry(f::Any)::Bool
+  (f === CodeGeneration.freeExternalObjects! || f === CodeGeneration._externalObjectRef) && return true
+  return f isa Expr && f.head === :. && length(f.args) == 2 && f.args[2] isa QuoteNode &&
+    (f.args[2]::QuoteNode).value in (:freeExternalObjects!, :_externalObjectRef)
+end
 
 """
     _throughOMBackend(path::Any) -> Any

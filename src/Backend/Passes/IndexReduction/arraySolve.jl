@@ -333,14 +333,17 @@ function solvedInArrays(model::IR.Model;
   local stale::Bool = false
   for _ in 1:64
     try
-      stale || return solvedInArraysOnce(model, view, solution)
+      stale || return solvedInArraysOnce(model, view, solution, cache)
       #= after a split only the splits asked for (`arrayTemplates`), then the view solved: the stale view's values
          and check were made and dropped (EngineV6: 0.8 s). `view` is the model's view already (made after the last
-         split; neither call changes the model or the view): scalarized again, 0.22 s =#
-      arrayTemplates(model, view, solution)
-      solution = derivativeSolution(view.model, view.model.continuous[1]; known, literalCoefficients = false)
-      solution === nothing && return (model, Symbol[])
-      return solvedInArraysOnce(model, view, solution)
+         split; neither call changes the model or the view): scalarized again, 0.22 s. The templates are kept where
+         the view solved made the same decisions (`sameDecisions`; EngineV6: 0.21 s) =#
+      local found::TemplatesAndBodies = arrayTemplates(model, view, solution)
+      local fresh::Union{Nothing, DerivativeSolution} =
+        derivativeSolution(view.model, view.model.continuous[1]; known, literalCoefficients = false)
+      fresh === nothing && return (model, Symbol[])
+      sameDecisions(solution, fresh) || return solvedInArraysOnce(model, view, fresh, cache)
+      return solvedInArraysOnce(model, view, fresh, cache, found)
     catch err
       (err isa NotHandled && needsSplit(err)) || rethrow()
       splitArrays!(model, view, err.arrays, err.equations; cache)
@@ -350,6 +353,21 @@ function solvedInArrays(model::IR.Model;
   end
   throw(NotHandled("derivatives solved in array form: more splits than 64"))
 end
+
+"""
+The solved derivatives' templates and their bodies (equation, path) by derivative array or scalar
+(`arrayTemplates`).
+"""
+const TemplatesAndBodies = Tuple{Dict{Symbol, SolvedTemplate}, Dict{Symbol, Tuple{Int, Vector{Int}}}}
+
+"""
+    sameDecisions(a, b) -> Bool
+
+Whether the derivative solutions `a` and `b` solve the same derivatives from the same equations, the same through
+others: what `arrayTemplates` reads of a solution (its values not), so the templates of `a` are `b`'s.
+"""
+sameDecisions(a::DerivativeSolution, b::DerivativeSolution)::Bool =
+  keys(a.resolved) == keys(b.resolved) && a.equationOf == b.equationOf && a.through == b.through
 
 """
     unsubstitutedNote(eq, solution, E, templates, small) -> String
@@ -457,8 +475,7 @@ The solved derivatives (arrays or scalars) of `model` in array form, of its elem
 solution `solution`: each one's template (`solvedTemplate`) and its body (equation, path). NotHandled, naming the
 arrays or for-equations to split, where solved differently: the only place `solvedInArraysOnce` asks for splits.
 """
-function arrayTemplates(model::IR.Model, view::Scalarized,
-                        solution::DerivativeSolution)::Tuple{Dict{Symbol, SolvedTemplate}, Dict{Symbol, Tuple{Int, Vector{Int}}}}
+function arrayTemplates(model::IR.Model, view::Scalarized, solution::DerivativeSolution)::TemplatesAndBodies
   local E::Elements = view.elements
   local partition::IR.Partition = model.continuous[1]
   local rowsOf::Dict{Tuple{Int, Vector{Int}}, Vector{Int}} = Dict{Tuple{Int, Vector{Int}}, Vector{Int}}()
@@ -590,16 +607,21 @@ function splitClosure!(arrays::Set{Symbol}, equations::Set{Int}, model::IR.Model
 end
 
 """
-    solvedInArraysOnce(model, view, solution) -> Tuple{IR.Model, Vector{Symbol}}
+    solvedInArraysOnce(model, view, solution, cache[, found]) -> Tuple{IR.Model, Vector{Symbol}}
 
 `solvedInArrays` without splitting, of the model's element view `view` and its derivatives' solution `solution`:
-NotHandled, naming the arrays or for-equations to split, where solved differently (`arrayTemplates`).
+NotHandled, naming the arrays or for-equations to split, where solved differently (`arrayTemplates`). `found`:
+`arrayTemplates` of `view` already (of a solution of the same decisions, `sameDecisions`). `cache`: the element
+equations `view` was made of (`ScalarCache`); the check takes those of the equations the solve leaves as they are
+from there (copies), and scalarizes the others (EngineV6: 5056 of 8150 equations left as they were; with the
+templates kept its solve took 2.40 s, 2.80 s before).
 """
-function solvedInArraysOnce(model::IR.Model, view::Scalarized, solution::DerivativeSolution)::Tuple{IR.Model, Vector{Symbol}}
+function solvedInArraysOnce(model::IR.Model, view::Scalarized, solution::DerivativeSolution, cache::ScalarCache,
+                            found::TemplatesAndBodies = arrayTemplates(model, view, solution))::Tuple{IR.Model, Vector{Symbol}}
   local elementPartition::IR.Partition = view.model.continuous[1]
   local E::Elements = view.elements
   local partition::IR.Partition = model.continuous[1]
-  local (templates::Dict{Symbol, SolvedTemplate}, bodyOf::Dict{Symbol, Tuple{Int, Vector{Int}}}) = arrayTemplates(model, view, solution)
+  local (templates::Dict{Symbol, SolvedTemplate}, bodyOf::Dict{Symbol, Tuple{Int, Vector{Int}}}) = found
   #= a solved derivative put in where the element view puts its elements' values in (all of them small) =#
   local small::Set{Symbol} = Set{Symbol}()
   for target in keys(templates)
@@ -610,27 +632,42 @@ function solvedInArraysOnce(model::IR.Model, view::Scalarized, solution::Derivat
   local resolved::Dict{Symbol, IR.Expression} = resolvedTemplates(templates, E, small)
   #= the values put in (a copy: the model with its arrays stays the scalarized path's), the bodies their definitions =#
   local equations::Vector{IR.Equation} = IR.Equation[IR.copyEquation(eq) for eq in partition.equations]
+  #= whether a value was put into the equation mapped (the ones left keep their element equations for the check) =#
+  local putIn::Base.RefValue{Bool} = Ref(false)
   local substitute::Function = (x::IR.Expression) -> begin
     local s::Union{Nothing, Symbol} = solvedTarget(x, E, templates)
-    (s === nothing || !haskey(resolved, s)) && return x
-    return s in small ? instantiated(templates[s], x, resolved[s]) : x
+    (s === nothing || !haskey(resolved, s) || !(s in small)) && return x
+    putIn[] = true
+    return instantiated(templates[s], x, resolved[s])
   end
+  local left::Vector{Bool} = fill(true, length(equations))
   for (i, eq) in enumerate(equations)
+    putIn[] = false
     equations[i] = IR.mapEquation!(substitute, eq)
+    left[i] = !putIn[]
   end
   for (target, value) in resolved
     local (i::Int, path::Vector{Int}) = bodyOf[target]
     local old::IR.SCALAR_EQUATION = templateBody(partition, (i, path))[1]
     local definition::IR.SCALAR_EQUATION = IR.SCALAR_EQUATION(templates[target].cref, value, IR.T_REAL(), old.source, old.attributes)
     isempty(path) ? (equations[i] = definition) : replaceBody!(equations[i]::IR.FOR_EQUATION, path, definition)
+    left[i] = false
   end
   local solvedPartition::IR.Partition = IR.Partition(partition.index, partition.association, partition.unknowns, equations,
                                        partition.initialEquations)
   local solved::IR.Model = IR.Model(model.name, model.variables, IR.Partition[solvedPartition], model.clocked, model.baseClocks,
                           model.functions, model.initialMode, model.modes, model.transitions, model.frontendModel)
-  #= the check: the array form's elements are the element view's solved equations =#
+  #= the check: the array form's elements are the element view's solved equations. Those of an equation left as it
+     was are its element equations in `view`, copied before the solve changes them in place (`substituteDerivatives!`) =#
+  local leftElements::ScalarCache = ScalarCache()
+  for (i, eq) in enumerate(equations)
+    left[i] || continue
+    local entry::Union{Nothing, Tuple{Vector{IR.Equation}, Vector{EquationOrigin}}} = get(cache, partition.equations[i], nothing)
+    entry === nothing && continue
+    leftElements[eq] = (IR.Equation[IR.copyEquation(x) for x in entry[1]], entry[2])
+  end
   substituteDerivatives!(elementPartition, solution, view.model.variables)
-  local mine::Vector{IR.Equation} = scalarizeArrays(solved).model.continuous[1].equations
+  local mine::Vector{IR.Equation} = scalarizeArrays(solved; cache = leftElements).model.continuous[1].equations
   length(mine) == length(elementPartition.equations) ||
     throw(NotHandled("derivatives solved in array form: $(length(mine)) element equations, the element view $(length(elementPartition.equations))"))
   #= scalar and if-equations folded (`sameEquation`: a whole array's value written out per element, `{0, 0, 0}[1] * r`) =#

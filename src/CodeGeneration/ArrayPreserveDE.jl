@@ -81,9 +81,9 @@ module ArrayPreserveDE
 
 import ModelingToolkit
 import ..CodeGeneration: stripBeginBlocks, ModelicaAssertionError, solveStoppedAtStart, _autoDtReset!, _finiteFirstStep!,
-  ode_to_dae
-import ..CodeGeneration: DelayState, delayedValue, emptyDelayHistories!, startDelayHistories!, recordDelayStepEnd!,
-  recordDelayJumps!, delayJumpsDue!
+  ode_to_dae, _instantLength
+import ..CodeGeneration: DelayState, DelayLimit, DELAY_LEFT, DELAY_RIGHT, delayedValue, emptyDelayHistories!,
+  startDelayHistories!, recordDelayStepEnd!, recordDelayJumps!, delayJumpsDue!
 import ...Passes
 import ...Runtime: solverVerbosity
 import ...SimCode
@@ -124,6 +124,7 @@ _noCrossings(z::CrossingOut)::Bool = z.z === nothing
 
 include("arrayBlockSolve.jl")
 include("arrayInitialBlocks.jl")
+include("arraySharedCalls.jl")
 
 """
 The array model's ODE `prob` (mass matrix I: its algebraic loops are solved in the right-hand side) as the problem
@@ -199,11 +200,13 @@ function _parameterRules(symbols::Vector{Symbol}, deps::Vector{Vector{Symbol}}, 
 end
 
 """
-    ArrayStartState(discrete, wcond, wnew, ndlog, upre, ureinit, loops, blocks, nRootLog, nObjectLog)
+    ArrayStartState(discrete, wcond, wnew, ndlog, upre, ureinit, loops, blocks, nRootLog, nObjectLog, structural)
 
 A problem's state after its initialization (`ArrayRuntimeState.atStart`): the discrete state (`_discreteState`), the
 when-conditions, the length of the event log, the pre() and reinit buffers of the states, the loops' roots (the
-families' and the large blocks' guesses) and the length of their log, the length of the external objects' call log.
+families' and the large blocks' guesses) and the length of their log, the length of the external objects' call log,
+the structural change the initialization reached (`_structuralChange!`; (0, 0.0): none; a `when initial()` of a
+recompilation: the mode's run ends at its start).
 """
 struct ArrayStartState
   discrete::Tuple{Vector{Float64}, Vector{Float64}, Vector{Bool}, Vector{Float64}}
@@ -216,6 +219,7 @@ struct ArrayStartState
   blocks::Vector{Vector{Float64}}
   nRootLog::Int
   nObjectLog::Int
+  structural::Tuple{Int, Float64}
 end
 
 """
@@ -460,36 +464,41 @@ PARAMETER_LAYOUT), the discrete state (relation values, discrete variables and t
 state values before the event), the buffers and run state, the generated module and its code `C` (`ArrayModelCode`).
 One type for every model of a translate (`ErasedArrayModelCode`: the solver is compiled once); an executable's
 specialized (`specializedCode`).
+Mutable, its fields constant: a reference. Immutable, it was a value of 464 B (CoupledLoopEvents), copied to the heap
+at each dynamic call that passed it (the type-erased right-hand side, `StepRejectingRHS{Function}`; tgrad!, the
+Jacobian's evaluations).
 """
-struct ArrayModelParameters{C <: ArrayModelCode}
-  values::Vector{Float64}
-  rel::Vector{Bool}
-  d::Vector{Float64}
-  dpre::Vector{Float64}
-  wcond::Vector{Bool}
-  sampleActive::Vector{Bool}   #= sample() instances true at the current event =#
-  initPhase::Vector{Bool}      #= [true] while initializing: initial() =#
-  checking::Vector{Bool}       #= [true] while asserts in algorithms are checked =#
-  upre::Vector{Float64}
-  ureinit::Vector{Float64}     #= the state reinit() sets in a sweep, applied at its end =#
-  wnew::Vector{Bool}           #= when-conditions of the current pass, before the bodies run =#
-  dlog::Vector{Tuple{Float64, Vector{Float64}}}   #= from each event on: discrete values, then relations and event-function values =#
-  evv::Vector{Float64}         #= values of the event-generating functions (_evfn), by relation number =#
-  hyst::Vector{Float64}        #= [H]: the relations' hysteresis (_rel); 0 (literal relations) while initializing =#
-  tend::Vector{Float64}        #= [stop time]: a solution read there gives the final values (_dlogIndex) =#
-  homotopy::Vector{Float64}    #= [λ] of homotopy(): 1 (actual) but in the continuation (homotopyStart!) =#
-  abuf::Vector{Float64}        #= the algebraic variables of a right-hand side evaluated on Float64 (RHS!): no buffer per call =#
-  aleft::Vector{Float64}       #= the algebraic variables before the event's sweep: pre() of one (its left limit) =#
-  tgradAfter::Vector{Float64}  #= tgrad!'s right-hand side after t (Float64 states: no buffer per call) =#
-  tgradBefore::Vector{Float64} #= tgrad!'s right-hand side before t =#
-  blocks::Vector{BlockSolver}  #= the large algebraic loops' solvers (blockSolve!), in the order of the schedule =#
+mutable struct ArrayModelParameters{C <: ArrayModelCode}
+  const values::Vector{Float64}
+  const rel::Vector{Bool}
+  const d::Vector{Float64}
+  const dpre::Vector{Float64}
+  const wcond::Vector{Bool}
+  const sampleActive::Vector{Bool}   #= sample() instances true at the current event =#
+  const initPhase::Vector{Bool}      #= [true] while initializing: initial() =#
+  const checking::Vector{Bool}       #= [true] while asserts in algorithms are checked =#
+  const upre::Vector{Float64}
+  const ureinit::Vector{Float64}     #= the state reinit() sets in a sweep, applied at its end =#
+  const wnew::Vector{Bool}           #= when-conditions of the current pass, before the bodies run =#
+  const dlog::Vector{Tuple{Float64, Vector{Float64}}}   #= from each event on: discrete values, then relations and event-function values =#
+  const evv::Vector{Float64}         #= values of the event-generating functions (_evfn), by relation number =#
+  const hyst::Vector{Float64}        #= [H]: the relations' hysteresis (_rel); 0 (literal relations) while initializing =#
+  const tend::Vector{Float64}        #= [stop time]: a solution read there gives the final values (_dlogIndex) =#
+  const homotopy::Vector{Float64}    #= [λ] of homotopy(): 1 (actual) but in the continuation (homotopyStart!) =#
+  const abuf::Vector{Float64}        #= the algebraic variables of a right-hand side evaluated on Float64 (RHS!): no buffer per call =#
+  const aleft::Vector{Float64}       #= the algebraic variables before the event's sweep: pre() of one (its left limit) =#
+  const tgradAfter::Vector{Float64}  #= tgrad!'s right-hand side after t (Float64 states: no buffer per call) =#
+  const tgradBefore::Vector{Float64} #= tgrad!'s right-hand side before t =#
+  const edu::Vector{Float64}         #= the event code's state derivatives on Float64 states (`_eventBuffers`) =#
+  const ebuf::Vector{Float64}        #= the event code's algebraic variables on Float64 states (`_eventBuffers`) =#
+  const blocks::Vector{BlockSolver}  #= the large algebraic loops' solvers (blockSolve!), in the order of the schedule =#
   #= per loop family its members' guesses (unknown, member): the run's last solutions =#
-  loops::Vector{Matrix{Float64}}
-  loopWork::Vector{LoopWork{Float64}}   #= per loop family its solve's work arrays (Float64 solves) =#
-  pass::InitialPass           #= the loops the initial solve holds (`initialize`) =#
-  state::ArrayRuntimeState     #= the run's state (samples, memo, warnings, asserts, terminate) =#
-  model::Module
-  code::C
+  const loops::Vector{Matrix{Float64}}
+  const loopWork::Vector{LoopWork{Float64}}   #= per loop family its solve's work arrays (Float64 solves) =#
+  const pass::InitialPass           #= the loops the initial solve holds (`initialize`) =#
+  const state::ArrayRuntimeState     #= the run's state (samples, memo, warnings, asserts, terminate) =#
+  const model::Module
+  const code::C
 end
 
 """
@@ -814,7 +823,7 @@ end
 _startState(p::ArrayModelParameters)::ArrayStartState =
   ArrayStartState(_discreteState(p), copy(p.wcond), copy(p.wnew), length(p.dlog), copy(p.upre), copy(p.ureinit),
                   map(copy, p.loops), Vector{Float64}[copy(b.y) for b in p.blocks], length(p.state.rootLog),
-                  length(p.state.objectLog))
+                  length(p.state.objectLog), p.state.structural)
 
 """
     _checkBlocksSolved(p)
@@ -842,18 +851,72 @@ transient of 1e-4 s, `a` 12 for 0). The step is OrdinaryDiffEq's estimate of a f
 1e-6 of the time span and the step proposed before. The estimate alone is not enough: the algebraic variables are
 solved inside the right-hand side, so a state that follows its input through a high gain has a derivative of
 round-off size at the event, and the estimate from it steps far over the transient (MSL OpAmps.Differentiator,
-V0 = 15000: 5e-3 s over a transient of 2e-6 s, the capacitor's voltage 0.02 V behind over the ramp). No step
-follows an event at the last stop. The step is proposed (`dtpropose`): `integrator.dt` stays the length of the step
-that ended at the event, which the assert checks after the event interpolate (`_assertPending!`, `_autoDtReset!`).
+V0 = 15000: 5e-3 s over a transient of 2e-6 s, the capacitor's voltage 0.02 V behind over the ramp). Where the
+right-hand side after the event changes slowly over the step proposed before it (`_slowAfterEvent`), that step is
+kept. No step follows an event at the last stop. The step is proposed (`dtpropose`): `integrator.dt` stays the length
+of the step that ended at the event, which the assert checks after the event interpolate (`_assertPending!`,
+`_autoDtReset!`).
 """
 function _restartStep!(integrator)::Nothing
   isempty(integrator.opts.tstops) && return nothing
   local before::Float64 = abs(integrator.dtpropose)
-  _autoDtReset!(integrator)
   local span::Float64 = abs(integrator.sol.prob.tspan[2] - integrator.sol.prob.tspan[1])
   local cap::Float64 = 1.0e-6 * (isfinite(span) ? span : 1.0)
+  _slowAfterEvent(integrator, before, min(cap, before)) && return nothing
+  _autoDtReset!(integrator)
   integrator.dtpropose = integrator.tdir * min(abs(integrator.dtpropose), cap, before)
   return nothing
+end
+
+"""
+The largest change of the right-hand side over the step after an event, relative to its size, for which the step
+proposed before the event is kept (`_slowAfterEvent`). A transient of time constant τ gives step / τ: at 10 it has
+decayed to 5e-5 within the step, which crosses it at once. At reltol 1e-6 MSL EngineV6's 325 restarts give at most 3.2,
+20 of OpAmps.Differentiator's 40 0.19 to 0.24; the transients the restart is for give 54 (`ArrayPath.StepAfterEvent`),
+6e5 (SlewRateLimiter) and 3e6 (`ArrayPath.HighGainKink`), whose derivatives are continuous at the event.
+"""
+const _RESTART_CHANGE = 10.0
+
+"""
+    _slowAfterEvent(integrator, step, probe) -> Bool
+
+Whether the step after an event can keep the length `step` proposed before it, both in the solver's error norm:
+- the right-hand side's jump across the event, times the step, is within the tolerance. Before the event it is the
+  derivative of the step that ended there (its interpolation, of the relations before the event: OrdinaryDiffEq computed
+  it again for the step cut at the event). MSL EngineV6's dead centers give at most 0.15; the switch from star to
+  delta of MSL IMC_YD 1.6e11: kept there, its first step of 1.6e-4 s crossed the transient and the steps fell to 3e-8 s
+  for 0.1 s (3134 steps instead of 1740), though its probe below gave only 6.
+- the right-hand side after the event changes by at most `_RESTART_CHANGE` times its size over the step: its change over
+  `probe` (1e-6 of the span, at most the step) from the state along its derivative, scaled to the step, against its
+  value. It catches a fast transient started by a continuous change (`ArrayPath.HighGainKink`, a jump of 1e-3).
+Restarted small after each of its 326 events, MSL EngineV6 took 15 steps between two events instead of 9 (3.3 s of
+solve instead of 2.4 s). Only for OrdinaryDiffEq's integrators of an ODE with an identity mass matrix (the right-hand
+side a derivative); a right-hand side that is not finite there restarts the step. An error at the probe's point is not
+kept as the run's (`LAST_RHS_ERROR`).
+"""
+_slowAfterEvent(::DiffEqBase.DEIntegrator, ::Float64, ::Float64)::Bool = false
+function _slowAfterEvent(integrator::OrdinaryDiffEq.OrdinaryDiffEqCore.ODEIntegrator, step::Float64,
+                         probe::Float64)::Bool
+  (integrator.f isa DiffEqBase.SciMLBase.ODEFunction && probe > 0 && isfinite(step)) || return false
+  local f::DiffEqBase.SciMLBase.ODEFunction = integrator.f
+  OrdinaryDiffEq.OrdinaryDiffEqCore._is_identity_massmatrix(f.mass_matrix) || return false
+  local u::AbstractVector = integrator.u
+  local t::Float64 = Float64(integrator.t)
+  local dir::Float64 = Float64(integrator.tdir)
+  local left::AbstractVector = integrator(t, Val{1})
+  local f0::AbstractVector = similar(u); local f1::AbstractVector = similar(u)
+  f(f0, u, integrator.p, t)
+  local opts::OrdinaryDiffEq.OrdinaryDiffEqCore.DEOptions = integrator.opts
+  local scale::AbstractVector = opts.abstol .+ abs.(u) .* opts.reltol
+  local jump::Float64 = Float64(opts.internalnorm((f0 .- left) ./ scale, t)) * step
+  (isfinite(jump) && jump <= 1) || return false
+  #= the probe is off the solution: an error there (StepRejectingRHS) is not the run's =#
+  local runError::Any = LAST_RHS_ERROR[]
+  f(f1, u .+ (dir * probe) .* f0, integrator.p, t + dir * probe)
+  LAST_RHS_ERROR[] = runError
+  local magnitude::Float64 = Float64(opts.internalnorm(f0 ./ scale, t))
+  local change::Float64 = Float64(opts.internalnorm((f1 .- f0) ./ scale, t)) * (step / probe)
+  return isfinite(magnitude) && isfinite(change) && change <= _RESTART_CHANGE * magnitude
 end
 
 """
@@ -891,6 +954,21 @@ function _rootsAt(p::ArrayModelParameters, t::Real, right::Bool)::Vector{Matrix{
 end
 
 """
+    _solveStart!(integrator)
+
+The start of a solve (its first callback's `initialize`): the parameters as after their initialization
+(`_restoreStart!`); where that reached a structural change, the run ends at its start with Success (`_endRun!`). A
+mode's problem is of zero length then (`endsAtStart`); remade to a longer tspan, it ran on in the mode the change had
+left.
+"""
+function _solveStart!(integrator::DiffEqBase.DEIntegrator)::Nothing
+  local p::ArrayModelParameters = integrator.p
+  _restoreStart!(p)
+  first(p.state.structural) == 0 || _endRun!(integrator, DiffEqBase.SciMLBase.ReturnCode.Success)
+  return nothing
+end
+
+"""
     _restoreStart!(p)
 
 `p` as after its initialization again (`ArrayRuntimeState.atStart`), at the start of a solve: a second solve of the
@@ -919,7 +997,7 @@ function _restoreStart!(p::ArrayModelParameters)::Nothing
   fill!(p.sampleActive, false)
   p.state.terminal = false
   p.state.pending = (NaN, Float64[]); p.state.leftLimit = (NaN, Float64[]); p.state.terminated = nothing
-  p.state.structural = (0, 0.0)
+  p.state.structural = s.structural
   empty!(p.state.whenMemo)
   return nothing
 end
@@ -1535,60 +1613,143 @@ function _withIndexInts(@nospecialize(x::Any), subs::Vector{Any}, at::Base.RefVa
   return Expr(x.head, Any[_withIndexInts(y, subs, at, false) for y in x.args]...)
 end
 
-"""
-    _rollRuns(stmts) -> stmts
+"The most statements a group of `_rollRuns` has (the longest period of a run it finds)."
+const ROLL_PERIOD = 8
 
-Consecutive classes of one column (`_isOneColumn`) whose code differs only in its subscripts' integer literals
-(`_indexShape!`) as one loop over them, in their order: a literal the same in all of them stays, one that varies is
-affine in the loop's counter `_run` or read from a table of its values. The rows of an array split into classes of one
-element each (MSL EngineV6: 9,889 of them, 204k of its 411k nodes, in runs of up to 216) are then compiled once per run.
-A run whose loop would not be smaller stays as it is. For `equations!` and `invariants!` only (`ColdCode`): in the
-solver's steps the tables' reads cost more than the code saves (EngineV6's solve 3.15 -> 3.70 s with all functions
-rolled).
 """
-function _rollRuns(stmts::Vector{Any})::Vector{Any}
+    _rollRuns(stmts; tables = true) -> stmts
+
+Runs of classes of one column (`_isOneColumn`) as loops, in their order. A run is a group of up to `ROLL_PERIOD`
+consecutive statements repeated at least twice, each repetition's code differing from the first only in its subscripts'
+integer literals (`_indexShape!`). In the loop, a literal the same in all repetitions stays; one that varies is affine
+in the loop's counter `_run` or read from a table of its values. Each position takes the period that covers the most
+statements (`_bestRun`); a run whose loop would not be smaller stays as it is.
+
+Period 1: the rows of an array split into classes of one element each (MSL EngineV6: 9,889 of them, 204k of its 411k
+nodes, in runs of up to 216). Longer periods: a recurrence over a chain's elements scheduled one column at a time
+(rodChain's torn block: three statements per mass, the literals advancing by one).
+
+`equations!`, `invariants!` and `assertRows!` (`ColdCode`) roll with tables. The functions of the solver's steps
+(`RHS!`, `crossings!`, the torn blocks' `BLOCK_k!`) take `tables = false`: only runs whose literals are all affine, as
+there the tables' reads cost more than the code saves (EngineV6's solve 3.15 -> 3.70 s with all functions rolled with
+tables); affine loops cost nothing there (EngineV6's right-hand side 7.1 us per call before and after).
+"""
+function _rollRuns(stmts::Vector{Any}; tables::Bool = true)::Vector{Any}
+  local n::Int = length(stmts)
+  local ids::Vector{Int} = zeros(Int, n)
+  local ints::Vector{Vector{Int}} = Vector{Int}[Int[] for _ in 1:n]
+  local nodes::Vector{Int} = zeros(Int, n)
+  local shapes::Dict{Any, Int} = Dict{Any, Int}()
+  for i::Int in 1:n
+    _isOneColumn(stmts[i]) || continue
+    ids[i] = get!(shapes, _indexShape!(ints[i], (stmts[i]::Expr).args[2], false), length(shapes) + 1)
+    nodes[i] = _nodeCount(stmts[i])
+  end
   local out::Vector{Any} = Any[]
   local i::Int = 1
-  while i <= length(stmts)
-    local st::Any = stmts[i]
-    if !_isOneColumn(st)
-      push!(out, st)
+  while i <= n
+    local (p::Int, r::Int) = _bestRun(nodes, ids, ints, i, !tables)
+    if p == 0
+      push!(out, stmts[i])
       i += 1
-      continue
+    else
+      push!(out, _runLoop(stmts, ints, i, p, r))
+      i += p * r
     end
-    local firstInts::Vector{Int} = Int[]
-    local shape::Any = _indexShape!(firstInts, (st::Expr).args[2], false)
-    local cols::Vector{Vector{Int}} = Vector{Int}[firstInts]
-    local j::Int = i
-    while j < length(stmts) && _isOneColumn(stmts[j + 1])
-      local ints::Vector{Int} = Int[]
-      _indexShape!(ints, (stmts[j + 1]::Expr).args[2], false) == shape || break
-      push!(cols, ints)
-      j += 1
-    end
-    local m::Int = j - i + 1
-    if m < 2 || isempty(firstInts) || (m - 1) * _nodeCount(st) < 64
-      append!(out, @view stmts[i:j])
-      i = j + 1
-      continue
-    end
-    local V::Matrix{Int} = reduce(hcat, cols)
-    local subs::Vector{Any} = Any[]
-    for r::Int in axes(V, 1)
-      local (a::Int, b::Int) = (V[r, 1], V[r, 2] - V[r, 1])
-      push!(subs, all(c::Int -> V[r, c] == a + b * (c - 1), 1:m) ?
-                  (b == 0 ? a : :($a + $b * _run)) : :($(V[r, :])[_run + 1]))
-    end
-    push!(out, :(for _run in 0:$(m - 1)
-                   $(_withIndexInts((st::Expr).args[2], subs, Base.RefValue{Int}(0), false))
-                 end))
-    i = j + 1
   end
   return out
 end
 
 """
-    _splitStatements(name, args, passed, paramLocals, stmts; fired) -> (defs, stmts)
+    _bestRun(nodes, ids, ints, i, affine) -> (period, repetitions)
+
+The run `_rollRuns` takes at statement `i`: of the periods up to `ROLL_PERIOD`, the one whose run covers the most
+statements (the shortest of equal ones), with at least two repetitions, a subscript literal, and a loop smaller than the
+statements by at least 64 nodes. `nodes`: the statements' sizes; `ids`: their shapes (`0`: not one column); `ints`:
+their literals. `affine`: only as far as every literal is affine in the repetition. `(0, 0)`: no run.
+"""
+function _bestRun(nodes::Vector{Int}, ids::Vector{Int}, ints::Vector{Vector{Int}}, i::Int, affine::Bool)::Tuple{Int, Int}
+  local best::Tuple{Int, Int} = (0, 0)
+  ids[i] == 0 && return best
+  for p::Int in 1:ROLL_PERIOD
+    local r::Int = _runLength(ids, ints, i, p, affine)
+    (r >= 2 && p * r > best[1] * best[2]) || continue
+    local size::Int = 0
+    local literals::Int = 0
+    for k::Int in 0:(p - 1)
+      size += nodes[i + k]
+      literals += length(ints[i + k])
+    end
+    (literals > 0 && (r - 1) * size >= 64) || continue
+    best = (p, r)
+  end
+  return best
+end
+
+"""
+    _runLength(ids, ints, i, p, affine) -> repetitions
+
+How often the `p` statements from `i` repeat in a row: the same shapes (`ids`, all one column), with `affine` only as
+long as each of their literals stays affine in the repetition (`_affineAt`).
+"""
+function _runLength(ids::Vector{Int}, ints::Vector{Vector{Int}}, i::Int, p::Int, affine::Bool)::Int
+  local r::Int = 1
+  while i + (r + 1) * p - 1 <= length(ids)
+    local same::Bool = true
+    for k::Int in 0:(p - 1)
+      if ids[i + k] == 0 || ids[i + r * p + k] != ids[i + k] || (affine && r >= 2 && !_affineAt(ints, i + k, p, r))
+        same = false
+        break
+      end
+    end
+    same || break
+    r += 1
+  end
+  return r
+end
+
+"Whether the literals of statement `i + c * p` continue those of `i` and `i + p` affinely (`c >= 2`)."
+function _affineAt(ints::Vector{Vector{Int}}, i::Int, p::Int, c::Int)::Bool
+  local (first::Vector{Int}, second::Vector{Int}, at::Vector{Int}) = (ints[i], ints[i + p], ints[i + c * p])
+  for row::Int in eachindex(first)
+    at[row] == first[row] + (second[row] - first[row]) * c || return false
+  end
+  return true
+end
+
+"""
+    _runLoop(stmts, ints, i, p, r) -> loop
+
+The `r` repetitions of the `p` statements from `stmts[i]` as one loop over `_run` (each statement in its own `let`
+when `p > 1`): a literal that varies is `a + b * _run` if it is affine in the repetition, else read from a table of its
+values.
+"""
+function _runLoop(stmts::Vector{Any}, ints::Vector{Vector{Int}}, i::Int, p::Int, r::Int)::Expr
+  local body::Vector{Any} = Any[]
+  for k::Int in 0:(p - 1)
+    local first::Vector{Int} = ints[i + k]
+    local subs::Vector{Any} = Any[]
+    for row::Int in eachindex(first)
+      local a::Int = first[row]
+      local b::Int = ints[i + k + p][row] - a
+      local affine::Bool = true
+      for c::Int in 2:(r - 1)
+        if ints[i + k + c * p][row] != a + b * c
+          affine = false
+          break
+        end
+      end
+      push!(subs, affine ? (b == 0 ? a : :($a + $b * _run)) :
+                  :($(Int[ints[i + k + c * p][row] for c::Int in 0:(r - 1)])[_run + 1]))
+    end
+    local code::Any = _withIndexInts((stmts[i + k]::Expr).args[2], subs, Base.RefValue{Int}(0), false)
+    push!(body, p == 1 ? code : Expr(:let, Expr(:block), code))
+  end
+  return Expr(:for, :(_run = 0:$(r - 1)), Expr(:block, body...))
+end
+
+"""
+    _splitStatements(name, args, passed, paramLocals, stmts; fired, pure) -> (defs, stmts)
 
 A generated function's statements (run under @inbounds) in functions of about `CHUNK_NODES` expression nodes each
 (`name_chunk1`, ...), called in order, where they are at least twice that: Julia's compilation of one function grows
@@ -1596,12 +1757,14 @@ faster than its size. MSL EngineV6's module (917k nodes, equations! 445k) took 5
 split at 20k nodes 24 s and 3.8 GB, the right-hand side as fast (at 5k nodes 17 % slower). The statements write only
 to the arrays. Each part takes the function's arguments `args` and its locals `passed`, declares the parameter views
 it reads (of `paramLocals`) and returns its `_fired` (an algorithm's when-statement fired), which the calls OR into
-the caller's where it has one (`fired`). No definitions and the statements as they are below the size.
+the caller's where it has one (`fired`). No definitions below the size. The calls of the pure functions `pure` each
+part (or the whole) makes more than once with the same arguments made once (`_shareCalls`).
 """
 function _splitStatements(name::Symbol, args::Vector{Symbol}, passed::Vector{Symbol}, paramLocals::Vector{Any},
-                          stmts::Vector{Any}; fired::Bool)::Tuple{Vector{Expr}, Vector{Any}}
+                          stmts::Vector{Any}; fired::Bool, pure::Set{Symbol})::Tuple{Vector{Expr}, Vector{Any}}
   local limit::Int = CHUNK_NODES[]
-  sum(_nodeCount, stmts; init = 0) < 2 * limit && return (Expr[], stmts)
+  local counter::Base.RefValue{Int} = Base.RefValue{Int}(0)
+  sum(_nodeCount, stmts; init = 0) < 2 * limit && return (Expr[], _shareCalls(stmts, pure, counter))
   local parts::Vector{Vector{Any}} = Vector{Any}[Any[]]
   local size::Int = 0
   for st in stmts
@@ -1614,8 +1777,9 @@ function _splitStatements(name::Symbol, args::Vector{Symbol}, passed::Vector{Sym
   isempty(last(parts)) && pop!(parts)
   local defs::Vector{Expr} = Expr[]
   local calls::Vector{Any} = Any[]
-  for (k, part) in enumerate(parts)
+  for (k, whole) in enumerate(parts)
     local partName::Symbol = Symbol(name, "_chunk", k)
+    local part::Vector{Any} = _shareCalls(whole, pure, counter)
     local views::Vector{Any} = _usedLocals(paramLocals, Expr(:block, part...))
     push!(defs, :(function $partName($(args...), $(passed...))
                     $(views...)
@@ -2980,23 +3144,32 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
   local jacProto::Union{Nothing, Expr} = pattern === nothing ? nothing :
     :(Symbolics.SparseArrays.sparse($(pattern[1]), $(pattern[2]), ones($(length(pattern[1]))), $nStates, $nStates, $(_keepFirst)))
   local paramsType::UnionAll = ArrayModelParameters
-  #= a terminate() at the initialization: the problem ends at its start =#
-  local endsAtStart::Union{Nothing, Expr} = hasTerminate ?
-    :(p.state.terminated === nothing || return (ODEProblem(f, u0, (tspan[1], tspan[1]), p), cb)) : nothing
-  #= the large functions' statements in functions of bounded size (_splitStatements) =#
+  #= a terminate() or a structural change at the initialization: the problem ends at its start =#
+  local hasStructural::Bool = !isempty(g.structuralChanges)
+  local endsAtStart::Union{Nothing, Expr} = hasTerminate || hasStructural ?
+    :((p.state.terminated === nothing && first(p.state.structural) == 0) ||
+      return (ODEProblem(f, u0, (tspan[1], tspan[1]), p), cb)) : nothing
+  #= the large functions' statements in functions of bounded size (_splitStatements), the calls of the functions not
+     called as impure shared in each (`_shareCalls`) =#
+  local pure::Set{Symbol} = Set{Symbol}(Symbol(nm) for nm::String in keys(g.functions) if !(nm in g.impure))
   local (eqDefs::Vector{Expr}, eqStmts::Vector{Any}) =
-    _splitStatements(:equations!, Symbol[:du, :a, :u, :p, :t, :z, :mode, :fire], Symbol[], paramLocals, _rollRuns(body); fired = true)
+    _splitStatements(:equations!, Symbol[:du, :a, :u, :p, :t, :z, :mode, :fire], Symbol[], paramLocals, _rollRuns(body);
+                     fired = true, pure)
   local (rhsDefs::Vector{Expr}, rhsStmts::Vector{Any}) =
-    _splitStatements(:RHS!, Symbol[:du, :u, :p, :t], Symbol[:a, :z, :mode, :fire], paramLocals, rhsBody; fired = true)
+    _splitStatements(:RHS!, Symbol[:du, :u, :p, :t], Symbol[:a, :z, :mode, :fire], paramLocals,
+                     _rollRuns(rhsBody; tables = false); fired = true, pure)
   local (condDefs::Vector{Expr}, condStmts::Vector{Any}) =
-    _splitStatements(:crossings!, Symbol[:du, :a, :u, :p, :t, :z, :mode], Symbol[:fire], paramLocals, condBody; fired = true)
+    _splitStatements(:crossings!, Symbol[:du, :a, :u, :p, :t, :z, :mode], Symbol[:fire], paramLocals,
+                     _rollRuns(condBody; tables = false); fired = true, pure)
   local (invDefs::Vector{Expr}, invStmts::Vector{Any}) =
-    _splitStatements(:invariants!, Symbol[:a, :p], Symbol[], paramLocals, _rollRuns(invariantBody); fired = false)
+    _splitStatements(:invariants!, Symbol[:a, :p], Symbol[], paramLocals, _rollRuns(invariantBody); fired = false, pure)
   local (assertRowDefs::Vector{Expr}, assertRowStmts::Vector{Any}) =
-    _splitStatements(:assertRows!, Symbol[:du, :a, :u, :p, :t], Symbol[:z, :mode, :fire], paramLocals, assertRowBody; fired = true)
+    _splitStatements(:assertRows!, Symbol[:du, :a, :u, :p, :t], Symbol[:z, :mode, :fire], paramLocals,
+                     _rollRuns(assertRowBody); fired = true, pure)
   local blockSplits::Vector{Tuple{Vector{Expr}, Vector{Any}}} =
     Tuple{Vector{Expr}, Vector{Any}}[_splitStatements(Symbol("BLOCK_", k, "!"), Symbol[:res, :y, :du, :a, :u, :p, :t, :z, :mode, :fire],
-                                                      Symbol[], paramLocals, code.args; fired = false)
+                                                      Symbol[], paramLocals, _rollRuns(code.args; tables = false);
+                                                      fired = false, pure)
                                      for (k, code) in enumerate(blockBodies)]
   local splitDefs::Vector{Expr} = vcat(rhsDefs, condDefs, Expr[d for (defs, _) in blockSplits for d in defs])
   #= equations! and invariants! with their parts: the model module's submodule ColdCode =#
@@ -3411,7 +3584,10 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
     #= The algebraic variables at a point (u, t) of a solution: the discrete, relation and
        event-function values of that time from the event log (after a solve p holds the final
        ones), on a copy of the discrete state; the loops started from the run's roots of that time (_rootsAt).
-       The external objects the when-bodies call as the run left them at the log entry's time (`replayObjects!`). =#
+       The external objects the when-bodies call as the run left them at the log entry's time (`replayObjects!`).
+       An event's two points read the delays at their jumps as the left and (`right`) the right limits, the event's
+       values (delays.jl `DelayLimit`): MSL CompareLosslessLines' reflected wave at 12.5 ns read 0 at both, its next
+       step's 5 V 0.36 ns later. =#
     function algebraics(u, p, t, right::Bool = false)
       local a = similar(u, $nAlg)
       local times = first.(p.dlog)
@@ -3424,10 +3600,17 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
       local q = $(paramsType)(p.values, rel, d, copy(d), copy(p.wcond), copy(p.sampleActive),
                               [false], [false], copy(p.upre), copy(p.ureinit), copy(p.wnew), p.dlog, evv, copy(p.hyst), copy(p.tend),
                               copy(p.homotopy),
-                              zeros($nAlg), copy(p.aleft), p.tgradAfter, p.tgradBefore, p.blocks, $(_rootsAt)(p, t, right), p.loopWork, p.pass, p.state,
+                              zeros($nAlg), copy(p.aleft), p.tgradAfter, p.tgradBefore, p.edu, p.ebuf, p.blocks, $(_rootsAt)(p, t, right), p.loopWork, p.pass, p.state,
                               p.model, p.code)
       POSITIONS_OBJECTS && k > 0 && replayObjects!(u, q, times[k])
-      equations!(similar(u), a, u, q, t, $(NO_CROSSINGS), false)
+      local delays::$(DelayState) = p.state.delays
+      local limit::$(DelayLimit) = delays.limit
+      delays.limit = right ? $(DELAY_RIGHT) : $(DELAY_LEFT)
+      try
+        equations!(similar(u), a, u, q, t, $(NO_CROSSINGS), false)
+      finally
+        delays.limit = limit
+      end
       return a
     end
 
@@ -3530,6 +3713,7 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
                            zeros(Bool, N_SAMPLES), [false], [false], copy(U0), copy(U0),
                            zeros(Bool, N_WHENS), Tuple{Float64, Vector{Float64}}[], zeros(N_RELATIONS), [0.0], [Float64(tspan[2])],
                            [1.0], zeros($nAlg), zeros($nAlg), zeros(length(U0)), zeros(length(U0)),
+                           zeros(length(U0)), zeros($nAlg),
                            $(BlockSolver)[$(BlockSolver)(BLOCK_PATTERNS[k], BLOCK_COLORS[k], BLOCK_GUESSES[k], BLOCK_LINEAR[k]; nominal = BLOCK_NOMINALS[k]) for k in eachindex(BLOCK_PATTERNS)],
                            Matrix{Float64}[copy(G) for G in LOOP_GUESSES],
                            $(LoopWork){Float64}[$(LoopWork){Float64}(size(G, 1)) for G in LOOP_GUESSES],
@@ -3640,7 +3824,7 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
                                     save_positions = (false, false)))
       end
       pushfirst!(cbs, DiscreteCallback($(_OMBACKEND.CodeGeneration.NotAnEvent)((u, t, integrator) -> false), integrator -> nothing;
-                                       initialize = (c, u, t, integrator) -> $(_restoreStart!)(integrator.p),
+                                       initialize = (c, u, t, integrator) -> $(_solveStart!)(integrator),
                                        save_positions = (false, false)))
       #= the first step, after the other callbacks' initializations: finite (`_finiteFirstStep!`) =#
       push!(cbs, DiscreteCallback($(_OMBACKEND.CodeGeneration.NotAnEvent)((u, t, integrator) -> false), integrator -> nothing;
@@ -3709,10 +3893,10 @@ function _emitModule(g::Gen, modelName::String, functionDefs::Vector{Any}, u0::V
       local initKw = (; $(_initializeKwargs)(prob, kwargs, abstol)..., $(_stepKwargs)(kwargs, tspan, N_RELATIONS)...,
                       $(solverVerbosity)(kwargs)...)
       OMBackend.CodeGeneration._resetRHSError!()
-      local sol = $(hasTerminate ?
-                    :(prob.p.state.terminated === nothing ?
+      local sol = $(hasTerminate || hasStructural ?
+                    :(prob.p.state.terminated === nothing && first(prob.p.state.structural) == 0 ?
                         DifferentialEquations.solve(prob, solver; callback = callbacks, abstol = abstol, initKw..., kwargs...) :
-                      $(solveStoppedAtStart)(prob, solver, something(prob.p.state.terminated); callback = callbacks,
+                      $(solveStoppedAtStart)(prob, solver, prob.p.state.terminated; callback = callbacks,
                                              abstol = abstol, initKw..., kwargs...)) :
                     :(DifferentialEquations.solve(prob, solver; callback = callbacks, abstol = abstol, initKw..., kwargs...)))
       #= an error that every smaller step met ends the run =#

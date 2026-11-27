@@ -729,7 +729,7 @@ The array model of the variable structure system `name` (canonical; OMJL's struc
 `Passes.isStructural`) that `lower()` lowers to OMJLIR: a module of one array module per mode
 (`ArrayPreserveDE.structuralModesModule`), each mode's model (`Passes.modeModels`; the model itself where it has no
 modes) through the array form (`reducedArrayModel`) to its array code (`_arrayModuleCode`). The modes a recompilation
-gives are compiled during the simulation (`recompiledArrayModule`). Cached and recorded as the arrayPreserveDE models
+gives are compiled during the simulation (`recompiledArrayModules`). Cached and recorded as the arrayPreserveDE models
 (`_registeredArrayModel`). `nothing` where the array form or code does not take a mode: the reason recorded
 (`declineArrayPath!`, "array code of the structural modes", or reducedArrayModel's), and the caller scalarizes.
 """
@@ -758,15 +758,10 @@ function structuralArrayTargetCode(lower::Function, name::String)::Union{Nothing
       push!(modes, (name, code))
     else
       initialMode = something(lowered.initialMode, first(lowered.modes).name)
-      for (k::Int, model::OMJLIR.Model) in enumerate(Passes.modeModels(lowered))
-        local modeName::String = lowered.modes[k].name
-        local reduced::Union{Nothing, OMJLIR.Model} = reducedArrayModel(() -> deepcopy(model), name)
-        reduced === nothing && return nothing
-        local (moduleName::Union{Nothing, String}, code::Union{String, Expr}) =
-          _arrayModuleCode(reduced, string("Mode_", k); owner = name)
-        moduleName === nothing && return decline(string("the mode ", modeName, ": ", code))
-        push!(modes, (modeName, code))
-      end
+      local made::ModeModules = _modeModules(lowered, name, "Mode")
+      made === nothing && return nothing
+      made isa String && return decline(made)
+      append!(modes, made)
     end
   catch err
     isFatal(err) && rethrow()
@@ -777,27 +772,70 @@ function structuralArrayTargetCode(lower::Function, name::String)::Union{Nothing
 end
 
 """
-    recompiledArrayModule(name, frontendModel, element, value, moduleName) -> Tuple{Expr, Any}
-
-The array module `moduleName` of a mode of the array model `name` (`structuralArrayTargetCode`) recompiled at a
-structural change, and its frontend model: the frontend's model `frontendModel` with the element `element` set to
-`value`, instantiated again with its arrays kept (`Runtime.recompiledArrayModel`), through the array form and code as
-the model's modes at its translate. An error where they do not take it.
+The array modules of a model's structural modes (`_modeModules`): each mode's name and module; the reason where a mode
+has no array code; `nothing` where a mode is outside the array form.
 """
-function recompiledArrayModule(name::String, @nospecialize(frontendModel), element::String, value::Union{Bool, Int, Float64},
-                               moduleName::String)::Tuple{Expr, Any}
-  local lower::Function = () -> Runtime.recompiledArrayModel(frontendModel, name, element, value)
+const ModeModules = Union{Nothing, String, Vector{Tuple{String, Expr}}}
+
+"""
+    _modeModules(lowered, name, prefix) -> ModeModules
+
+The array modules of the structural modes of the lowered model `lowered` of the array model `name` (`Passes.modeModels`),
+each its mode's name and module, named `<prefix>_<k>`: `nothing` where a mode is outside the array form
+(`reducedArrayModel`), the reason where a mode has no array code.
+"""
+function _modeModules(lowered::OMJLIR.Model, name::String, prefix::String)::ModeModules
+  local modes::Vector{Tuple{String, Expr}} = Tuple{String, Expr}[]
+  for (k::Int, model::OMJLIR.Model) in enumerate(Passes.modeModels(lowered))
+    local modeName::String = lowered.modes[k].name
+    local reduced::Union{Nothing, OMJLIR.Model} = reducedArrayModel(() -> deepcopy(model), name)
+    reduced === nothing && return nothing
+    local (moduleName::Union{Nothing, String}, code::Union{String, Expr}) =
+      _arrayModuleCode(reduced, string(prefix, "_", k); owner = name)
+    moduleName === nothing && return string("the mode ", modeName, ": ", code)
+    push!(modes, (modeName, code::Expr))
+  end
+  return modes
+end
+
+"""
+    recompiledArrayModules(name, frontendModel, element, value, moduleName) -> Tuple{Vector{Tuple{String, Expr}}, Any}
+
+The array modules of the array model `name` (`structuralArrayTargetCode`) recompiled at a structural change, each its
+mode's name and module, and their frontend model: the frontend's model `frontendModel` with the element `element` set
+to `value`, instantiated again with its arrays kept (`Runtime.recompiledArrayModel`), through the array form and code
+as the model's modes at its translate. A model without structural modes is one, named `moduleName` (its mode's name
+`name`); a model with modes has one per mode, `<moduleName>_<k>`. An error where they do not take it.
+"""
+function recompiledArrayModules(name::String, @nospecialize(frontendModel), element::String,
+                                value::Union{Bool, Int, Float64}, moduleName::String)::Tuple{Vector{Tuple{String, Expr}}, Any}
+  local change::String = string(element, " = ", value)
+  local lowered::OMJLIR.Model = Runtime.recompiledArrayModel(frontendModel, name, element, value)
   #= the translate's record of the model kept (reducedArrayModel drops it at its start) =#
   local recorded::Bool = name in ARRAY_REDUCED_MODELS
-  local reduced::Union{Nothing, OMJLIR.Model} = reducedArrayModel(lower, name)
-  recorded && push!(ARRAY_REDUCED_MODELS, name)
-  reduced === nothing &&
-    error(string("array model ", name, ": the mode recompiled with ", element, " = ", value, " is outside the array form (",
-                 scalarizedFallbackReason(name), ")"))
-  local (modelName::Union{Nothing, String}, code::Union{String, Expr}) = _arrayModuleCode(reduced, moduleName; owner = name)
-  modelName === nothing &&
-    error(string("array model ", name, ": the mode recompiled with ", element, " = ", value, " has no array code (", code, ")"))
-  return (code::Expr, reduced.frontendModel)
+  try
+    if !isempty(lowered.modes)
+      local made::ModeModules = _modeModules(lowered, name, moduleName)
+      made === nothing && error(string("array model ", name, ": a mode recompiled with ", change,
+                                       " is outside the array form (", scalarizedFallbackReason(name), ")"))
+      made isa String && error(string("array model ", name, ": recompiled with ", change, ", ", made))
+      return (made, lowered.frontendModel)
+    end
+    #= lowered again where the array form needs it again =#
+    local fresh::Base.RefValue{Bool} = Base.RefValue{Bool}(true)
+    local lower::Function = () -> fresh[] ? (fresh[] = false; lowered) :
+      Runtime.recompiledArrayModel(frontendModel, name, element, value)
+    local reduced::Union{Nothing, OMJLIR.Model} = reducedArrayModel(lower, name)
+    reduced === nothing &&
+      error(string("array model ", name, ": the mode recompiled with ", change, " is outside the array form (",
+                   scalarizedFallbackReason(name), ")"))
+    local (modelName::Union{Nothing, String}, code::Union{String, Expr}) = _arrayModuleCode(reduced, moduleName; owner = name)
+    modelName === nothing &&
+      error(string("array model ", name, ": the mode recompiled with ", change, " has no array code (", code, ")"))
+    return (Tuple{String, Expr}[(name, code::Expr)], reduced.frontendModel)
+  finally
+    recorded && push!(ARRAY_REDUCED_MODELS, name)
+  end
 end
 
 """

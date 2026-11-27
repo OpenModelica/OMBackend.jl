@@ -336,9 +336,11 @@ end
     arrayAliasPlan(model, view, cache) -> Tuple{Scalarized, Union{Nothing, Plan}}
 
 `aliasPlan` of an arrays-kept model that needs index reduction (`differentiates` of its element view `view`): planned
-with the aliases read through their representatives (`substituteArrayAliases!`), which the model keeps, its new
-element view and plan. Where that leaves nothing to reduce (the aliases were the constraint: a capacitor loop's
-`v1 = v2`) or is not handled, the model as written, `view` and `nothing` (the caller plans it as written).
+with the aliases read through their representatives (`substituteArrayAliases!`) and the simulation code's values
+(`knownPlan`), which the model keeps, its new element view and plan. Where that leaves nothing to reduce (the aliases
+were the constraint: a capacitor loop's `v1 = v2`) or is not handled, the model as written, `view` and `nothing` (the
+caller plans it as written). Kept where the simulation code's zeros took terms out (`dropFunctionZeroTerms!`), also of
+nothing to reduce: they, not the aliases, took the derivatives out (MSL Spice3's MOSFETs without capacitances).
 """
 function arrayAliasPlan(model::IR.Model, view::Scalarized, cache::ScalarCache)::Tuple{Scalarized, Union{Nothing, Plan}}
   local order::Vector{Symbol} = Symbol[v.name for v in model.variables]
@@ -351,15 +353,25 @@ function arrayAliasPlan(model::IR.Model, view::Scalarized, cache::ScalarCache)::
     return (view, nothing)
   end
   aliases.substituted > 0 || return (view, nothing)
+  #= the variables as substituted and their kinds: the plan's fold of a function's zero outputs (`knownPlan`,
+     `dropFunctionZeroTerms!`) can demote states and drop their derivative variables, undone with the aliases =#
+  local substituted::Vector{IR.Variable} = collect(model.variables)
+  local kinds::Vector{IR.VariableKind} = IR.VariableKind[v.kind for v in substituted]
   local substitutedView::Union{Nothing, Scalarized} = nothing
-  local p::Union{Nothing, Plan} = try
+  local planned::Union{Nothing, Tuple{Scalarized, Plan}} = try
     substitutedView = scalarizeArrays(model; cache)
-    plan(substitutedView.model, substitutedView.model.continuous[1]; indexOne = true, initialDerivatives = true)
+    knownPlan(model, substitutedView)
   catch err
     err isa NotHandled || rethrow()
     nothing
   end
-  (p !== nothing && !isempty(p.differentiated)) && return (something(substitutedView), p)
+  #= another view than the substituted one: the zeros took terms out =#
+  (planned !== nothing && (planned[1] !== substitutedView || !isempty(planned[2].differentiated))) && return planned
+  empty!(model.variables)
+  for (v::IR.Variable, kind::IR.VariableKind) in zip(substituted, kinds)
+    v.kind = kind
+    push!(model.variables, v)
+  end
   undoArrayAliases!(model, aliases, order)
   return (view, nothing)
 end

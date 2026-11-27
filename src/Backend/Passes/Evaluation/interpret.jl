@@ -161,6 +161,16 @@ function valueOf(@nospecialize(e::IR.Expression), run::Interpretation)::Union{No
     return (outputs === nothing || e.index > length(outputs)) ? nothing : outputs[e.index]
   end
   if e isa IR.SUBSCRIPTED
+    #= an array constructor's element by an index per iterator, of a cast too (a cast's value is its operand's; the
+       frontend's Real start `/*Real[N]*/ {i for i in 1:N}[k]`): its body at their items alone (`constructorElement`) =#
+    local array::IR.Expression = e.exp
+    while array isa IR.CAST
+      array = array.exp
+    end
+    if array isa IR.ARRAY_CONSTRUCTOR && length(e.subscripts) >= length(array.iterators)
+      local at::Union{Nothing, Vector{Int}} = subscriptIndices(e.subscripts, run)
+      at === nothing || return constructorElement(array, at, run)
+    end
     local v = valueOf(e.exp, run)
     v === nothing && return nothing
     local index = subscriptIndices(e.subscripts, run)
@@ -592,6 +602,35 @@ function rangeValues(e::IR.RANGE, run::Interpretation)::Union{Nothing, Vector{Fl
   local h = e.step === nothing ? 1.0 : bound(e.step)
   (a === nothing || b === nothing || h === nothing || h == 0) && return nothing
   return collect(a:h:b)
+end
+
+"""
+    constructorElement(e, index, run) -> Union{Nothing, FlatValue}
+
+The element at `index` of an array constructor, an index per iterator (`{f(i) for i in 1:n}[k]`): its body with each
+iterator at its item, the other elements not evaluated (the start `{i for i in 1:N}[k]` of each of N scalarized
+variables: the whole array per variable, rodChain's start values O(N^2), 2.68 s at N = 1600). Indices after the
+iterators' pick from the body's value; `nothing` where an item or the body does not evaluate, as `constructorValue`.
+"""
+function constructorElement(e::IR.ARRAY_CONSTRUCTOR, index::Vector{Int}, run::Interpretation)::Union{Nothing, FlatValue}
+  local n::Int = length(e.iterators)
+  local items::Vector{Float64} = Vector{Float64}(undef, n)
+  for k in 1:n
+    local it::IR.Iterator = e.iterators[k]
+    local xs::Union{Nothing, Vector{Float64}} = it.range isa IR.RANGE ? rangeValues(it.range, run) : iteratorItems(it, run)
+    (xs === nothing || !(1 <= index[k] <= length(xs))) && return nothing
+    items[k] = xs[index[k]]
+  end
+  local previous::Vector{Union{Nothing, FlatValue}} = Union{Nothing, FlatValue}[get(run.variables, it.name, nothing) for it in e.iterators]
+  for k in 1:n
+    run.variables[e.iterators[k].name] = scalarValue(items[k])
+  end
+  local v::Union{Nothing, FlatValue} = valueOf(e.body, run)
+  for (it::IR.Iterator, x::Union{Nothing, FlatValue}) in zip(e.iterators, previous)
+    x === nothing ? delete!(run.variables, it.name) : (run.variables[it.name] = x)
+  end
+  v === nothing && return nothing
+  return length(index) == n ? v : elementOf(v, index[n + 1:end])
 end
 
 "An array constructor (`{f(i, j) for i in 1:n, j in 1:m}`): its body for each combination of the iterators' items, the first iterator the first dimension."

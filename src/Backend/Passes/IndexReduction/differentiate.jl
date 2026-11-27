@@ -186,8 +186,9 @@ withIteratorsAsOne(cref::IR.ComponentRef)::IR.ComponentRef =
 The derivative of an element of an array whose derivative the seeds (`ArrayVariables`) give as a whole: that
 element of the derivative array (`\$DER.x[i]`, `\$DER.c.T[i]`, the subscripts of all parts on its last part,
 `IR.withLastSubscripts`); of a
-slice's element the slice's; of an element of an array that is no variable, its elements' derivatives at the
-subscripts; 0 for another reference, and with other seeds (the variable has no derivative).
+slice's element the slice's; of an element of an array that is no variable, the derivatives of the elements its
+subscripts reach at the subscripts (`reachedElementsDerivative`); 0 for another reference, and with other seeds (the
+variable has no derivative).
 """
 arrayElementDerivative(::IR.CREF, ::Seeds)::IR.Expression = ZERO
 
@@ -199,11 +200,17 @@ function arrayElementDerivative(e::IR.CREF, seeds::Seeds{<:ArrayVariables})::IR.
     local sliced::Union{Nothing, IR.ComponentRef} = slicedCref(e.cref, (n::Symbol) -> seedOf(seeds, n) !== nothing)
     sliced === nothing || return derivativeOf(IR.CREF(sliced, e.ty), seeds)
     #= an element by subscripts of an array that is no variable but whose elements are (a record's array field,
-       `frame_a.R.w[\$i1]`): the array of its elements' derivatives (by name, 0 for a parameter's) at the subscripts =#
+       `frame_a.R.w[\$i1]`): the array of the derivatives of the elements the subscripts reach (by name, 0 for a
+       parameter's) at the subscripts that are no literals =#
     local last::IR.CrefPart = e.cref.parts[end]
     if last.ty isa IR.T_ARRAY && length(IR.dimensions(last.ty)) == length(last.subscripts) &&
        !any(IR.isSubscripted, @view e.cref.parts[1:end - 1]) && all(x::IR.Subscript -> x isa IR.INDEX, last.subscripts)
-      return foldTree(selectElement(wholeDerivative(IR.withoutSubscripts(e.cref), last.ty, seeds), last.subscripts, e.ty))
+      local sizes::Vector{Int} = knownSizes(last.ty, "the array $(unsubscriptedName(e.cref))")
+      local fixed::Vector{Int} = Int[something(IR.literalIndex(x), 0) for x in last.subscripts]
+      local free::Vector{IR.Subscript} = IR.Subscript[x for (x, k) in zip(last.subscripts, fixed) if k == 0]
+      local reached::IR.Expression =
+        reachedElementsDerivative(IR.withoutSubscripts(e.cref), sizes, fixed, Int[], IR.elementType(last.ty), seeds)
+      return foldTree(selectElement(reached, free, e.ty))
     end
     return ZERO
   end
@@ -246,6 +253,27 @@ function elementsDerivative(cref::IR.ComponentRef, sizes::Vector{Int}, index::Ve
   local rest = sizes[length(index) + 1:end]
   local ty = IR.T_ARRAY(element, IR.Dimension[IR.DIM_SIZE(n) for n in rest])
   return IR.ARRAY(IR.Expression[elementsDerivative(cref, sizes, vcat(index, k), element, seeds) for k in 1:rest[1]], ty)
+end
+
+"""
+    reachedElementsDerivative(cref, sizes, fixed, index, element, seeds) -> Expression
+
+The derivatives of the elements of the array `cref` (of `sizes`) that subscripts reach, under the subscripts `index`
+so far: a dimension of a literal subscript (`fixed`, its index; 0 for another) at that index only, another whole; an
+array literal over the whole ones, nested by dimension. `x[3, \$i1]` reads the derivatives of `x[3, 1:n]`, not of
+the elements no differentiated equation reads, which Pantelides' algorithm gives none (MSL Engine1a: a connection's
+rows 2 and 3 of `frame_a.R.T`, not its `R.T[1, 1]`).
+"""
+function reachedElementsDerivative(cref::IR.ComponentRef, sizes::Vector{Int}, fixed::Vector{Int}, index::Vector{Int},
+                                   element::IR.ModelicaType, seeds::Seeds)::IR.Expression
+  local k::Int = length(index) + 1
+  k > length(sizes) &&
+    return wholeDerivative(IR.appendSubscripts(cref, IR.Subscript[IR.INDEX(IR.INTEGER(i)) for i in index]), element, seeds)
+  fixed[k] == 0 || return reachedElementsDerivative(cref, sizes, fixed, Int[index; fixed[k]], element, seeds)
+  local rest::Vector{Int} = Int[sizes[j] for j in k:length(sizes) if fixed[j] == 0]
+  local ty::IR.T_ARRAY = IR.T_ARRAY(element, IR.Dimension[IR.DIM_SIZE(n) for n in rest])
+  return IR.ARRAY(IR.Expression[reachedElementsDerivative(cref, sizes, fixed, Int[index; i], element, seeds)
+                                for i in 1:sizes[k]], ty)
 end
 
 function derivativeOf(e::IR.BINARY, seeds::Seeds)::IR.Expression

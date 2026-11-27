@@ -39,6 +39,21 @@
    them (`_eventFunctionNames`). =#
 
 """
+    _eventBuffers(u, p) -> (du, a)
+
+The buffers into which the event code evaluates the equations at the state `u` (the state derivatives, the algebraic
+variables): the parameters' own on Float64 states (`edu`, `ebuf`), so that an event, a condition or a step's check
+allocates none (MSL EngineV6: five buffers of 15086 values per event, 56 µs each); fresh ones of u's number type
+otherwise. One pair for all: each function of the event code is done with the values it computed into them before it
+calls another that fills them (affectCrossing! before `_coincidentCrossings` evaluates the conditions).
+"""
+_eventBuffers(u::Vector{Float64}, p::ArrayModelParameters)::Tuple{Vector{Float64}, Vector{Float64}} = (p.edu, p.ebuf)
+
+function _eventBuffers(u::AbstractVector{T}, p::ArrayModelParameters)::Tuple{Vector{T}, Vector{T}} where {T}
+  return (Vector{T}(undef, length(u)), Vector{T}(undef, length(p.abuf)))
+end
+
+"""
     _settle!(du, a, u, p, t, fire, searched = false) -> Bool
 
 One sweep at (u, t): passes with the same pre() until nothing changes (a fired body runs in each: with pre() fixed it
@@ -79,7 +94,7 @@ condition there, the conditions' values become pre() of the conditions; with fir
 whens initial() turns true run. reinit() has no effect.
 """
 function startSolution!(u::AbstractVector, p::ArrayModelParameters, t::Real, fire::Bool)::Bool
-  local du::AbstractVector = similar(u); local a::AbstractVector = similar(u, length(p.abuf))
+  local (du::AbstractVector, a::AbstractVector) = _eventBuffers(u, p)
   _settle!(du, a, u, p, t, fire) || return false
   p.ureinit .= u
   p.wcond .= p.wnew
@@ -99,7 +114,7 @@ reinit() takes effect after the sweep (at the initialization, as OpenModelica, i
 function eventIteration!(u::AbstractVector, p::ArrayModelParameters, t::Real, fire::Bool, sampleInstant::Bool = false;
                          left::Bool = true)::Bool
   local c::ArrayModelCode = p.code
-  local du::AbstractVector = similar(u); local a::AbstractVector = similar(u, length(p.abuf))
+  local (du::AbstractVector, a::AbstractVector) = _eventBuffers(u, p)
   #= the algebraic variables' left limit: the equations with the relations and discrete values of before the event
      (`left`; a crossing computed it already, before its relations changed: `affectCrossing!`) =#
   if c.usesLeft && left
@@ -141,15 +156,29 @@ the next mode), a terminate() reached (its message, p.state.terminated) the run.
 """
 function _terminateReached!(integrator::DiffEqBase.DEIntegrator)::Bool
   if first(integrator.p.state.structural) != 0
-    DiffEqBase.terminate!(integrator, DiffEqBase.SciMLBase.ReturnCode.Success)
+    _endRun!(integrator, DiffEqBase.SciMLBase.ReturnCode.Success)
     return false
   end
   local message::Union{Nothing, String} = integrator.p.state.terminated
   message === nothing && return true
   integrator.p.state.terminated = nothing
   @info "Modelica terminate() reached" message time = integrator.t
-  DiffEqBase.terminate!(integrator)
+  _endRun!(integrator, DiffEqBase.SciMLBase.ReturnCode.Terminated)
   return false
+end
+
+"""
+    _endRun!(integrator, retcode) -> Nothing
+
+`terminate!` of `integrator` with `retcode`. In its initialization (an event at the start instant in a callback's
+`initialize`: a sample's tick at the start, `_sampleStart!`) the start is kept as a stop: OrdinaryDiffEqCore's first
+step size, after the callbacks' initialization, reads the first stop (4.19.1: a BoundsError where terminate! left
+none). The solve ends there, no step taken.
+"""
+function _endRun!(integrator::DiffEqBase.DEIntegrator, retcode::DiffEqBase.SciMLBase.ReturnCode.T)::Nothing
+  DiffEqBase.terminate!(integrator, retcode)
+  integrator.iter == 0 && DiffEqBase.add_tstop!(integrator, integrator.t)
+  return nothing
 end
 
 """
@@ -176,7 +205,7 @@ function _eventAt!(integrator::DiffEqBase.DEIntegrator, sampleInstant::Bool = fa
   end
   @error string("[events] the event iteration did not settle at t = ", integrator.t,
                 " (relations switching back and forth: a chattering model); the simulation stops")
-  DiffEqBase.terminate!(integrator, DiffEqBase.SciMLBase.ReturnCode.Failure)
+  _endRun!(integrator, DiffEqBase.SciMLBase.ReturnCode.Failure)
   return false
 end
 
@@ -205,9 +234,8 @@ function conditions!(out::AbstractVector, u::AbstractVector, t::Real,
                      integrator::DiffEqBase.DEIntegrator)::Nothing
   local p::ArrayModelParameters = integrator.p
   local c::ArrayModelCode = p.code
-  local du::AbstractVector = similar(u)
+  local (du::AbstractVector, a::AbstractVector) = _eventBuffers(u, p)
   c.crossingsOnly && (c.crossings!(du, p.abuf, u, p, t, CrossingOut(out), false); return nothing)
-  local a::AbstractVector = similar(u, length(p.abuf))
   c.equations!(du, a, u, p, t, CrossingOut(out), false)
   c.whens!(du, a, u, p, t, CrossingOut(out), false, false)
   return nothing
@@ -232,7 +260,8 @@ function logStepRoots!(integrator::DiffEqBase.DEIntegrator)::Nothing
   local t::Float64 = integrator.t
   if p.state.leftLimit[1] == t
     local u::AbstractVector = integrator.u
-    p.code.equations!(similar(u), similar(u, length(p.abuf)), u, p, t, NO_CROSSINGS, false)
+    local (du::AbstractVector, a::AbstractVector) = _eventBuffers(u, p)
+    p.code.equations!(du, a, u, p, t, NO_CROSSINGS, false)
   end
   _logRoots!(p, t)
   return nothing
@@ -268,12 +297,50 @@ function _atSampleInstant(p::ArrayModelParameters, t::Real, tspan::Tuple{Real, R
 end
 
 """
+    _coincidentCrossings(integrator, events, tl, ul) -> Vector{Int8}
+
+The event's crossings (`events`, as the root finder reports them) with those of the relations that cross within the
+event's instant after t (`_instantLength`: 1e-10 * (1 + |t|), the MTK path's coincident time events): their crossing
+functions, continued in a straight line from the left limit (tl, ul) through t, change sign by t + that length. The root
+finder reports only the crossings at its earliest root; coincident ones, found 7e-13 s apart at reltol 1e-6, were an
+event each, with a restart each (MSL EngineV6's cylinders 1 and 6 at dead center: 651 events). Relations of time keep
+their exact times.
+"""
+function _coincidentCrossings(integrator::DiffEqBase.DEIntegrator, events::AbstractVector{Int8}, tl::Float64,
+                              ul::AbstractVector)::Vector{Int8}
+  local fired::Vector{Int8} = Vector{Int8}(events)
+  local c::ArrayModelCode = integrator.p.code
+  local t::Float64 = integrator.t
+  local n::Int = length(events)
+  local open::Bool = false
+  for k::Int in 1:n
+    open |= events[k] == 0 && c.relationSlot[k] && !c.timeSlot[k]
+  end
+  (open && tl < t) || return fired
+  local zl::Vector{Float64} = zeros(n); local z0::Vector{Float64} = zeros(n)
+  conditions!(zl, ul, tl, integrator)
+  conditions!(z0, integrator.u, t, integrator)
+  local r::Float64 = _instantLength(t) / (t - tl)
+  for k::Int in 1:n
+    (events[k] == 0 && c.relationSlot[k] && !c.timeSlot[k]) || continue
+    local z1::Float64 = z0[k] + r * (z0[k] - zl[k])
+    if z0[k] < 0 && z1 >= 0
+      fired[k] = Int8(1)
+    elseif z0[k] > 0 && z1 <= 0
+      fired[k] = Int8(-1)
+    end
+  end
+  return fired
+end
+
+"""
     affectCrossing!(integrator, events)
 
 A crossing: relations and when-conditions first take their values at the left limit (the state just before the event),
 so a when fires exactly when its condition rises across the event; a relation whose crossing the root finder found
-(`events`: +1 its crossing function rose past zero, -1 it fell) changes where that is its change (a true one's rises, a
-false one's falls) and its value at the left limit did not change already; then the event iteration at the event.
+(`events`: +1 its crossing function rose past zero, -1 it fell), or that crosses within the event's instant after it
+(`_coincidentCrossings`), changes where that is its change (a true one's rises, a false one's falls) and its value at
+the left limit did not change already; then the event iteration at the event.
 Re-evaluated there, a hair off its bound, the relation kept its value where an algebraic loop solved inside the
 equations gave its last digits from another guess, and the same crossing was found again in every step (MSL EngineV6's
 piston speed at dead center). A time event (a relation of time and parameters crossed): the event iteration with the
@@ -296,7 +363,7 @@ function affectCrossing!(integrator::DiffEqBase.DEIntegrator, events::AbstractVe
   c.nDelays == 0 || _delayLeft!(integrator)
   local tl::Float64 = max(integrator.tprev, t - max(1e-10, 2 * p.hyst[1]) * (1 + abs(t)))
   local ul::AbstractVector = tl < t ? integrator(tl) : copy(integrator.uprev)
-  local du::AbstractVector = similar(ul); local a::AbstractVector = similar(ul, length(p.abuf))
+  local (du::AbstractVector, a::AbstractVector) = _eventBuffers(ul, p)
   local before::Vector{Bool} = copy(p.rel)
   c.equations!(du, a, ul, p, tl, NO_CROSSINGS, true)
   c.whens!(du, a, ul, p, tl, NO_CROSSINGS, true, false)
@@ -307,11 +374,12 @@ function affectCrossing!(integrator::DiffEqBase.DEIntegrator, events::AbstractVe
     c.equations!(du, a, integrator.u, p, t, NO_CROSSINGS, false)
     p.aleft .= a
   end
+  local fired::Vector{Int8} = _coincidentCrossings(integrator, events, tl, ul)
   local timed::Bool = false
-  for k::Int in eachindex(events)
-    (events[k] != 0 && c.relationSlot[k] && p.rel[k] == before[k] && p.rel[k] == (events[k] > 0)) &&
+  for k::Int in eachindex(fired)
+    (fired[k] != 0 && c.relationSlot[k] && p.rel[k] == before[k] && p.rel[k] == (fired[k] > 0)) &&
       (p.rel[k] = !p.rel[k])
-    timed |= events[k] != 0 && c.timeSlot[k]
+    timed |= fired[k] != 0 && c.timeSlot[k]
   end
   local hyst::Float64 = p.hyst[1]
   timed && (p.hyst[1] = 0.0)
@@ -476,11 +544,10 @@ function relationsChanged(u::AbstractVector, t::Real, integrator::DiffEqBase.DEI
   local rel0::Vector{Bool} = copy(p.rel); local w0::Vector{Bool} = copy(p.wcond)
   local e0::Vector{Float64} = copy(p.evv)
   local d0::Vector{Float64} = copy(p.d)
-  local du::AbstractVector = similar(u)
+  local (du::AbstractVector, a::AbstractVector) = _eventBuffers(u, p)
   if c.crossingsOnly
     c.crossings!(du, p.abuf, u, p, t, NO_CROSSINGS, true)
   else
-    local a::AbstractVector = similar(u, length(p.abuf))
     c.equations!(du, a, u, p, t, NO_CROSSINGS, true)
     c.whens!(du, a, u, p, t, NO_CROSSINGS, true, false)
   end
@@ -513,11 +580,10 @@ end
 """
     affectDelay!(integrator)
 
-A delayed jump is due (delays.jl): the event iteration with the delayed values as right limits, until the recorder
-after the events (`_delayJumps!`).
+A delayed jump is due (delays.jl): the event iteration with the delayed values as right limits (the jump's event ran:
+`delayJumpsDue!`, `_takesJump`), then the recorder after the events (`_delayJumps!`).
 """
 function affectDelay!(integrator::DiffEqBase.DEIntegrator)::Nothing
-  integrator.p.state.delays.rightLimit = true
   _eventAt!(integrator)
   _logDiscretes!(integrator.p, integrator.t)
   DiffEqBase.derivative_discontinuity!(integrator, true)

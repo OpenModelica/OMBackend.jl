@@ -527,6 +527,68 @@ end
     @test loop.head === :for && !occursin("s1", string(loop)) && occursin("s2", string(loop))
   end
 
+  @testset "Emission: repeating statements as loops (_rollRuns)" begin
+    local AG::Module = OMBackend.CodeGeneration.ArrayPreserveDE
+    local one(x::Expr)::Expr = Expr(:let, Expr(:block), x)
+    local valuesOf(stmts::Vector{Any})::Vector{Float64} =
+      Base.invokelatest(eval(:(a -> (@inbounds begin; $(stmts...); end; a))), collect(1.0:40.0))
+    #= a recurrence of period 2, the literals advancing by one: one loop, in the statements' order =#
+    local chain::Vector{Any} = Any[one(:(a[1] = 1.0))]
+    for k::Int in 1:12
+      push!(chain, one(:(a[$(20 + k)] = a[$k] + 1.0)), one(:(a[$(1 + k)] = 0.5 * a[$(20 + k)])))
+    end
+    push!(chain, one(:(a[40] = a[13])))
+    local rolled::Vector{Any} = AG._rollRuns(chain; tables = false)
+    @test length(rolled) == 3 && rolled[2].head === :for
+    @test valuesOf(rolled) == valuesOf(chain)
+    #= literals that are not affine: a table only where tables are allowed =#
+    local scattered::Vector{Any} = Any[one(:(a[$i] = 2.0 * a[$(i + 20)])) for i::Int in (3, 1, 4, 1, 5, 9, 2, 6)]
+    @test AG._rollRuns(scattered; tables = false) == scattered
+    local tabled::Vector{Any} = AG._rollRuns(scattered)
+    @test length(tabled) == 1 && tabled[1].head === :for
+    @test valuesOf(tabled) == valuesOf(scattered)
+  end
+
+  @testset "A rod chain's torn block: code of one size for every length" begin
+    #= the chain is rigid: it moves as one mass N on the spring, x = 1 + 0.5 cos(sqrt(100 / N) t). The torn block's
+       recurrence (three statements per mass) is one loop: BLOCK_1! has the same size at N = 8 and N = 24 =#
+    local chains = Modelica"""
+      connector Flange Real s; flow Real f; end Flange;
+      model Mass parameter Real m = 1; Real s, v; Flange a, b;
+      equation a.s = s; b.s = s; der(s) = v; m * der(v) = a.f + b.f; end Mass;
+      model Rod parameter Real L = 1; Flange a, b; equation b.s = a.s + L; a.f + b.f = 0; end Rod;
+      model Spring parameter Real c = 100; Flange a, b; Real f;
+      equation f = c * (b.s - a.s - 1); a.f = -f; b.f = f; end Spring;
+      model Fixed Flange a; equation a.s = 0; end Fixed;
+      model RodChain "N masses on rigid rods, the first on a spring stretched by 0.5"
+        parameter Integer N = 8;
+        Mass m[N](s(start = {i + 0.5 for i in 1:N}), v(each start = 0));
+        Rod r[N - 1]; Spring sp; Fixed fx;
+      equation
+        connect(fx.a, sp.a); connect(sp.b, m[1].a);
+        for i in 1:N - 1 loop connect(m[i].b, r[i].a); connect(r[i].b, m[i + 1].a); end for;
+      end RodChain;
+      model RodChain24 extends RodChain(N = 24); end RodChain24;
+      """
+    local AG::Module = OMBackend.CodeGeneration.ArrayPreserveDE
+    local blockSize(x::Any)::Int =
+      !(x isa Expr) ? 0 :
+      x.head === :function && x.args[1] isa Expr && x.args[1].args[1] === Symbol("BLOCK_1!") ? AG._nodeCount(x) :
+      maximum(blockSize, x.args; init = 0)
+    local sizes::Vector{Int} = Int[]
+    for spec::Tuple{String, Int} in (("RodChain", 8), ("RodChain24", 24))
+      local (model::String, n::Int) = spec
+      local name::String = _translateProgram(chains, model; scalarized = false)
+      @test _arrayPathTaken(name)
+      push!(sizes, blockSize(OMBackend.COMPILED_MODELS_ARRAY_PRESERVE_DE[name][1]))
+      local sol = OMBackend.simulate(name; tspan = (0.0, 1.0), reltol = 1e-8, abstol = 1e-10)
+      @test sol.retcode == ReturnCode.Success
+      local x::Float64 = 1 + 0.5 * cos(sqrt(100 / n))
+      @test _values(sol, ["m[1].s", "m[$n].s", "sp.f"]) ≈ [x, x + n - 1, 100 * (x - 1)] rtol = 1e-5
+    end
+    @test sizes[1] > 0 && sizes[1] == sizes[2]
+  end
+
   @testset "Time-invariant rows: in invariants! only, per solve; the callbacks' types erased" begin
     #= n and c read parameters only (SimCode Domains: invariant rows): invariants! computes them once per solve,
        equations! (the relation's event, the observed values) calls it and holds no copy. MSL EngineV6: such rows were
@@ -1596,6 +1658,21 @@ end DivideInLoop;
         k = integer(delay(u, 0.2));
         y = table[k];
       end DelayedTable;
+
+      model DelayedJumpThenEvent "x 5 from td/2 to td: y = delay(x, td) 5 from 1.5 td, z = delay(y, td) from 2.5 td"
+        parameter Real td = 5e-9;
+        Integer count(start = 0, fixed = true);
+        Real x;
+        Real y;
+        Real z;
+      equation
+        when time >= 1.5 * td + 1e-23 then
+          count = pre(count) + 1;
+        end when;
+        x = if time >= td / 2 and time < td then 5 else 0;
+        y = delay(x, td);
+        z = delay(y, td);
+      end DelayedJumpThenEvent;
       """
     #= between the steps the history is linear: the solver's steps at this tolerance leave 1.2e-4 =#
     local (sd, ad, _) = _bothWaysOf(delays, "DelayedDecay", ["x", "y"]; reltol = 1e-8, abstol = 1e-10)
@@ -1624,6 +1701,31 @@ end DivideInLoop;
       local (st, at, _) = _bothWaysOf(delays, "DelayedTable", ["k", "y"]; tspan = (0.0, stop))
       @test at == expected
       stop < 0.5 && @test st == expected
+    end
+    #= a read on a recorded jump takes it by the time against the jump's event time (`_takesJump`), not by s = t -
+       delayTime: before it the left limit, after it the right one, at it once the event ran (no longer pending), a
+       saved point's values afterwards as asked. An event within round-off before the due time takes the jump. =#
+    local CG::Module = OMBackend.CodeGeneration
+    local history()::OMBackend.CodeGeneration.DelayHistory =
+      CG.DelayHistory([0.0, 1.0, 1.0, 2.0], [0.0, 0.0, 5.0, 5.0], [1.0], [3.0], [1])
+    local h::OMBackend.CodeGeneration.DelayHistory = history()
+    local at(t::Float64, limit::OMBackend.CodeGeneration.DelayLimit)::Float64 = CG._delayedValue(h, t - 2.0, limit, t, 5.0)
+    @test [at(3.0, CG.DELAY_BY_EVENT), at(3.0 + 4eps(3.0), CG.DELAY_BY_EVENT), at(3.0 - 4eps(3.0), CG.DELAY_BY_EVENT)] ==
+          [0.0, 5.0, 0.0]
+    @test CG.delayJumpsDue!(CG.DelayState([h], CG.DELAY_BY_EVENT, [0.0], [2.0]), 3.0) && isempty(h.pending)
+    @test [at(3.0, CG.DELAY_BY_EVENT), at(3.0, CG.DELAY_LEFT), at(3.0, CG.DELAY_RIGHT)] == [5.0, 0.0, 5.0]
+    local takenBefore::OMBackend.CodeGeneration.DelayHistory = history()
+    @test CG.delayJumpsDue!(CG.DelayState([takenBefore], CG.DELAY_BY_EVENT, [0.0], [2.0]), 3.0 - 1e-13) &&
+          takenBefore.due == [3.0 - 1e-13]
+    #= the model: an event 1e-23 s after y's delayed jump at 1.5 td (MSL CompareLosslessLines: the pulse's own, at
+       7.5 ns) reads y after it. Before, s could not tell the two apart (a 1 ps tolerance): the event recorded y = 0 in
+       z's history, and z was 0.11 at 2.5 td + 5 ps =#
+    local jumpThenEvent::String = _translateProgram(delays, "DelayedJumpThenEvent"; scalarized = false)
+    @test _arrayPathTaken(jumpThenEvent)
+    for (stop, expected) in ((1.2505e-8, [0.0, 5.0, 1.0]), (1.6e-8, [0.0, 0.0, 1.0]))
+      local sol = OMBackend.simulate(jumpThenEvent; tspan = (0.0, stop))
+      @test sol.retcode == ReturnCode.Success
+      @test _values(sol, ["y", "z", "count"]) == expected
     end
   end
 
@@ -2267,6 +2369,51 @@ end DivideInLoop;
     local (sf, af, _) = _bothWaysOf(fields, "FieldStarts", ["s.X[1]", "s.X[2]"])
     @test af ≈ [0.25 * sqrt(2), -0.75 * sqrt(2)] rtol = 1e-6
     @test sf ≈ af rtol = 1e-6
+  end
+
+  @testset "a row of a record's array field differentiated, the other rows not: the derivatives of that row only" begin
+    #= a frame Q set row by row by for-equations, as connect() writes a frame's R (MSL Engine1a, Engine1b, FullRobot,
+       EngineV6_analytic): the slide's position reads row 2 of Q, which index reduction differentiates twice; row 1 no
+       differentiated equation reads. The derivative of `Q.T[2, i]` in array form was the whole Q.T's at [2, i], also
+       Q.T[1, 1]'s, which Pantelides' algorithm gives none: the array path refused the model. omc 1.27.1, tolerance
+       1e-11: s(1) = -1.830888753, v(1) = -4.865138546 =#
+    local rows = Modelica"""
+      record Frame
+        Real T[3, 3];
+      end Frame;
+
+      model SlidingMassRows "a mass on a slide turned by phi about z, tilted by a about x"
+        parameter Real g = 9.81;
+        parameter Real a = 0.3;
+        Real phi;
+        Frame R;
+        Frame Q;
+        Real s(start = 1, fixed = true);
+        Real v(start = 0, fixed = true);
+        Real r[3], vr[3], f[3];
+      equation
+        phi = time + 0.5;
+        R.T = {{cos(phi), sin(phi) * cos(a), sin(phi) * sin(a)}, {-sin(phi), cos(phi) * cos(a), cos(phi) * sin(a)},
+               {0, -sin(a), cos(a)}};
+        for i in 1:3 loop
+          Q.T[1, i] = 2 * R.T[1, i];
+        end for;
+        for i in 1:3 loop
+          Q.T[2, i] = 2 * R.T[2, i];
+        end for;
+        for i in 1:3 loop
+          Q.T[3, i] = 2 * R.T[3, i];
+        end for;
+        r = {Q.T[2, 1], Q.T[2, 2], Q.T[2, 3]} * s / 2;
+        v = der(s);
+        der(r) = vr;
+        der(vr) = f + {0, -g, 0};
+        R.T[2, 1] * f[1] + R.T[2, 2] * f[2] + R.T[2, 3] * f[3] = 0;
+      end SlidingMassRows;
+      """
+    local (sr, ar, _) = _bothWaysOf(rows, "SlidingMassRows", ["s", "v"])
+    @test ar ≈ [-1.830888753, -4.865138546] rtol = 2e-6
+    @test sr ≈ ar rtol = 1e-6
   end
 
   @testset "pre() of an array as an argument, an array output into a row, an element of a negated array" begin

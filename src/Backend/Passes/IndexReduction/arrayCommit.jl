@@ -881,37 +881,151 @@ function arrayKinds(kinds::Dict{Symbol, IR.VariableKind}, E::Elements, variables
 end
 
 """
-    differentiatedArrayEquations(partition, view, p, E, variables, derivatives, functions) -> Vector{IR.Equation}
+    ForChains(plan, rows, origins, chains)
+
+The derivatives in array form of a for-equation's body equations (`forDerivatives`: `chains`) made for the plan `plan`
+and checked against the for-equation's rows of the element view (`rows`, their equations; `origins`, their paths and
+iterations). A later commit of the same plan reuses them where the for-equation, the same object, has the same rows
+(`ForChainCache`).
+"""
+struct ForChains
+  plan::Plan
+  rows::Vector{IR.Equation}
+  origins::Vector{Tuple{Vector{Int}, Vector{Int}}}
+  chains::Dict{Vector{Int}, Vector{IR.Equation}}
+end
+
+"""
+The for-equations' derivatives (`ForChains`) of the commits of one plan, by for-equation: `reduceIndexArrays!` commits
+one plan on element views that differ only where arrays were split, which makes the equations that read them other
+objects (MSL EngineV6: 209 for-equations differentiated, 0.17 s a round; 0.2 s saved).
+"""
+const ForChainCache = IdDict{IR.FOR_EQUATION, ForChains}
+
+"""
+    sameRows(c, p, rows, view) -> Bool
+
+Whether the derivatives `c` were made for the plan `p` and the rows `rows` of the element view `view`: the same row
+equations (the objects), paths and iterations.
+"""
+function sameRows(c::ForChains, p::Plan, rows::Vector{Int}, view::Scalarized)::Bool
+  (c.plan === p && length(c.rows) == length(rows)) || return false
+  local equations::Vector{IR.Equation} = view.model.continuous[1].equations
+  for (k::Int, r::Int) in enumerate(rows)
+    local o::EquationOrigin = view.origins[r]
+    (c.rows[k] === equations[r] && c.origins[k][1] == o.path && c.origins[k][2] == o.iteration) || return false
+  end
+  return true
+end
+
+"""
+    cachedForDerivatives!(cache, eq, rows, view, p, seeds, planSeeds, E, variables, functions, known)
+        -> Dict{Vector{Int}, Vector{IR.Equation}}
+
+`forDerivatives` of the for-equation `eq`, from `cache` where it holds them for the plan `p` and the rows `rows`
+(`sameRows`), else made and kept there.
+"""
+function cachedForDerivatives!(cache::ForChainCache, eq::IR.FOR_EQUATION, rows::Vector{Int}, view::Scalarized, p::Plan,
+                               seeds::Seeds, planSeeds::Seeds, E::Elements, variables::IR.VariableSet,
+                               functions::Dict{Symbol, IR.ModelicaFunction},
+                               known::StartValues)::Dict{Vector{Int}, Vector{IR.Equation}}
+  (haskey(cache, eq) && sameRows(cache[eq], p, rows, view)) && return cache[eq].chains
+  local chains::Dict{Vector{Int}, Vector{IR.Equation}} =
+    forDerivatives(eq, rows, view, p, seeds, planSeeds, E, variables, functions, known)
+  local equations::Vector{IR.Equation} = view.model.continuous[1].equations
+  cache[eq] = ForChains(p, IR.Equation[equations[r] for r in rows],
+                        Tuple{Vector{Int}, Vector{Int}}[(view.origins[r].path, view.origins[r].iteration) for r in rows], chains)
+  return chains
+end
+
+"""
+    PendingSplits()
+
+The splits one commit found in the for-equations (`differentiatedArrayEquations`): the arrays and for-equations (by
+index) to split, the first one's reason, and the variables the splits change (the arrays' families, `familyBase`;
+`containers`, the records around them, `arrayContainers`). A for-equation that reads one of them is left to the commit
+after the splits, which unroll or slice it (what fails in it then may not); the splits of another the commit after
+them finds the same, the plan, the for-equation and its arrays as they were.
+"""
+mutable struct PendingSplits
+  reason::String
+  arrays::Vector{Symbol}
+  equations::Vector{Int}
+  touched::Set{Symbol}
+  containers::Set{Symbol}
+end
+
+PendingSplits() = PendingSplits("", Symbol[], Int[], Set{Symbol}(), Set{Symbol}())
+
+"The split `err` (`needsSplit`) added to `pending`, and the variables the splits change with it (of `variables`)."
+function addSplit!(pending::PendingSplits, err::NotHandled, variables::IR.VariableSet)::Nothing
+  hasSplits(pending) || (pending.reason = err.reason)
+  append!(pending.arrays, err.arrays)
+  append!(pending.equations, err.equations)
+  local bases::Set{Symbol} = Set{Symbol}(familyBase(a, variables) for a in err.arrays)
+  isempty(bases) && return nothing
+  for v::IR.Variable in variables
+    familyBase(v.name, variables) in bases && push!(pending.touched, v.name)
+  end
+  pending.containers = arrayContainers(pending.touched)
+  return nothing
+end
+
+"Whether `pending` holds a split."
+hasSplits(pending::PendingSplits)::Bool = !(isempty(pending.arrays) && isempty(pending.equations))
+
+"Whether the splits `pending` change the `i`-th equation `eq` of the partition (`PendingSplits`)."
+touchedBySplits(pending::PendingSplits, eq::IR.Equation, i::Int)::Bool =
+  i in pending.equations || readsArrays(eq, pending.touched, pending.containers)
+
+"""
+    differentiatedArrayEquations(partition, view, p, E, variables, derivatives, functions; chains) -> Vector{IR.Equation}
 
 The equations the plan differentiates, their derivatives in array form, by equation of the partition: a
-for-equation's for-equations of its body's derivatives (`forDerivatives`), another's the plan's derivatives of its
-elements (an array equation the passes split, element by element; `arrayEquation`).
+for-equation's for-equations of its body's derivatives (`forDerivatives`, from `chains` where made before), another's
+the plan's derivatives of its elements (an array equation the passes split, element by element; `arrayEquation`).
+NotHandled for the splits the for-equations need (slicing): all of them that the commit after the first ones finds
+(`PendingSplits`; MSL EngineV6: 3 split rounds instead of 8, 0.3 s).
 """
 function differentiatedArrayEquations(partition::IR.Partition, view::Scalarized, p::Plan, E::Elements, variables::IR.VariableSet,
-                                      derivatives::Dict{Symbol, Symbol}, functions::Vector{IR.ModelicaFunction})::Vector{IR.Equation}
-  local rowsOf = Dict{Int, Vector{Int}}()
-  for (r, origin) in enumerate(view.origins)
+                                      derivatives::Dict{Symbol, Symbol}, functions::Vector{IR.ModelicaFunction};
+                                      chains::ForChainCache = ForChainCache())::Vector{IR.Equation}
+  local rowsOf::Dict{Int, Vector{Int}} = Dict{Int, Vector{Int}}()
+  for (r::Int, origin::EquationOrigin) in enumerate(view.origins)
     push!(get!(() -> Int[], rowsOf, origin.equation), r)
   end
-  local functionsByName = Dict{Symbol, IR.ModelicaFunction}(f.name => f for f in functions)
-  local seeds = arraySeeds(p.structure, derivatives, E, variables, functions, p.constants)
-  local planSeeds = derivativeSeeds(p.structure, functions; constants = p.constants)
+  local functionsByName::Dict{Symbol, IR.ModelicaFunction} = Dict{Symbol, IR.ModelicaFunction}(f.name => f for f in functions)
+  local seeds::Seeds = arraySeeds(p.structure, derivatives, E, variables, functions, p.constants)
+  local planSeeds::Seeds = derivativeSeeds(p.structure, functions; constants = p.constants)
   local known::StartValues = StartValues(view.model.variables, view.model.functions; parametersOnly = true)
-  local out = IR.Equation[]
-  for i in sort!(unique(Int[view.origins[r].equation for r in keys(p.differentiated)]))
-    local eq = partition.equations[i]
+  local out::Vector{IR.Equation} = IR.Equation[]
+  local pending::PendingSplits = PendingSplits()
+  for i::Int in sort!(unique(Int[view.origins[r].equation for r in keys(p.differentiated)]))
+    local eq::IR.Equation = partition.equations[i]
     if eq isa IR.FOR_EQUATION
-      local chains = forDerivatives(eq, rowsOf[i], view, p, seeds, planSeeds, E, variables, functionsByName, known)
-      for level in 1:maximum(length, values(chains); init = 0)
-        local d = differentiatedForEquation(eq, chains, level)
+      (hasSplits(pending) && touchedBySplits(pending, eq, i)) && continue
+      local body::Dict{Vector{Int}, Vector{IR.Equation}}
+      try
+        body = cachedForDerivatives!(chains, eq, rowsOf[i], view, p, seeds, planSeeds, E, variables, functionsByName, known)
+      catch err
+        err isa NotHandled || rethrow()
+        # another than a split: the splits found first, after which the commit finds it where they leave it
+        needsSplit(err) || (hasSplits(pending) ? break : rethrow())
+        addSplit!(pending, err, variables)
+        continue
+      end
+      hasSplits(pending) && continue
+      for level::Int in 1:maximum(length, values(body); init = 0)
+        local d::Union{Nothing, IR.FOR_EQUATION} = differentiatedForEquation(eq, body, level)
         d === nothing || push!(out, d)
       end
-    else
-      for r in rowsOf[i], derivative in get(p.differentiated, r, IR.Equation[])
+    elseif !hasSplits(pending)
+      for r::Int in rowsOf[i], derivative::IR.Equation in get(p.differentiated, r, IR.Equation[])
         push!(out, arrayEquation(derivative, E, variables))
       end
     end
   end
+  hasSplits(pending) && throw(NotHandled(pending.reason, unique(pending.arrays), unique(pending.equations)))
   return out
 end
 
@@ -949,15 +1063,16 @@ function stateSets(p::Plan, E::Elements, variables::IR.VariableSet,
 end
 
 """
-    arrayCommit(model, partition, view, p) -> ArrayCommit
+    arrayCommit(model, partition, view, p; chains = ForChainCache()) -> ArrayCommit
 
 The plan `p`, made on the element view `view` of the arrays-kept `model`, in array form (`ArrayCommit`), the model
 not changed: the new derivative variables (`newArrays`), the kinds (`plannedKinds`, an array's from its elements',
-`arrayKinds`), the differentiated equations (`differentiatedArrayEquations`), the selected states' derivatives
-(`stateLinks`), the dynamic state sets (`stateSets`). NotHandled where the plan treats an array's elements
-differently.
+`arrayKinds`), the differentiated equations (`differentiatedArrayEquations`; the for-equations' from `chains` where an
+earlier commit of `p` made them), the selected states' derivatives (`stateLinks`), the dynamic state sets
+(`stateSets`). NotHandled where the plan treats an array's elements differently.
 """
-function arrayCommit(model::IR.Model, partition::IR.Partition, view::Scalarized, p::Plan)::ArrayCommit
+function arrayCommit(model::IR.Model, partition::IR.Partition, view::Scalarized, p::Plan;
+                     chains::ForChainCache = ForChainCache())::ArrayCommit
   local s = p.structure
   local added = newArrays(Symbol[n for n in s.variables if !haskey(view.model.variables, n)], s, view.elements, model)
   #= all variables, the model's and the new ones (not yet in the model), and their arrays' elements =#
@@ -974,7 +1089,7 @@ function arrayCommit(model::IR.Model, partition::IR.Partition, view::Scalarized,
   local (links, linkEquations) = stateLinks(s, p.dummies, E, derivatives, variables)
   E = extendedElements(E, links, variables)
   local kinds = arrayKinds(plannedKinds(s, p.dummies), E, variables)
-  local equations = differentiatedArrayEquations(expandedPartition, view, p, E, variables, derivatives, model.functions)
+  local equations = differentiatedArrayEquations(expandedPartition, view, p, E, variables, derivatives, model.functions; chains)
   append!(equations, linkEquations)
   local (setVariables, setEquations, sets) = stateSets(p, E, variables, view.model.variables)
   append!(equations, setEquations)
@@ -1096,16 +1211,16 @@ end
 """
     reduceIndexArrays!(model) -> Bool
 
-Index reduction of an arrays-kept model in array form: planned on its element view (`scalarizeArrays`, `knownPlan`),
-committed in array form (`arrayCommit`, `commitArrays!`); true where reduced. A model of index 1 is committed with
-the plan that differentiates nothing (its states, their derivative variables and links in array form, as the array
-code reads them): false. With `arrays` (the default) false, the model not changed, where it has no continuous
-arrays; without, a model of scalars is reduced the same way (a scalar is the array form's variable of no
-dimensions: MSL Rotational ElasticBearing, of index 3 and no array, for the array code). An array whose elements the
-plan treats differently (slicing) is split into its elements first (`splitArrays!`), and the plan committed again.
-NotHandled where the array form does not take the plan (a split down to no array equations, der() of an expression
-whose derivative it does not write: the caller takes the scalarized path and discards the model, which a split may
-have changed).
+Index reduction of an arrays-kept model in array form: planned on its element view with the simulation code's values
+(`scalarizeArrays`, `knownPlan`), committed in array form (`arrayCommit`, `commitArrays!`); true where reduced. A
+model of index 1 is committed with the plan that differentiates nothing (its states, their derivative variables and
+links in array form, as the array code reads them): false. With `arrays` (the default) false, the model not changed,
+where it has no continuous arrays; without, a model of scalars is reduced the same way (a scalar is the array form's
+variable of no dimensions: MSL Rotational ElasticBearing, of index 3 and no array, for the array code). An array whose
+elements the plan treats differently (slicing) is split into its elements first (`splitArrays!`), and the plan
+committed again. NotHandled where the array form does not take the plan (a split down to no array equations, der() of
+an expression whose derivative it does not write: the caller takes the scalarized path and discards the model, which
+a split may have changed).
 """
 function reduceIndexArrays!(model::IR.Model; arrays::Bool = true)::Bool
   (arrays && !hasContinuousArrays(model)) && return false
@@ -1119,31 +1234,42 @@ function reduceIndexArrays!(model::IR.Model; arrays::Bool = true)::Bool
   local partition::IR.Partition = view.model.continuous[1]
   #= the arrays of aliases read through representatives (`arrayAliasPlan`) where the plan differentiates anything
      (`differentiates`): MSL EngineV6 differentiates 4974 element rows instead of 7132, translated and first simulated
-     5 s faster. The plan as written only where that does not apply (EngineV6: a plan fewer, 0.4 s). =#
+     5 s faster. The plan of the model as written only where that does not apply (EngineV6: a plan fewer, 0.4 s). Both
+     made with the simulation code's values (`knownPlan`). =#
   local aliased::Union{Nothing, Plan} = nothing
   if envSwitch("OMBACKEND_ALIAS_SUBSTITUTION") && differentiates(view.model, partition; initialDerivatives = true)
     (view, aliased) = arrayAliasPlan(model, view, cache)
-    partition = view.model.continuous[1]
   end
-  local written::Plan = aliased !== nothing ? aliased : plan(view.model, partition; indexOne = true, initialDerivatives = true)
-  #= the array form of the plan as written first: a plan it does not take is refused before the simulation code's
-     values are computed for the plan again (`knownPlan`). Arrays whose elements it treats differently (slicing) are
-     split into their elements, until it takes it. The element view stays (the splits keep the model's meaning), so
-     its plan is kept while splitting and made again on the final view, which the array form must take too (its
-     variables' order may decide differently): MSL EngineV6, 5 rounds, planned each round, 3.6 s of 7.6. The plan made
-     again is the one committed (`knownPlan`, the simulation code's values), with its commit (EngineV6: a plan and a
-     commit fewer, 0.9 s). =#
+  local written::Plan
+  if aliased === nothing
+    (view, written) = knownPlan(model, view)
+  else
+    written = aliased
+  end
+  #= the array form of the plan: arrays whose elements it treats differently (slicing) are split into their elements,
+     until it takes it. The splits keep the model's meaning and the element view's rows (each row's equation), so the
+     plan stays, committed by the variables' names: their order can change (an inner split orders a rolled array's
+     elements by slice), the plan made again after the splits could break a tie differently (MSL EngineV6: it was the
+     same plan, 0.8 s for a plan and a commit). Made again only where the split elements give the simulation
+     code's zeros a term to take out (`dropFunctionZeroTerms!` takes an array of some zero elements as written, its
+     elements once split). The for-equations a split leaves as they were are differentiated once (`ForChainCache`). =#
   local splits::Int = 0
-  local stale::Bool = false
-  local final::Union{Nothing, Tuple{Scalarized, Plan, ArrayCommit}} = nothing
+  local afterSplit::Bool = false
+  local taken::Union{Nothing, ArrayCommit} = nothing
+  local chains::ForChainCache = ForChainCache()
   local arrayElements::Int = continuousArrayElements(model, view)
-  while true
+  while taken === nothing
     try
-      arrayCommit(model, model.continuous[1], view, written)
-      stale || break
-      (view, written) = knownPlan(model, view, nothing)
-      final = (view, written, arrayCommit(model, model.continuous[1], view, written))
-      break
+      local c::ArrayCommit = arrayCommit(model, model.continuous[1], view, written; chains)
+      if afterSplit && dropFunctionZeroTerms!(model, view, written.known)
+        view = scalarizeArrays(model)
+        written = plan(view.model, view.model.continuous[1]; known = written.known, indexOne = true,
+                       initialDerivatives = true)::Plan
+        empty!(chains)
+        afterSplit = false
+      else
+        taken = c
+      end
     catch err
       (err isa NotHandled && needsSplit(err) && splits < 256) || rethrow()
       splitArrays!(model, view, err.arrays, err.equations; cache)
@@ -1155,11 +1281,10 @@ function reduceIndexArrays!(model::IR.Model; arrays::Bool = true)::Bool
         throw(NotHandled("slicing that splits most of the arrays ($(arrayElements - kept) of $(arrayElements) elements, " *
                          "starting at $(err.reason))"))
       view = scalarizeArrays(model; cache)
-      stale = true
+      afterSplit = true
     end
   end
-  final === nothing && return commitArrayPlan!(model, view, written)
-  return commitPlan!(model, final...)
+  return commitPlan!(model, view, written, taken::ArrayCommit)
 end
 
 """
@@ -1185,32 +1310,18 @@ end
 indexReduced(model::IR.Model)::Bool = any(v::IR.Variable -> v.kind isa Union{IR.DUMMY_DER, IR.DUMMY_STATE}, model.variables)
 
 """
-    knownPlan(model, view, written) -> Tuple{Scalarized, Plan}
+    knownPlan(model, view) -> Tuple{Scalarized, Plan}
 
-The plan of the element view `view` of `model` made with the simulation code's values (`KNOWN_VALUES`), on the model
-as the plan with these values reads it: without the terms a function's zero output takes out (`model` changed, its
-view made again). Without such values `written`, or where that is `nothing` the plan made again.
+The plan of the element view `view` of `model` made with the simulation code's values (`KNOWN_VALUES`, of `view`), on
+the model as the plan with these values reads it: without the terms a function's zero output takes out
+(`dropFunctionZeroTerms!`; `model` changed, its view made again: another view than `view`). The plan without values
+where there are none (the simulation code not loaded).
 """
-function knownPlan(model::IR.Model, view::Scalarized, written::Union{Nothing, Plan})::Tuple{Scalarized, Plan}
+function knownPlan(model::IR.Model, view::Scalarized)::Tuple{Scalarized, Plan}
   local known::Dict{Symbol, IR.Expression} =
     KNOWN_VALUES[] === nothing ? Dict{Symbol, IR.Expression}() : KNOWN_VALUES[](view.model)
-  if isempty(known)
-    written === nothing || return (view, written)
-    return (view, plan(view.model, view.model.continuous[1]; indexOne = true, initialDerivatives = true)::Plan)
-  end
-  local v::Scalarized = dropFunctionZeroTerms!(model, view, known) ? scalarizeArrays(model) : view
+  local v::Scalarized = (!isempty(known) && dropFunctionZeroTerms!(model, view, known)) ? scalarizeArrays(model) : view
   return (v, plan(v.model, v.model.continuous[1]; known, indexOne = true, initialDerivatives = true)::Plan)
-end
-
-"""
-    commitArrayPlan!(model, view, written) -> Bool
-
-The plan `written`, made on the element view `view` of `model` and taken by its array form, made again with the
-simulation code's values (`knownPlan`) and committed (`commitPlan!`); whether it reduced the index.
-"""
-function commitArrayPlan!(model::IR.Model, view::Scalarized, written::Plan)::Bool
-  local (v::Scalarized, p::Plan) = knownPlan(model, view, written)
-  return commitPlan!(model, v, p, arrayCommit(model, model.continuous[1], v, p))
 end
 
 """

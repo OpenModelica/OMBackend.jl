@@ -616,6 +616,44 @@ end
          alias no higher than its set's StateSelect =#
       @test _irStates("AlgebraicNever") == ["x"]
       @test _irStates("ImplicitAlias") == ["q"]
+      #= dummies of two classes left once those of constant pivots are eliminated: the pendulum's (x or y) and z's
+         (StateSelect.avoid, its pivot 2 + x). The pendulum's row reads no z, so its pivot alone decides: the set
+         {y, x}. Without it y stays the state and the pendulum stops at x = 0 (0.835 s: Unstable scalarized, energy
+         lost with the arrays kept). MSL UniversalConstraint: a body's angles by the rotation constraint, its
+         positions by the translations'. x(1) of the pendulum in polar coordinates, phi'' = -g sin(phi). =#
+      local follower = Modelica"""
+      model PendulumFollower "a Cartesian pendulum and a mass z held on a curve that reads the pendulum's x and y"
+        parameter Real L = 1;
+        parameter Real m = 1;
+        parameter Real g = 9.81;
+        Real x(start = cos(0.5235987755982988), fixed = true);
+        Real y(start = -sin(0.5235987755982988));
+        Real vx(start = 0, fixed = true);
+        Real vy;
+        Real F;
+        Real z(stateSelect = StateSelect.avoid);
+        Real vz(stateSelect = StateSelect.avoid);
+        Real Fz;
+      equation
+        der(x) = vx;
+        der(y) = vy;
+        m * der(vx) = -x / L * F;
+        m * der(vy) = -y / L * F - m * g;
+        x ^ 2 + y ^ 2 = L ^ 2;
+        der(z) = vz;
+        der(vz) = Fz - z;
+        (2 + x) * z = sin(y);
+      end PendulumFollower;
+      """
+      local (fm, cache) = OMFrontend.instantiateSCodeToFM("PendulumFollower", OMFrontend.translateToSCode(follower))
+      local e::_IRd.Explanation = OMBackend.explainIndexReduction(fm; functionList = OMFrontend.cacheToFunctionList(cache))
+      @test only(e.sets) == [:y, :x, :vy, :vx] && isempty(e.states)
+      for kept in (false, true)
+        local (x, y, vx, vy, z) = _irSimulateOf(follower, "PendulumFollower", ["x", "y", "vx", "vy", "z"], 1.0; kept = kept)
+        @test x ≈ -0.8533817035864134 atol = 1e-8
+        @test 0.5 * (vx ^ 2 + vy ^ 2) + 9.81 * y ≈ -9.81 / 2 atol = 1e-6
+        @test (2 + x) * z ≈ sin(y) atol = 1e-10
+      end
     end
     #= switch off: the choice at the start values, the ranking as before =#
     withenv("OMBACKEND_DYNAMIC_STATE_SETS" => "false") do

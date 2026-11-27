@@ -996,7 +996,7 @@ function recompiledSimCode end
     recompiledArrayModel(metaModel, activeModeName::String, elementToChange::String, newValue::Real) -> OMJLIR.Model
 
 The OMJLIR model, its arrays kept and before the passes, of a model the array code recompiles at a structural change
-(`OMBackend.recompiledArrayModule`): the frontend's model `metaModel` with the element `elementToChange` of the active
+(`OMBackend.recompiledArrayModules`): the frontend's model `metaModel` with the element `elementToChange` of the active
 mode `activeModeName` set to `newValue`, instantiated again without scalarizing and lowered (its `frontendModel` the
 changed one). Defined by the frontend's extension (OMBackendOMFrontendExt: an SCode class).
 """

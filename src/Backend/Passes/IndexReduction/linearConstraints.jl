@@ -83,41 +83,94 @@ readsContinuous(@nospecialize(e::IR.Expression), resolve::Resolver)::Bool =
   !isempty(continuousReads!(Symbol[], e, resolve))
 
 """
-    linearTerms!(row, e, scale, index, resolve, values) -> Bool
+    ContinuousReads(e, resolve)
+
+`readsContinuous` of the nodes of `e` (a side of an equation) by their positions in pre-order (`IR.children`'s order),
+and the size of each one's subtree in it: an operation's, an array's and a sum of an array's answer from its
+arguments' (all of them, as `continuousReads!` walks them all), another node's its own. `linearTerms!` asks at every
+level it descends; a sum of n terms walked again at each level was O(n^2) (a ladder's ground node of 1600 rungs, a sum
+of 1603 terms: 0.87 of the 0.99 s of `reduceIndex!`). Kept by position: kept by node (`IdDict`), each lookup hashed
+the node's subtree (an immutable node's `objectid`), O(n^2) again (0.19 s).
+"""
+struct ContinuousReads
+  reads::Vector{Bool}
+  sizes::Vector{Int}
+end
+
+function ContinuousReads(@nospecialize(e::IR.Expression), resolve::Resolver)
+  local table::ContinuousReads = ContinuousReads(Bool[], Int[])
+  fillReads!(table, e, resolve)
+  return table
+end
+
+"Whether `e`'s answer in a `ContinuousReads` is from its arguments': an operation, an array, a sum of an array."
+readsThroughArguments(@nospecialize(e::IR.Expression))::Bool =
+  e isa Union{IR.UNARY, IR.BINARY, IR.ARRAY} || (e isa IR.CALL && e.name === :sum && e.attributes.builtin)
+
+"`e`'s answer and those of its subtree into `table` (pre-order); `e`'s."
+function fillReads!(table::ContinuousReads, @nospecialize(e::IR.Expression), resolve::Resolver)::Bool
+  push!(table.reads, false)
+  push!(table.sizes, 1)
+  local at::Int = length(table.reads)
+  local reads::Bool = false
+  if readsThroughArguments(e)
+    for c::IR.Expression in IR.children(e)
+      fillReads!(table, c, resolve) && (reads = true)
+    end
+  else
+    reads = readsContinuous(e, resolve)
+  end
+  table.reads[at] = reads
+  table.sizes[at] = length(table.reads) - at + 1
+  return reads
+end
+
+"""
+    linearTerms!(row, e, scale, index, resolve, values, reads, at) -> Bool
 
 `scale * e` added to `row` where `e` is linear in the continuous variables with known coefficients
 (sums, differences, negation, a product or quotient by a literal or a known parameter's value: `knownRational`);
 a term that reads no continuous variable is a known term. `false` for another expression (the row is then
-incomplete and not used).
+incomplete and not used). `reads`: the answers of `readsContinuous` for the side of the equation, `e`'s at `at`
+(`ContinuousReads`; an argument's after its predecessors' subtrees).
 """
 function linearTerms!(row::LinearRow, @nospecialize(e::IR.Expression), scale::Rational{Int}, index::Dict{Symbol, Int},
-                      resolve::Resolver, values::StartValues)::Bool
+                      resolve::Resolver, values::StartValues, reads::ContinuousReads, at::Int)::Bool
   if e isa IR.CREF && haskey(index, e.cref.name)
     local v = index[e.cref.name]
     row.coefficients[v] = get(row.coefficients, v, 0 // 1) + scale
     return true
-  elseif !readsContinuous(e, resolve)
+  elseif !reads.reads[at]
     push!(row.known, (scale, e))
     return true
   elseif e isa IR.UNARY && e.op === IR.UMINUS
-    return linearTerms!(row, e.exp, -scale, index, resolve, values)
-  elseif e isa IR.BINARY && e.op in (IR.ADD, IR.SUB)
-    return linearTerms!(row, e.exp1, scale, index, resolve, values) &&
-           linearTerms!(row, e.exp2, e.op === IR.ADD ? scale : -scale, index, resolve, values)
+    return linearTerms!(row, e.exp, -scale, index, resolve, values, reads, at + 1)
+  end
+  #= the positions of a binary operation's operands: the first's subtree after it, the second's after that =#
+  local (at1::Int, at2::Int) = e isa IR.BINARY ? (at + 1, at + 1 + reads.sizes[at + 1]) : (0, 0)
+  if e isa IR.BINARY && e.op in (IR.ADD, IR.SUB)
+    return linearTerms!(row, e.exp1, scale, index, resolve, values, reads, at1) &&
+           linearTerms!(row, e.exp2, e.op === IR.ADD ? scale : -scale, index, resolve, values, reads, at2)
   elseif e isa IR.BINARY && e.op === IR.MUL
-    local a = readsContinuous(e.exp1, resolve) ? nothing : knownRational(e.exp1, values)
-    a === nothing || return linearTerms!(row, e.exp2, scale * a, index, resolve, values)
-    local b = readsContinuous(e.exp2, resolve) ? nothing : knownRational(e.exp2, values)
-    b === nothing || return linearTerms!(row, e.exp1, scale * b, index, resolve, values)
+    local a = reads.reads[at1] ? nothing : knownRational(e.exp1, values)
+    a === nothing || return linearTerms!(row, e.exp2, scale * a, index, resolve, values, reads, at2)
+    local b = reads.reads[at2] ? nothing : knownRational(e.exp2, values)
+    b === nothing || return linearTerms!(row, e.exp1, scale * b, index, resolve, values, reads, at1)
     return false
   elseif e isa IR.BINARY && e.op === IR.DIV
-    local b = readsContinuous(e.exp2, resolve) ? nothing : knownRational(e.exp2, values)
+    local b = reads.reads[at2] ? nothing : knownRational(e.exp2, values)
     (b === nothing || iszero(b)) && return false
-    return linearTerms!(row, e.exp1, scale / b, index, resolve, values)
+    return linearTerms!(row, e.exp1, scale / b, index, resolve, values, reads, at1)
   elseif e isa IR.CALL && e.name === :sum && e.attributes.builtin && length(e.arguments) == 1 &&
          e.arguments[1] isa IR.ARRAY
-    #= the sum of an array's elements, as the element view writes `sum(i)` (MSL ZeroInductor: `m * i0 = sum(i)`) =#
-    return all(x::IR.Expression -> linearTerms!(row, x, scale, index, resolve, values), e.arguments[1].elements)
+    #= the sum of an array's elements, as the element view writes `sum(i)` (MSL ZeroInductor: `m * i0 = sum(i)`); the
+       array at `at + 1`, its first element after it =#
+    local next::Int = at + 2
+    for x::IR.Expression in e.arguments[1].elements
+      linearTerms!(row, x, scale, index, resolve, values, reads, next) || return false
+      next += reads.sizes[next]
+    end
+    return true
   end
   return false
 end
@@ -284,7 +337,8 @@ function linearConstraints(model::IR.Model, partition::IR.Partition)::Vector{Tup
     #= an equation whose reads the structure does not handle (an array constructor over a range that is not
        constant: MSL Media's ideal gas mixtures) is no linear row; reduceIndex! decides about it =#
     local linear = try
-      linearTerms!(row, eq.lhs, 1 // 1, index, resolve, values) && linearTerms!(row, eq.rhs, -1 // 1, index, resolve, values)
+      linearTerms!(row, eq.lhs, 1 // 1, index, resolve, values, ContinuousReads(eq.lhs, resolve), 1) &&
+        linearTerms!(row, eq.rhs, -1 // 1, index, resolve, values, ContinuousReads(eq.rhs, resolve), 1)
     catch err
       err isa NotHandled || rethrow()
       false
